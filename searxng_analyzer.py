@@ -684,6 +684,172 @@ Return JSON array only:
     return clean_data, formatted_text
 
 # ============================================
+# Counterparty Individual Enrichment
+# ============================================
+
+def enrich_counterparties_with_individuals(events: list, main_company: str) -> list:
+    """
+    Second-pass enrichment: Uses Perplexity to find individuals and announcement URLs for each deal.
+    
+    Args:
+        events: List of corporate events with counterparties
+        main_company: The main company being researched
+        
+    Returns:
+        Enriched events with individuals and press release URLs added to counterparties
+    """
+    import os, json, requests
+    
+    OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_KEY")
+    if not OPENROUTER_KEY:
+        print("   ⚠️ No OpenRouter key for individual enrichment")
+        return events
+    
+    # Enrich ALL events (no limit)
+    total_events = len(events)
+    
+    for idx, event in enumerate(events):
+        event_short = event.get("Event (short)", "")
+        announcement_date = event.get("Announcement Date", "")
+        closed_date = event.get("Closed Date", "")
+        counterparties = event.get("counterparties", [])
+        
+        if not counterparties:
+            continue
+            
+        # Build query for this deal
+        cp_names = [cp.get("company_name", "") for cp in counterparties if cp.get("company_name")]
+        if len(cp_names) < 2:
+            continue
+        
+        # Build date context
+        date_context = ""
+        if announcement_date:
+            date_context += f"Announced: {announcement_date}"
+        if closed_date:
+            date_context += f", Closed: {closed_date}" if date_context else f"Closed: {closed_date}"
+        if not date_context:
+            date_context = "Date unknown"
+            
+        print(f"      [{idx+1}/{total_events}] Enriching: {event_short[:50]}...")
+            
+        query = f"""For the corporate deal: "{event_short}"
+Date: {date_context}
+Companies involved: {', '.join(cp_names)}
+
+Find for EACH company involved:
+
+1. **KEY EXECUTIVES** involved in this deal:
+   - CEO, President, or Managing Director
+   - CFO or deal leads
+   - Executives quoted in press releases
+   - PE firm Partners (if applicable)
+
+2. **ANNOUNCEMENT URL** - each company's own press release or announcement about this deal
+
+Return JSON with this EXACT format:
+{{
+  "counterparties": [
+    {{
+      "company": "Company Name",
+      "press_release_url": "https://company.com/news/deal-announcement",
+      "company_linkedin_url": "https://www.linkedin.com/company/company-name/",
+      "individuals": [
+        {{"name": "Full Name", "title": "Title at Company", "linkedin_url": ""}},
+        {{"name": "Full Name", "title": "Title at Company", "linkedin_url": ""}}
+      ]
+    }}
+  ]
+}}
+
+Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
+
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "perplexity/sonar-pro",
+                    "messages": [{"role": "user", "content": query}],
+                    "temperature": 0.1,
+                    "max_tokens": 2000
+                },
+                timeout=45
+            )
+            
+            if response.status_code == 200:
+                raw = response.json()["choices"][0]["message"]["content"].strip()
+                
+                # Extract JSON (could be object or array)
+                start_obj = raw.find('{')
+                end_obj = raw.rfind('}') + 1
+                start_arr = raw.find('[')
+                end_arr = raw.rfind(']') + 1
+                
+                enrichment_data = None
+                
+                # Try object format first
+                if start_obj != -1 and end_obj > start_obj:
+                    try:
+                        enrichment_data = json.loads(raw[start_obj:end_obj])
+                        if "counterparties" in enrichment_data:
+                            enrichment_data = enrichment_data["counterparties"]
+                    except:
+                        pass
+                
+                # Try array format
+                if not enrichment_data and start_arr != -1 and end_arr > start_arr:
+                    try:
+                        enrichment_data = json.loads(raw[start_arr:end_arr])
+                    except:
+                        pass
+                
+                if enrichment_data and isinstance(enrichment_data, list):
+                    # Map enrichment data to counterparties
+                    for enrich_cp in enrichment_data:
+                        enrich_company = enrich_cp.get("company", "").lower()
+                        enrich_url = enrich_cp.get("press_release_url", "")
+                        enrich_linkedin = enrich_cp.get("company_linkedin_url", "")
+                        enrich_individuals = enrich_cp.get("individuals", [])
+                        
+                        # Find matching counterparty
+                        for cp in counterparties:
+                            cp_name = cp.get("company_name", "").lower()
+                            if enrich_company in cp_name or cp_name in enrich_company or \
+                               any(word in cp_name for word in enrich_company.split() if len(word) > 3):
+                                
+                                # Update press release URL
+                                if enrich_url and not cp.get("press_release_url"):
+                                    cp["press_release_url"] = enrich_url
+                                
+                                # Update LinkedIn URL
+                                if enrich_linkedin and not cp.get("company_linkedin_url"):
+                                    cp["company_linkedin_url"] = enrich_linkedin
+                                
+                                # Add individuals
+                                if "individuals" not in cp:
+                                    cp["individuals"] = []
+                                    
+                                existing_names = [i.get("name", "").lower() for i in cp["individuals"]]
+                                for ind in enrich_individuals:
+                                    ind_name = ind.get("name", "")
+                                    if ind_name and ind_name.lower() not in existing_names:
+                                        cp["individuals"].append({
+                                            "name": ind_name,
+                                            "title": ind.get("title", ""),
+                                            "linkedin_url": ind.get("linkedin_url", "")
+                                        })
+                                        existing_names.append(ind_name.lower())
+                                break
+                                
+        except Exception as e:
+            print(f"      ⚠️ Enrichment failed for '{event_short[:30]}...': {e}")
+            continue
+    
+    return events
+
+
+# ============================================
 # FILE 1: generate_events.py (or your generator file)
 # ============================================
 
@@ -707,11 +873,13 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
         print("Missing API keys")
         return []
 
-    print(f"Fetching corporate events for: {company_name}")
+    print(f"Fetching corporate events for: {company_name} (max_events={max_events})")
 
     def search(query):
         try:
-            params = {"q": query, "num": 25, "api_key": SERPAPI_KEY}  # Increased from 20 to 25
+            # Limit results based on max_events
+            num_results = 5 if max_events <= 1 else 25
+            params = {"q": query, "num": num_results, "api_key": SERPAPI_KEY}
             results = GoogleSearch(params).get_dict().get("organic_results", [])
             return [
                 {
@@ -719,54 +887,61 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
                     "snippet": r.get('snippet', ''),
                     "link": r.get('link', '')
                 }
-                for r in results[:25]  # Get more results per query
+                for r in results[:num_results]
             ]
         except Exception as e:
             print(f"Search error: {e}")
             return []
 
-    # Comprehensive queries - works for both large and small companies
-    queries = [
-        # === OFFICIAL PRESS RELEASES (most accurate for dates) ===
-        f'"{company_name}" acquisition site:prnewswire.com',
-        f'"{company_name}" acquisition site:businesswire.com',
-        f'"{company_name}" acquisition site:globenewswire.com',
-        
-        # === HIGH-YIELD ACQUISITION PATTERNS ===
-        f'"{company_name}" acquires',
-        f'"{company_name}" acquired',
-        f'"{company_name}" "has acquired"',
-        f'"{company_name}" buys',
-        f'"{company_name}" bought',
-        f'"{company_name}" merger',
-        
-        # === YEAR-SPECIFIC SEARCHES (find all deals by year) ===
-        f'"{company_name}" acquisition 2025',
-        f'"{company_name}" acquisition 2024',
-        f'"{company_name}" acquisition 2023',
-        f'"{company_name}" acquisition 2022',
-        f'"{company_name}" acquisition 2021',
-        f'"{company_name}" acquisition 2020',
-        f'"{company_name}" acquisition 2019',
-        f'"{company_name}" acquisition 2018',
-        f'"{company_name}" acquisition 2017',
-        f'"{company_name}" acquisition 2016',
-        f'"{company_name}" acquisition 2015',
-        
-        # === PRIVATE EQUITY / INVESTMENT DEALS ===
-        f'"{company_name}" "private equity" investment',
-        f'"{company_name}" "growth equity" OR "growth investment"',
-        f'"{company_name}" investor OR "backed by"',
-        f'"{company_name}" "majority stake" OR "minority stake"',
-        f'"{company_name}" "portfolio company"',
-        
-        # === PE/VC NEWS SOURCES ===
-        f'"{company_name}" site:pitchbook.com',
-        f'"{company_name}" site:pehub.com',
-        f'"{company_name}" site:privateequitywire.com',
-        f'"{company_name}" site:agfundernews.com',
-        
-        # === DIVESTITURES & SALES ===
+    # TESTING MODE: Only 1 query when max_events <= 1
+    if max_events <= 1:
+        print("⚡ TESTING MODE: Using minimal queries to save credits")
+        queries = [
+            f'"{company_name}" acquisition OR merger OR investment',  # Single comprehensive query
+        ]
+    else:
+        # Full queries for production
+        queries = [
+            # === OFFICIAL PRESS RELEASES (most accurate for dates) ===
+            f'"{company_name}" acquisition site:prnewswire.com',
+            f'"{company_name}" acquisition site:businesswire.com',
+            f'"{company_name}" acquisition site:globenewswire.com',
+            
+            # === HIGH-YIELD ACQUISITION PATTERNS ===
+            f'"{company_name}" acquires',
+            f'"{company_name}" acquired',
+            f'"{company_name}" "has acquired"',
+            f'"{company_name}" buys',
+            f'"{company_name}" bought',
+            f'"{company_name}" merger',
+            
+            # === YEAR-SPECIFIC SEARCHES (find all deals by year) ===
+            f'"{company_name}" acquisition 2025',
+            f'"{company_name}" acquisition 2024',
+            f'"{company_name}" acquisition 2023',
+            f'"{company_name}" acquisition 2022',
+            f'"{company_name}" acquisition 2021',
+            f'"{company_name}" acquisition 2020',
+            f'"{company_name}" acquisition 2019',
+            f'"{company_name}" acquisition 2018',
+            f'"{company_name}" acquisition 2017',
+            f'"{company_name}" acquisition 2016',
+            f'"{company_name}" acquisition 2015',
+            
+            # === PRIVATE EQUITY / INVESTMENT DEALS ===
+            f'"{company_name}" "private equity" investment',
+            f'"{company_name}" "growth equity" OR "growth investment"',
+            f'"{company_name}" investor OR "backed by"',
+            f'"{company_name}" "majority stake" OR "minority stake"',
+            f'"{company_name}" "portfolio company"',
+            
+            # === PE/VC NEWS SOURCES ===
+            f'"{company_name}" site:pitchbook.com',
+            f'"{company_name}" site:pehub.com',
+            f'"{company_name}" site:privateequitywire.com',
+            f'"{company_name}" site:agfundernews.com',
+            
+            # === DIVESTITURES & SALES ===
         f'"{company_name}" sold OR divested',
         f'"{company_name}" divestiture OR "sale of"',
         f'"{company_name}" "sold to" OR "sells"',
@@ -857,7 +1032,15 @@ OUTPUT: Return exactly {max_events} events if that many exist in the search resu
 
 For EACH verified event, extract these EXACT fields:
 
-1. **date**: Exact date in format "MMM DD, YYYY" (e.g., "Nov 30, 2020", "Feb 28, 2022")
+1. **announcement_date**: When the deal was ANNOUNCED in format "MMM DD, YYYY" (e.g., "Nov 30, 2020")
+   - Look for phrases like "announced on", "press release dated", "disclosed on"
+   - This is when the deal was first made public
+   - If unknown, use empty string ""
+
+2. **closed_date**: When the deal was COMPLETED/CLOSED in format "MMM DD, YYYY" (e.g., "Feb 28, 2022")
+   - Look for phrases like "completed", "closed", "finalized", "consummated"
+   - This is when the transaction was legally completed
+   - If deal not yet closed or date unknown, use empty string ""
    
    DATE ACCURACY RULES (CRITICAL):
    - ONLY use dates EXPLICITLY stated in the search results
@@ -866,27 +1049,61 @@ For EACH verified event, extract these EXACT fields:
    - If ONLY year is known: use "Jan 1, YYYY" and add "(approximate)" to event description
    - NEVER guess dates - if unsure, use article publication date with "(announced)" note
    - Cross-reference dates across multiple sources when possible
+   - Prefer announcement_date if only one date is available
 
-2. **event_short**: Precise description following these patterns:
+4. **event_short**: Precise description following these patterns:
    - Acquisition: "{company_name} acquired [Target] to [brief purpose]"
    - Investment: "[Investor] invested in {company_name}"
    - Merger: "{company_name} merged with [Target]"
    - Sale: "{company_name} sold [Asset/Division] to [Buyer]"
    - Keep it concise: 10-20 words maximum
 
-3. **event_type**: Use EXACTLY one of these (match case exactly):
-   - "Merger / acquisition announcement"
-   - "Merger / close"
-   - "Acquisition"
-   - "Acquisition (agreement)"
-   - "Divestiture / sale"
-   - "Divestiture (agreement)"
-   - "Divestiture (close)"
-   - "Joint-venture sale"
-   - "Investment"
-   - "IPO"
+5. **description**: Professional, neutral 2-4 sentence description of the event.
+   Write as a financial analyst explaining the deal to clients:
+   - State what happened (transaction type, parties involved, deal value if known)
+   - Explain the strategic rationale or context (why this deal matters)
+   - Include key terms (cash, stock, financing structure) if mentioned
+   - Use absolute dates where relevant
+   - Be factual and neutral - no speculation
+   - Do NOT use bullet points - write in flowing prose
+   
+   Example: "On February 24, 2025, Kynetec, a global leader in agricultural market research, completed its acquisition of Freshlogic, an Australian food and beverage analytics firm. The transaction, terms undisclosed, expands Kynetec's capabilities in food supply chain intelligence and strengthens its presence in the Asia-Pacific region. The deal was backed by Paine Schwartz Partners, Kynetec's majority shareholder."
 
-4. **value_usd**: Format EXACTLY as shown in these examples:
+6. **deal_type**: Use EXACTLY one of these (match case exactly):
+   - "Acquisition"
+   - "Sale"
+   - "IPO"
+   - "MBO"
+   - "Investment"
+   - "Strategic Review"
+   - "Divestment"
+   - "Restructuring"
+   - "Dual track"
+   - "Closing"
+   - "Grant"
+   - "Debt financing"
+   - "Bankruptcy"
+   - "Reorganisation"
+   - "Employee tender offer"
+   - "Rebrand"
+   - "Partnership"
+
+7. **deal_status**: Use EXACTLY one of these based on the deal's current state:
+   - "Completed" — deal is finalized/closed
+   - "In Market" — deal is actively being marketed
+   - "Not yet launched" — deal announced but not started
+   - "Strategic Review" — company exploring options
+   - "Deal Prep" — preparing for transaction
+   - "In Exclusivity" — exclusive negotiations ongoing
+   
+   How to determine status:
+   - If closed_date exists → "Completed"
+   - If "exploring strategic alternatives" mentioned → "Strategic Review"
+   - If "exclusive negotiations" mentioned → "In Exclusivity"
+   - If only announcement_date and no close → check article for status clues
+   - Default to "Completed" for historical deals
+
+8. **value_usd**: Format EXACTLY as shown in these examples:
    - "$44,000,000,000 (enterprise value)"
    - "$2,225,000,000 (cash)"
    - "$550,000,000 (mix of cash & stock; net of cash acquired)"
@@ -899,13 +1116,13 @@ For EACH verified event, extract these EXACT fields:
    - Convert millions: "$550M" → "$550,000,000"
    - Include transaction type in parentheses: (enterprise value), (cash), (mix of cash & stock)
 
-5. **source_url**: The BEST URL for this event announcement/news article.
+9. **source_url**: The BEST URL for this event announcement/news article.
    - Prefer official company press releases (e.g., kynetec.com/kynetec-acquires-freshlogic)
    - If no press release, use the best news article URL from search results
    - Extract the FULL URL exactly as shown in the search results
    - If no URL available, use empty string ""
 
-6. **counterparties**: Array of ALL companies involved in this deal with their ROLES.
+10. **counterparties**: Array of ALL companies involved in this deal with their ROLES.
    
    COUNTERPARTY TYPES (use exact type_id):
    - type_id: 17, type: "Target" — company being acquired/invested in/going public
@@ -917,10 +1134,18 @@ For EACH verified event, extract these EXACT fields:
    - type_id: 20, type: "Joint Venture Partner" — JV partner
    
    For EACH counterparty include:
-   - company_name: Exact company name as it appears in sources
-   - type_id: Number from list above
-   - type: Text label from list above
-   - role_description: Brief description of their role in this specific deal
+   - company_name: Exact company name as it appears in sources (REQUIRED)
+   - type_id: Number from list above (REQUIRED)
+   - type: Text label from list above (REQUIRED)
+   - role_description: Brief description of their role in this specific deal (REQUIRED)
+   - company_linkedin_url: LinkedIn company page URL if known, otherwise ""
+   - press_release_url: Company's own press release URL for this deal if found, otherwise ""
+   - individuals: Array of key people mentioned in press releases/articles for this deal
+     For each individual include:
+     - name: Full name (e.g., "Peter Berweger")
+     - title: Role at the company (e.g., "CEO", "CFO", "Managing Director")
+     - linkedin_url: "" (leave empty for now)
+     Look for: CEOs, CFOs, deal leads, executives quoted in press releases about this transaction
 
 COUNTERPARTY EXTRACTION RULES:
 ✓ EVERY deal has at least 2 counterparties (e.g., Acquirer + Target)
@@ -953,66 +1178,45 @@ Search results to analyze:
 Return ONLY valid JSON array (no markdown, no explanation):
 [
   {{
-    "date": "Nov 30, 2020",
+    "announcement_date": "Nov 30, 2020",
+    "closed_date": "",
     "event_short": "S&P Global and IHS Markit announced definitive all-stock merger",
-    "event_type": "Merger / acquisition announcement",
+    "description": "On November 30, 2020, S&P Global Inc. announced a definitive agreement to acquire IHS Markit Ltd. in an all-stock transaction valued at approximately $44 billion. The combination creates a leading provider of data, analytics and workflow solutions across capital, commodity and automotive markets. The deal is expected to generate approximately $480 million in annual cost synergies and is subject to regulatory approvals.",
+    "deal_type": "Acquisition",
+    "deal_status": "In Exclusivity",
     "value_usd": "$44,000,000,000 (enterprise value)",
     "source_url": "https://press.spglobal.com/2020-11-30-S-P-Global-and-IHS-Markit-to-Merge",
     "counterparties": [
-      {{
-        "company_name": "S&P Global",
-        "type_id": 18,
-        "type": "Acquirer",
-        "role_description": "Acquiring company in the merger"
-      }},
-      {{
-        "company_name": "IHS Markit",
-        "type_id": 17,
-        "type": "Target",
-        "role_description": "Target company being acquired"
-      }}
+      {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Douglas Peterson", "title": "President & CEO", "linkedin_url": ""}}]}},
+      {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Lance Uggla", "title": "Chairman & CEO", "linkedin_url": ""}}]}}
     ]
   }},
   {{
-    "date": "Feb 28, 2022",
-    "event_short": "Completion of S&P Global's merger with IHS Markit",
-    "event_type": "Merger / close",
+    "announcement_date": "Nov 30, 2020",
+    "closed_date": "Feb 28, 2022",
+    "event_short": "S&P Global completed merger with IHS Markit",
+    "description": "On February 28, 2022, S&P Global completed its acquisition of IHS Markit following receipt of all required regulatory approvals. The transaction, first announced in November 2020, was valued at $44 billion in an all-stock deal. The combined entity becomes a leading provider of credit ratings, benchmarks, analytics, and data solutions serving global capital and commodity markets.",
+    "deal_type": "Closing",
+    "deal_status": "Completed",
     "value_usd": "$44,000,000,000 (enterprise value)",
-    "source_url": "https://press.spglobal.com/2022-02-28-S-P-Global-Completes-Merger-with-IHS-Markit",
+    "source_url": "https://press.spglobal.com/2022-02-28-Merger-Complete",
     "counterparties": [
-      {{
-        "company_name": "S&P Global",
-        "type_id": 18,
-        "type": "Acquirer",
-        "role_description": "Acquiring company completing the merger"
-      }},
-      {{
-        "company_name": "IHS Markit",
-        "type_id": 17,
-        "type": "Target",
-        "role_description": "Target company acquired"
-      }}
+      {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": []}},
+      {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": []}}
     ]
   }},
   {{
-    "date": "Jan 15, 2021",
-    "event_short": "S&P Global acquired Visible Alpha to expand market intelligence",
-    "event_type": "Acquisition",
+    "announcement_date": "Jan 15, 2021",
+    "closed_date": "Jan 15, 2021",
+    "event_short": "S&P Global acquired Visible Alpha",
+    "description": "S&P Global acquired Visible Alpha, a financial technology company specializing in consensus estimate data and company-level research analytics. The acquisition strengthens S&P Global's Market Intelligence division by adding granular financial model data sourced from over 170 contributing investment research firms. Terms of the transaction were not disclosed.",
+    "deal_type": "Acquisition",
+    "deal_status": "Completed",
     "value_usd": "Undisclosed",
-    "source_url": "https://www.spglobal.com/en/research-insights/articles/sp-global-acquires-visible-alpha",
+    "source_url": "https://www.spglobal.com/visible-alpha-acquisition",
     "counterparties": [
-      {{
-        "company_name": "S&P Global",
-        "type_id": 18,
-        "type": "Acquirer",
-        "role_description": "Acquiring company"
-      }},
-      {{
-        "company_name": "Visible Alpha",
-        "type_id": 17,
-        "type": "Target",
-        "role_description": "Target company being acquired"
-      }}
+      {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Martina Cheung", "title": "President, S&P Global Market Intelligence", "linkedin_url": ""}}]}},
+      {{"company_name": "Visible Alpha", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Scott Ryles", "title": "CEO", "linkedin_url": ""}}]}}
     ]
   }}
 ]
@@ -1027,7 +1231,7 @@ JSON:'''
                 "model": "anthropic/claude-3.5-sonnet:beta",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,  # Slightly increased for more creative extraction
-                "max_tokens": 16000  # Increased to allow more events
+                "max_tokens": 32000  # Doubled to allow more events with enhanced counterparty data
             },
             timeout=180
         )
@@ -1046,21 +1250,57 @@ JSON:'''
         # Transform to match your table structure with counterparties
         result = []
         for i, e in enumerate(events[:max_events], 1):
-            # Process counterparties
+            # Process counterparties with enhanced fields
             counterparties = []
             raw_counterparties = e.get("counterparties", [])
             for cp in raw_counterparties:
+                # Process individuals for this counterparty
+                individuals = []
+                raw_individuals = cp.get("individuals", [])
+                for ind in raw_individuals:
+                    individuals.append({
+                        "name": str(ind.get("name", "")).strip(),
+                        "title": str(ind.get("title", "")).strip(),
+                        "linkedin_url": str(ind.get("linkedin_url", "")).strip()
+                    })
+                
                 counterparties.append({
                     "company_name": str(cp.get("company_name", "")).strip(),
                     "type_id": int(cp.get("type_id", 0)),
                     "type": str(cp.get("type", "Unknown")).strip(),
-                    "role_description": str(cp.get("role_description", "")).strip()
+                    "role_description": str(cp.get("role_description", "")).strip(),
+                    "company_linkedin_url": str(cp.get("company_linkedin_url", "")).strip(),
+                    "press_release_url": str(cp.get("press_release_url", "")).strip(),
+                    "individuals": individuals
                 })
             
+            # Use announcement_date as primary, fall back to date field for backwards compatibility
+            announcement_date = str(e.get("announcement_date", e.get("date", ""))).strip()
+            closed_date = str(e.get("closed_date", "")).strip()
+            
+            # For display, prefer announcement_date, then closed_date
+            display_date = announcement_date if announcement_date else closed_date
+            if not display_date:
+                display_date = "Unknown"
+            
+            # Extract deal type and status (new fields)
+            deal_type = str(e.get("deal_type", e.get("event_type", "Unknown"))).strip()
+            deal_status = str(e.get("deal_status", "")).strip()
+            # Auto-set status to Completed if closed_date exists and no status provided
+            if not deal_status and closed_date:
+                deal_status = "Completed"
+            elif not deal_status:
+                deal_status = "Unknown"
+            
             result.append({
-                "Date": str(e.get("date", "Unknown")).strip(),
+                "Announcement Date": announcement_date,
+                "Closed Date": closed_date,
+                "Date": display_date,  # Keep for backwards compatibility
                 "Event (short)": str(e.get("event_short", e.get("event", "Unknown event"))).strip(),
-                "Event type": str(e.get("event_type", e.get("type", "Unknown"))).strip(),
+                "Description": str(e.get("description", "")).strip(),
+                "Deal Type": deal_type,
+                "Deal Status": deal_status,
+                "Event type": deal_type,  # Keep for backwards compatibility
                 "Event value (USD)": str(e.get("value_usd", e.get("value", "Undisclosed"))).strip(),
                 "Source URL": str(e.get("source_url", "")).strip(),
                 "counterparties": counterparties
@@ -1068,9 +1308,31 @@ JSON:'''
 
         print(f"SUCCESS: {len(result)} corporate events loaded for {company_name}")
         
+        # SECOND PASS: Enrich counterparties with individuals using Perplexity
+        print(f"   → Enriching counterparties with individuals...")
+        result = enrich_counterparties_with_individuals(result, company_name)
+        
         # Log counterparty summary
         total_counterparties = sum(len(e.get("counterparties", [])) for e in result)
+        total_individuals = sum(len(cp.get("individuals", [])) for e in result for cp in e.get("counterparties", []))
         print(f"   → {total_counterparties} counterparties extracted across {len(result)} events")
+        print(f"   → {total_individuals} individuals identified")
+        
+        # Log date and status extraction
+        events_with_announcement = sum(1 for e in result if e.get("Announcement Date"))
+        events_with_closed = sum(1 for e in result if e.get("Closed Date"))
+        print(f"   → Dates: {events_with_announcement} with announcement date, {events_with_closed} with closed date")
+        
+        # Log deal types and statuses
+        deal_types = {}
+        deal_statuses = {}
+        for e in result:
+            dt = e.get("Deal Type", "Unknown")
+            ds = e.get("Deal Status", "Unknown")
+            deal_types[dt] = deal_types.get(dt, 0) + 1
+            deal_statuses[ds] = deal_statuses.get(ds, 0) + 1
+        print(f"   → Deal types: {deal_types}")
+        print(f"   → Deal statuses: {deal_statuses}")
         
         return result
 
