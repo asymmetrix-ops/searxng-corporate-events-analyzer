@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: searxng-corporate-events-analyzer
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: PERPLEXITY_API_KEY
+        sync: false
+
