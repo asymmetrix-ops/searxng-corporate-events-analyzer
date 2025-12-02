@@ -941,6 +941,16 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
             f'"{company_name}" site:privateequitywire.com',
             f'"{company_name}" site:agfundernews.com',
             
+            # === STARTUP / VC FUNDING SOURCES ===
+            f'"{company_name}" site:crunchbase.com',
+            f'"{company_name}" site:techcrunch.com funding',
+            f'"{company_name}" "series A" OR "series B" OR "seed round"',
+            f'"{company_name}" "raises" OR "raised" funding',
+            f'"{company_name}" "venture capital" OR "VC funding"',
+            f'"{company_name}" site:eu-startups.com',
+            f'"{company_name}" site:sifted.eu',
+            f'"{company_name}" site:dealroom.co',
+            
             # === DIVESTITURES & SALES ===
         f'"{company_name}" sold OR divested',
         f'"{company_name}" divestiture OR "sale of"',
@@ -973,6 +983,17 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
         f'"{company_name}" M&A deal',
         f'"{company_name}" acquisition site:reuters.com',
         f'"{company_name}" acquisition site:bloomberg.com',
+        
+        # === PARTNERSHIP & STRATEGIC DEALS ===
+        f'"{company_name}" partnership OR "strategic partnership"',
+        f'"{company_name}" "joint venture" OR JV',
+        f'"{company_name}" collaboration OR alliance',
+        
+        # === COMPANY INFO SOURCES ===
+        f'"{company_name}" site:zoominfo.com',
+        f'"{company_name}" site:apollo.io',
+        f'"{company_name}" site:linkedin.com/company',
+        f'"{company_name}" company funding history',
     ]
 
     search_results = []
@@ -1004,29 +1025,36 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     
     print(f"   → Analyzing all {results_to_analyze} search results...")
 
-    prompt = f'''Extract ALL M&A events for "{company_name}" from the {results_to_analyze} search results below.
+    prompt = f'''Extract ALL corporate events for "{company_name}" from the {results_to_analyze} search results below.
 
-YOUR GOAL: Find and return up to {max_events} UNIQUE acquisition/merger/investment events.
+YOUR GOAL: Find and return up to {max_events} UNIQUE corporate events including M&A, funding, and partnerships.
 
 EXTRACTION CHECKLIST - scan for ALL of these:
 □ Companies that "{company_name}" acquired (look for: "acquired", "buys", "bought", "acquisition of")
 □ Companies that "{company_name}" merged with
-□ Investors/PE firms that invested in "{company_name}"
+□ Investors/PE firms/VCs that invested in "{company_name}"
 □ Assets/divisions that "{company_name}" sold or divested
 □ Regional/country-specific acquisitions (Brazil, UK, Australia, etc.)
 □ Small bolt-on acquisitions and strategic purchases
+□ FUNDING ROUNDS: Seed, Series A, Series B, etc. (look for: "raises", "raised", "funding round", "led by")
+□ PARTNERSHIPS: Strategic partnerships, joint ventures, collaborations
+□ IPO or SPAC transactions
 
 COMMON MISSED DEALS - pay special attention to:
+- Startup funding rounds (Seed, Series A/B/C, etc.)
+- Strategic partnerships and collaborations
 - Brazilian acquisitions (look for: Brazil, Latin America, LATAM)
 - Research company acquisitions (look for: Research, Solutions, Analytics)
-- Animal health and agriculture sector deals
-- Machinery/data company acquisitions
+- Climate tech, fintech, healthtech sector deals
+- Early-stage investments and accelerator programs
 
 EXTRACTION RULES:
 1. Each unique target company = separate event (even if small deal)
-2. Investments INTO the company = also events (PE firm invests in company)
-3. If date is unclear, use the article date or "Jan 1, [year]" 
-4. Extract ALL deals - do not filter by size or importance
+2. Investments INTO the company = also events (VC/PE firm invests in company)
+3. Funding rounds ARE corporate events (Series A, Seed round, etc.)
+4. Partnerships and JVs ARE corporate events
+5. If date is unclear, use the article date or "Jan 1, [year]" 
+6. Extract ALL deals - do not filter by size or importance
 
 OUTPUT: Return exactly {max_events} events if that many exist in the search results.
 
