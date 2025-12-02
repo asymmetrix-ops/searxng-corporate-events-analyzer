@@ -1577,27 +1577,82 @@ def generate_summary(company_name, text=""):
     """
     Company summary where CEO is ALWAYS extracted using
     SERPAPI + strict AI CEO extractor (zero hallucination).
+    Uses web search as fallback when Wikipedia has no data.
     """
+    
+    # Extract domain/company name from URL if needed
+    search_name = company_name
+    website_from_input = ""
+    if company_name.startswith("http://") or company_name.startswith("https://"):
+        website_from_input = company_name
+        from urllib.parse import urlparse
+        parsed = urlparse(company_name)
+        domain = parsed.netloc.replace("www.", "")
+        search_name = domain.split(".")[0]  # e.g., "ecorth" from "ecorth.com"
+        print(f"   → Extracted company name '{search_name}' from URL")
 
-    # ------ Step 1: Get source text (Wikipedia) ------
+    # ------ Step 1: Get source text (Wikipedia first, then web search) ------
     if not text.strip():
-        text = get_wikipedia_summary(company_name)
+        text = get_wikipedia_summary(search_name)
+    
+    # If Wikipedia has no useful data, use web search
+    if not text.strip() or len(text) < 100:
+        print(f"   → Wikipedia has no data for {search_name}, using web search...")
+        # Search for company info from multiple sources
+        search_queries = [
+            f'"{search_name}" company about headquarters',
+            f'"{search_name}" site:linkedin.com/company',
+            f'"{search_name}" site:crunchbase.com',
+            f'"{search_name}" founded CEO location',
+            f'site:{website_from_input.replace("https://", "").replace("http://", "").rstrip("/")}' if website_from_input else f'"{search_name}" company',
+        ]
+        search_text = ""
+        for q in search_queries:
+            if q:  # Skip empty queries
+                result = serpapi_search(q, num_results=5)
+                if result:
+                    search_text += result + "\n\n"
+        if search_text.strip():
+            text = search_text
+            print(f"   → Collected {len(text)} chars of search data")
 
-    # ------ Step 2: Make AI generate structure (ignoring CEO) ------
+    # ------ Step 2: Use Perplexity for accurate company info ------
     prompt = f"""
-You are a professional researcher. Extract complete company details for "{company_name}".
-Return ONLY in this exact markdown format:
+You are a professional researcher. Find and extract complete company details for "{search_name}".
+
+Return ONLY in this exact markdown format (no extra text):
 
 **Company Details**
-- Year Founded: <value>
-- Website: <value>
-- LinkedIn: <value>
-- Headquarters: <value>
-- CEO: <value>
+- Company Name: <full legal/common name>
+- Year Founded: <year>
+- Website: <full URL like https://www.example.com>
+- LinkedIn: <full LinkedIn URL like https://www.linkedin.com/company/example>
+- Headquarters: <city, country>
+- CEO: <full name>
 
-Source text:
-{text[:8000]}
+CRITICAL RULES:
+1. For Website: Must be a full URL starting with https:// or http://
+2. For LinkedIn: Must be the full LinkedIn company page URL
+3. For Headquarters: Format as "City, Country" (e.g., "London, United Kingdom")
+4. Search your knowledge for this company if the source text is insufficient
+5. If you truly cannot find a value, write "Unknown"
+
+{"Known website: " + website_from_input if website_from_input else ""}
+
+Source text for reference:
+{text[:6000]}
 """
+    # Use Perplexity for better web-connected results
+    summary = openrouter_chat(
+        "perplexity/sonar-pro",
+        prompt,
+        f"Company Info - {search_name}"
+    )
+
+    if not summary:
+        return "❌ No details found."
+    
+    print(f"   → AI returned company info: {summary[:300]}...")
     summary = openrouter_chat(
         "openai/gpt-4o-mini",
         prompt,

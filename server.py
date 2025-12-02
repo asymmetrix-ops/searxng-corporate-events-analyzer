@@ -138,12 +138,24 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         db_events = get_corporate_events_by_company_id(cid)
 
     # 2) AI company overview (summary + description)
+    # Extract company name from URL if needed
+    company_name = query
+    input_website = ""
+    if query.startswith("http://") or query.startswith("https://"):
+        input_website = query
+        # Extract domain name as company name hint
+        from urllib.parse import urlparse
+        parsed = urlparse(query)
+        domain = parsed.netloc.replace("www.", "")
+        # Use domain without TLD as company name hint
+        company_name = domain.split(".")[0].title()
+    
     ai_overview = {
-        "name": query,
+        "name": company_name,
         "city": "",
         "country": "",
         "ownership": "",
-        "website": "",
+        "website": input_website or "",
         "linkedin": "",
         "description": "",
     }
@@ -151,43 +163,98 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         wiki_text = get_wikipedia_summary(query)
         summary_md = generate_summary(query, text=wiki_text)
         description = generate_description(query, text=wiki_text, company_details=summary_md)
+        
+        print(f"[AI] Summary generated:\n{summary_md[:500]}...")
 
         # Very light parsing from the markdown summary to structured fields
         # We keep it simple: look for "- Website:", "- LinkedIn:", "- Headquarters:"
-        website = ""
+        website = input_website  # Default to input URL if provided
         linkedin = ""
         city = ""
         country = ""
+        year_founded = ""
+        ceo = ""
+        
+        def is_valid_value(val: str) -> bool:
+            """Check if value is valid (not empty or placeholder)"""
+            if not val:
+                return False
+            low = val.lower().strip()
+            invalid = ["not found", "unknown", "n/a", "none", "<value>", ""]
+            return low not in invalid and not low.startswith("<")
+        
+        def extract_url(text: str) -> str:
+            """Extract URL from text, handling markdown links"""
+            import re
+            # Handle markdown links like [text](url)
+            md_match = re.search(r'\[.*?\]\((https?://[^\)]+)\)', text)
+            if md_match:
+                return md_match.group(1)
+            # Handle plain URLs
+            url_match = re.search(r'(https?://[^\s\)]+)', text)
+            if url_match:
+                return url_match.group(1)
+            return text.strip()
+        
         for line in (summary_md or "").splitlines():
-            low = line.lower()
+            low = line.lower().replace("–", "-").replace("—", "-")
+            
             if "website:" in low:
-                website = line.split(":", 1)[-1].strip()
+                val = line.split(":", 1)[-1].strip()
+                url = extract_url(val)
+                if is_valid_value(url) and ("http://" in url or "https://" in url):
+                    website = url
             elif "linkedin:" in low:
-                linkedin = line.split(":", 1)[-1].strip()
+                val = line.split(":", 1)[-1].strip()
+                url = extract_url(val)
+                if is_valid_value(url) and "linkedin.com" in url.lower():
+                    linkedin = url
             elif "headquarters:" in low:
                 hq = line.split(":", 1)[-1].strip()
-                # Very rough split city / country by last comma
-                if "," in hq:
-                    parts = [p.strip() for p in hq.split(",")]
-                    if len(parts) >= 2:
-                        city = ", ".join(parts[:-1])
-                        country = parts[-1]
+                if is_valid_value(hq):
+                    # Very rough split city / country by last comma
+                    if "," in hq:
+                        parts = [p.strip() for p in hq.split(",")]
+                        if len(parts) >= 2:
+                            city = ", ".join(parts[:-1])
+                            country = parts[-1]
+                        else:
+                            city = hq
                     else:
                         city = hq
-                else:
-                    city = hq
+            elif "year founded:" in low or "- founded:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    # Extract just the year if there's extra text
+                    import re
+                    year_match = re.search(r'(\d{4})', val)
+                    if year_match:
+                        year_founded = year_match.group(1)
+            elif "- ceo:" in low or line.strip().lower().startswith("ceo:"):
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    ceo = val
+            elif "company name:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    company_name = val
 
         ai_overview = {
-            "name": query,
+            "name": company_name,
             "city": city,
             "country": country,
             "ownership": "",
             "website": website,
             "linkedin": linkedin,
             "description": description or "",
+            "year_founded": year_founded,
+            "ceo": ceo,
         }
+        print(f"[AI] Parsed overview: {ai_overview}")
     except Exception as e:
         print(f"[AI] overview generation error: {e}")
+        import traceback
+        traceback.print_exc()
 
     # 3) AI events (full capacity again – use richer query set in analyzer)
     try:
