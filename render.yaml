@@ -11,6 +11,4 @@ services:
         sync: false
       - key: SERPAPI_KEY
         sync: false
-      - key: PERPLEXITY_API_KEY
-        sync: false
 
