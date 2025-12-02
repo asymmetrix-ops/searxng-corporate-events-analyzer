@@ -719,7 +719,8 @@ def enrich_counterparties_with_individuals(events: list, main_company: str) -> l
             
         # Build query for this deal
         cp_names = [cp.get("company_name", "") for cp in counterparties if cp.get("company_name")]
-        if len(cp_names) < 2:
+        if len(cp_names) < 1:
+            print(f"         → Skipping: no counterparty names found")
             continue
         
         # Build date context
@@ -805,12 +806,14 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
                         pass
                 
                 if enrichment_data and isinstance(enrichment_data, list):
+                    print(f"         → Found {len(enrichment_data)} companies in enrichment response")
                     # Map enrichment data to counterparties
                     for enrich_cp in enrichment_data:
                         enrich_company = enrich_cp.get("company", "").lower()
                         enrich_url = enrich_cp.get("press_release_url", "")
                         enrich_linkedin = enrich_cp.get("company_linkedin_url", "")
                         enrich_individuals = enrich_cp.get("individuals", [])
+                        print(f"         → {enrich_company}: {len(enrich_individuals)} individuals found")
                         
                         # Find matching counterparty
                         for cp in counterparties:
@@ -853,9 +856,124 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
 # FILE 1: generate_events.py (or your generator file)
 # ============================================
 
+def detect_company_type(company_name: str, serpapi_key: str) -> dict:
+    """
+    Detects if a company is a startup/small company vs established enterprise.
+    Returns company type info to guide search strategy.
+    """
+    from serpapi import GoogleSearch
+    import re
+    
+    print(f"   🔍 Detecting company type for: {company_name}")
+    
+    result = {
+        "is_startup": False,
+        "is_small_company": False,
+        "founded_year": None,
+        "estimated_size": "unknown",
+        "company_type": "enterprise",  # default
+        "confidence": 0.0
+    }
+    
+    try:
+        # Quick search to understand company profile
+        queries = [
+            f'"{company_name}" founded startup',
+            f'"{company_name}" series funding OR seed round OR accelerator',
+            f'"{company_name}" site:crunchbase.com OR site:linkedin.com/company'
+        ]
+        
+        all_snippets = ""
+        for q in queries:
+            try:
+                params = {"q": q, "num": 5, "api_key": serpapi_key}
+                results = GoogleSearch(params).get_dict().get("organic_results", [])
+                for r in results:
+                    all_snippets += f" {r.get('title', '')} {r.get('snippet', '')}"
+            except:
+                pass
+        
+        all_snippets_lower = all_snippets.lower()
+        
+        # Check for startup indicators
+        startup_signals = [
+            "startup", "founded in 20", "seed round", "series a", "series b",
+            "accelerator", "incubator", "early-stage", "venture-backed",
+            "pre-seed", "angel investment", "bootstrap", "climate tech startup",
+            "fintech startup", "healthtech", "saas startup", "founded 2018",
+            "founded 2019", "founded 2020", "founded 2021", "founded 2022",
+            "founded 2023", "founded 2024", "founded 2025", "young company",
+            "emerging company", "growth-stage", "scale-up"
+        ]
+        
+        # Check for enterprise indicators
+        enterprise_signals = [
+            "fortune 500", "nasdaq:", "nyse:", "publicly traded", "billion revenue",
+            "global leader", "multinational", "established in 19", "founded 19",
+            "100+ years", "50,000 employees", "10,000 employees", "headquarters",
+            "s&p 500", "dow jones", "ftse 100", "dax", "cac 40"
+        ]
+        
+        startup_score = sum(1 for s in startup_signals if s in all_snippets_lower)
+        enterprise_score = sum(1 for s in enterprise_signals if s in all_snippets_lower)
+        
+        # Try to extract founding year
+        year_patterns = [
+            r'founded (?:in )?(\d{4})',
+            r'established (?:in )?(\d{4})',
+            r'since (\d{4})',
+            r'started (?:in )?(\d{4})'
+        ]
+        for pattern in year_patterns:
+            match = re.search(pattern, all_snippets_lower)
+            if match:
+                year = int(match.group(1))
+                result["founded_year"] = year
+                # Companies founded after 2015 are more likely startups
+                if year >= 2015:
+                    startup_score += 3
+                elif year >= 2010:
+                    startup_score += 1
+                break
+        
+        # Determine company type
+        total_signals = startup_score + enterprise_score
+        if total_signals > 0:
+            result["confidence"] = max(startup_score, enterprise_score) / total_signals
+        
+        if startup_score > enterprise_score:
+            result["is_startup"] = True
+            result["company_type"] = "startup"
+            if startup_score >= 5:
+                result["estimated_size"] = "early-stage"
+            else:
+                result["estimated_size"] = "growth-stage"
+        elif enterprise_score > startup_score:
+            result["company_type"] = "enterprise"
+            result["estimated_size"] = "large"
+        else:
+            # If unclear, check if we found ANY M&A history
+            if "acquired" in all_snippets_lower or "acquisition" in all_snippets_lower:
+                result["company_type"] = "enterprise"
+            else:
+                # Default to startup-friendly search for unknown companies
+                result["is_small_company"] = True
+                result["company_type"] = "small_company"
+        
+        print(f"   📊 Company type: {result['company_type']} (startup_score={startup_score}, enterprise_score={enterprise_score})")
+        if result["founded_year"]:
+            print(f"   📅 Founded: {result['founded_year']}")
+            
+    except Exception as e:
+        print(f"   ⚠️ Company type detection error: {e}")
+    
+    return result
+
+
 def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     """
     Fetches and extracts corporate M&A events for a company using web search and LLM.
+    Automatically detects if company is a startup and adjusts search strategy accordingly.
     
     Args:
         company_name: Name of the company to search for
@@ -874,6 +992,9 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
         return []
 
     print(f"Fetching corporate events for: {company_name} (max_events={max_events})")
+    
+    # Detect company type to optimize search strategy
+    company_info = detect_company_type(company_name, SERPAPI_KEY)
 
     def search(query):
         try:
@@ -897,10 +1018,82 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     if max_events <= 1:
         print("⚡ TESTING MODE: Using minimal queries to save credits")
         queries = [
-            f'"{company_name}" acquisition OR merger OR investment',  # Single comprehensive query
+            f'"{company_name}" acquisition OR merger OR investment OR funding',  # Single comprehensive query
+        ]
+    elif company_info.get("is_startup") or company_info.get("is_small_company") or company_info.get("company_type") in ["startup", "small_company"]:
+        # === STARTUP-OPTIMIZED QUERIES ===
+        print("🚀 Using STARTUP-optimized search queries")
+        queries = [
+            # === FUNDING ROUNDS (PRIMARY for startups) ===
+            f'"{company_name}" "raises" OR "raised" funding',
+            f'"{company_name}" "seed round" OR "pre-seed"',
+            f'"{company_name}" "series A" OR "series B" OR "series C"',
+            f'"{company_name}" funding round announced',
+            f'"{company_name}" "led by" investment OR funding',
+            f'"{company_name}" "venture capital" OR "VC" investment',
+            f'"{company_name}" angel investment OR angel investor',
+            f'"{company_name}" funding 2025 OR 2024 OR 2023',
+            
+            # === STARTUP NEWS SOURCES ===
+            f'"{company_name}" site:techcrunch.com',
+            f'"{company_name}" site:crunchbase.com',
+            f'"{company_name}" site:eu-startups.com',
+            f'"{company_name}" site:sifted.eu',
+            f'"{company_name}" site:dealroom.co',
+            f'"{company_name}" site:tech.eu',
+            f'"{company_name}" site:venturebeat.com',
+            f'"{company_name}" site:forbes.com startup',
+            f'"{company_name}" site:businessinsider.com funding',
+            
+            # === ACCELERATORS & INCUBATORS ===
+            f'"{company_name}" accelerator OR incubator',
+            f'"{company_name}" Y Combinator OR YC',
+            f'"{company_name}" Techstars OR 500 Startups',
+            f'"{company_name}" accelerator program graduate',
+            f'"{company_name}" startup competition winner',
+            f'"{company_name}" demo day OR pitch competition',
+            
+            # === GRANTS & NON-DILUTIVE FUNDING ===
+            f'"{company_name}" grant OR award funding',
+            f'"{company_name}" government grant OR innovation grant',
+            f'"{company_name}" EU grant OR Horizon Europe',
+            f'"{company_name}" climate grant OR sustainability grant',
+            f'"{company_name}" research grant OR R&D funding',
+            f'"{company_name}" Innovate UK OR EIC Accelerator',
+            
+            # === PARTNERSHIPS (important for startups) ===
+            f'"{company_name}" partnership announced',
+            f'"{company_name}" "strategic partnership" OR "partners with"',
+            f'"{company_name}" collaboration OR alliance',
+            f'"{company_name}" pilot program OR proof of concept',
+            f'"{company_name}" enterprise customer OR contract',
+            
+            # === STARTUP-SPECIFIC DEAL TYPES ===
+            f'"{company_name}" "backed by" OR "portfolio company"',
+            f'"{company_name}" "growth equity" OR "growth stage"',
+            f'"{company_name}" bridge round OR extension',
+            f'"{company_name}" convertible note OR SAFE',
+            f'"{company_name}" crowdfunding OR equity crowdfunding',
+            
+            # === CLIMATE/IMPACT TECH (if relevant) ===
+            f'"{company_name}" climate tech OR cleantech funding',
+            f'"{company_name}" sustainability startup investment',
+            f'"{company_name}" impact investing OR ESG',
+            f'"{company_name}" green investment OR carbon',
+            
+            # === ACQUISITIONS (startups get acquired too) ===
+            f'"{company_name}" acquired by',
+            f'"{company_name}" acquisition announced',
+            f'"{company_name}" exit OR "sold to"',
+            
+            # === PRESS RELEASES ===
+            f'"{company_name}" site:prnewswire.com',
+            f'"{company_name}" site:businesswire.com',
+            f'"{company_name}" announces funding OR investment',
         ]
     else:
-        # Full queries for production
+        # === ENTERPRISE/ESTABLISHED COMPANY QUERIES ===
+        print("🏢 Using ENTERPRISE-optimized search queries")
         queries = [
             # === OFFICIAL PRESS RELEASES (most accurate for dates) ===
             f'"{company_name}" acquisition site:prnewswire.com',
@@ -952,49 +1145,49 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
             f'"{company_name}" site:dealroom.co',
             
             # === DIVESTITURES & SALES ===
-        f'"{company_name}" sold OR divested',
-        f'"{company_name}" divestiture OR "sale of"',
-        f'"{company_name}" "sold to" OR "sells"',
-        
-        # === REGIONAL / GEOGRAPHIC EXPANSION ===
-        f'"{company_name}" acquired Brazil',
-        f'"{company_name}" acquired "Latin America"',
-        f'"{company_name}" acquired UK OR Australia',
-        f'"{company_name}" acquired Europe OR Germany',
-        f'"{company_name}" "bolt-on acquisition"',
-        f'"{company_name}" "strategic acquisition"',
-        f'"{company_name}" "expands" acquisition OR acquires',
-        
-        # === SPECIFIC TARGET PATTERNS (catches smaller deals) ===
-        f'"{company_name}" acquired site:agfundernews.com',
-        f'"{company_name}" acquired site:feednavigator.com',
-        f'"{company_name}" buys site:agribusinessglobal.com',
-        f'"{company_name}" "has acquired" OR "has bought"',
-        f'"{company_name}" "completed acquisition" OR "completes acquisition"',
-        f'"{company_name}" "joins" OR "joined" acquisition',
-        f'"{company_name}" "transaction" acquisition OR acquired',
-        
-        # === ANNOUNCEMENT PATTERNS ===
-        f'"{company_name}" "announces acquisition"',
-        f'"{company_name}" "completes acquisition"',
-        f'"{company_name}" "acquisition of"',
-        
-        # === INDUSTRY NEWS ===
-        f'"{company_name}" M&A deal',
-        f'"{company_name}" acquisition site:reuters.com',
-        f'"{company_name}" acquisition site:bloomberg.com',
-        
-        # === PARTNERSHIP & STRATEGIC DEALS ===
-        f'"{company_name}" partnership OR "strategic partnership"',
-        f'"{company_name}" "joint venture" OR JV',
-        f'"{company_name}" collaboration OR alliance',
-        
-        # === COMPANY INFO SOURCES ===
-        f'"{company_name}" site:zoominfo.com',
-        f'"{company_name}" site:apollo.io',
-        f'"{company_name}" site:linkedin.com/company',
-        f'"{company_name}" company funding history',
-    ]
+            f'"{company_name}" sold OR divested',
+            f'"{company_name}" divestiture OR "sale of"',
+            f'"{company_name}" "sold to" OR "sells"',
+            
+            # === REGIONAL / GEOGRAPHIC EXPANSION ===
+            f'"{company_name}" acquired Brazil',
+            f'"{company_name}" acquired "Latin America"',
+            f'"{company_name}" acquired UK OR Australia',
+            f'"{company_name}" acquired Europe OR Germany',
+            f'"{company_name}" "bolt-on acquisition"',
+            f'"{company_name}" "strategic acquisition"',
+            f'"{company_name}" "expands" acquisition OR acquires',
+            
+            # === SPECIFIC TARGET PATTERNS (catches smaller deals) ===
+            f'"{company_name}" acquired site:agfundernews.com',
+            f'"{company_name}" acquired site:feednavigator.com',
+            f'"{company_name}" buys site:agribusinessglobal.com',
+            f'"{company_name}" "has acquired" OR "has bought"',
+            f'"{company_name}" "completed acquisition" OR "completes acquisition"',
+            f'"{company_name}" "joins" OR "joined" acquisition',
+            f'"{company_name}" "transaction" acquisition OR acquired',
+            
+            # === ANNOUNCEMENT PATTERNS ===
+            f'"{company_name}" "announces acquisition"',
+            f'"{company_name}" "completes acquisition"',
+            f'"{company_name}" "acquisition of"',
+            
+            # === INDUSTRY NEWS ===
+            f'"{company_name}" M&A deal',
+            f'"{company_name}" acquisition site:reuters.com',
+            f'"{company_name}" acquisition site:bloomberg.com',
+            
+            # === PARTNERSHIP & STRATEGIC DEALS ===
+            f'"{company_name}" partnership OR "strategic partnership"',
+            f'"{company_name}" "joint venture" OR JV',
+            f'"{company_name}" collaboration OR alliance',
+            
+            # === COMPANY INFO SOURCES ===
+            f'"{company_name}" site:zoominfo.com',
+            f'"{company_name}" site:apollo.io',
+            f'"{company_name}" site:linkedin.com/company',
+            f'"{company_name}" company funding history',
+        ]
 
     search_results = []
     seen_urls = set()
@@ -1024,12 +1217,54 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
         context += f"[{i}] {result['title']}\n{result['snippet']}\nSource: {result['link']}\n\n"
     
     print(f"   → Analyzing all {results_to_analyze} search results...")
+    
+    # Determine if this is a startup for prompt customization
+    is_startup_search = company_info.get("is_startup") or company_info.get("is_small_company") or company_info.get("company_type") in ["startup", "small_company"]
+    
+    if is_startup_search:
+        extraction_checklist = f'''EXTRACTION CHECKLIST FOR STARTUPS - scan for ALL of these:
+□ FUNDING ROUNDS (HIGHEST PRIORITY for startups):
+  - Seed round, Pre-seed (look for: "seed funding", "pre-seed", "angel round")
+  - Series A, Series B, Series C, etc. (look for: "series A", "raises $X million")
+  - Bridge rounds, extension rounds
+  - Convertible notes, SAFE agreements
+  - Equity crowdfunding
+  
+□ GRANTS & NON-DILUTIVE FUNDING:
+  - Government grants (Innovate UK, EIC Accelerator, EU grants)
+  - Research grants, innovation awards
+  - Climate/sustainability grants
+  - Competition prize money
+  
+□ ACCELERATORS & INCUBATORS:
+  - Y Combinator, Techstars, 500 Startups participation
+  - Demo Day presentations
+  - Startup competition wins
+  - Incubator program completion
+  
+□ PARTNERSHIPS & CONTRACTS:
+  - Strategic partnerships with enterprises
+  - Pilot programs, proof of concept deals
+  - Major customer contracts
+  - Distribution agreements
+  
+□ ACQUISITIONS (startups get acquired):
+  - Being acquired by larger company
+  - Acqui-hire situations
+  - Exit events
+  
+□ INVESTMENTS MADE BY STARTUP (if any):
+  - Acquisitions of smaller companies
+  - Strategic investments
 
-    prompt = f'''Extract ALL corporate events for "{company_name}" from the {results_to_analyze} search results below.
-
-YOUR GOAL: Find and return up to {max_events} UNIQUE corporate events including M&A, funding, and partnerships.
-
-EXTRACTION CHECKLIST - scan for ALL of these:
+STARTUP-SPECIFIC SIGNALS to look for:
+- "raises", "raised", "secures", "closes" + funding amount
+- "led by", "participated by", "backed by" + investor names
+- "graduates from", "selected for", "joins" + accelerator name
+- "wins", "awarded", "receives" + grant or prize
+- "partners with", "signs deal with" + enterprise name'''
+    else:
+        extraction_checklist = f'''EXTRACTION CHECKLIST - scan for ALL of these:
 □ Companies that "{company_name}" acquired (look for: "acquired", "buys", "bought", "acquisition of")
 □ Companies that "{company_name}" merged with
 □ Investors/PE firms/VCs that invested in "{company_name}"
@@ -1046,7 +1281,13 @@ COMMON MISSED DEALS - pay special attention to:
 - Brazilian acquisitions (look for: Brazil, Latin America, LATAM)
 - Research company acquisitions (look for: Research, Solutions, Analytics)
 - Climate tech, fintech, healthtech sector deals
-- Early-stage investments and accelerator programs
+- Early-stage investments and accelerator programs'''
+
+    prompt = f'''Extract ALL corporate events for "{company_name}" from the {results_to_analyze} search results below.
+
+YOUR GOAL: Find and return up to {max_events} UNIQUE corporate events including M&A, funding, grants, accelerators, and partnerships.
+
+{extraction_checklist}
 
 EXTRACTION RULES:
 1. Each unique target company = separate event (even if small deal)
@@ -1098,23 +1339,25 @@ For EACH verified event, extract these EXACT fields:
    Example: "On February 24, 2025, Kynetec, a global leader in agricultural market research, completed its acquisition of Freshlogic, an Australian food and beverage analytics firm. The transaction, terms undisclosed, expands Kynetec's capabilities in food supply chain intelligence and strengthens its presence in the Asia-Pacific region. The deal was backed by Paine Schwartz Partners, Kynetec's majority shareholder."
 
 6. **deal_type**: Use EXACTLY one of these (match case exactly):
-   - "Acquisition"
-   - "Sale"
-   - "IPO"
-   - "MBO"
-   - "Investment"
-   - "Strategic Review"
-   - "Divestment"
-   - "Restructuring"
-   - "Dual track"
-   - "Closing"
-   - "Grant"
-   - "Debt financing"
-   - "Bankruptcy"
-   - "Reorganisation"
-   - "Employee tender offer"
-   - "Rebrand"
-   - "Partnership"
+   - "Acquisition" — company acquired another company
+   - "Sale" — company was sold/acquired by another
+   - "IPO" — initial public offering
+   - "MBO" — management buyout
+   - "Investment" — VC/PE investment, funding round (Seed, Series A/B/C, etc.)
+   - "Strategic Review" — exploring strategic options
+   - "Divestment" — selling off assets/divisions
+   - "Restructuring" — corporate restructuring
+   - "Dual track" — pursuing multiple exit options
+   - "Closing" — deal completion/closing
+   - "Grant" — government grant, innovation grant, research funding
+   - "Debt financing" — debt/loan financing
+   - "Bankruptcy" — bankruptcy filing
+   - "Reorganisation" — corporate reorganization
+   - "Employee tender offer" — employee stock buyback
+   - "Rebrand" — company rebranding
+   - "Partnership" — strategic partnership, collaboration, alliance
+   - "Accelerator" — accelerator/incubator program participation
+   - "Award" — competition win, prize, recognition with funding
 
 7. **deal_status**: Use EXACTLY one of these based on the deal's current state:
    - "Completed" — deal is finalized/closed
@@ -1175,6 +1418,25 @@ For EACH verified event, extract these EXACT fields:
      - linkedin_url: "" (leave empty for now)
      Look for: CEOs, CFOs, deal leads, executives quoted in press releases about this transaction
 
+11. **advisors**: Array of professional advisory firms that advised on this transaction.
+   
+   ADVISOR TYPES:
+   - Financial advisors (investment banks): Goldman Sachs, Morgan Stanley, JP Morgan, Lazard, Evercore, Centerview Partners, PJT Partners, Rothschild, Moelis, Jefferies, etc.
+   - Legal advisors (law firms): Skadden, Sullivan & Cromwell, Wachtell Lipton, Kirkland & Ellis, Simpson Thacher, Latham & Watkins, Davis Polk, Freshfields, Clifford Chance, etc.
+   - Consulting/Due Diligence: McKinsey, BCG, Bain, Deloitte, EY, KPMG, PwC, etc.
+   
+   For EACH advisor include:
+   - advisor_name: Exact name of the advisory firm (REQUIRED)
+   - advisor_type: "Financial Advisor" | "Legal Advisor" | "Due Diligence" | "Tax Advisor" | "Other"
+   - advised_party: Which counterparty they advised (e.g., "S&P Global", "Target", "Buyer")
+   - announcement_url: URL where this advisor relationship was mentioned, if available
+   
+   ADVISOR EXTRACTION TIPS:
+   - Look for phrases like "advised by", "financial advisor to", "legal counsel to", "represented by"
+   - Investment banks often advise on deal terms, valuation, and negotiations
+   - Law firms handle legal documentation, regulatory filings, due diligence
+   - If no advisors mentioned, use empty array []
+
 COUNTERPARTY EXTRACTION RULES:
 ✓ EVERY deal has at least 2 counterparties (e.g., Acquirer + Target)
 ✓ The company "{company_name}" should appear as a counterparty in each event
@@ -1217,6 +1479,10 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "counterparties": [
       {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Douglas Peterson", "title": "President & CEO", "linkedin_url": ""}}]}},
       {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Lance Uggla", "title": "Chairman & CEO", "linkedin_url": ""}}]}}
+    ],
+    "advisors": [
+      {{"advisor_name": "Goldman Sachs", "advisor_type": "Financial Advisor", "advised_party": "S&P Global", "announcement_url": ""}},
+      {{"advisor_name": "Davis Polk & Wardwell", "advisor_type": "Legal Advisor", "advised_party": "S&P Global", "announcement_url": ""}}
     ]
   }},
   {{
@@ -1231,7 +1497,8 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "counterparties": [
       {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": []}},
       {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": []}}
-    ]
+    ],
+    "advisors": []
   }},
   {{
     "announcement_date": "Jan 15, 2021",
@@ -1245,6 +1512,9 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "counterparties": [
       {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Martina Cheung", "title": "President, S&P Global Market Intelligence", "linkedin_url": ""}}]}},
       {{"company_name": "Visible Alpha", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Scott Ryles", "title": "CEO", "linkedin_url": ""}}]}}
+    ],
+    "advisors": [
+      {{"advisor_name": "Jefferies", "advisor_type": "Financial Advisor", "advised_party": "Visible Alpha", "announcement_url": ""}}
     ]
   }}
 ]
@@ -1320,6 +1590,17 @@ JSON:'''
             elif not deal_status:
                 deal_status = "Unknown"
             
+            # Extract advisors
+            advisors = []
+            for adv in e.get("advisors", []):
+                if adv and isinstance(adv, dict):
+                    advisors.append({
+                        "advisor_name": str(adv.get("advisor_name", "")).strip(),
+                        "advisor_type": str(adv.get("advisor_type", "")).strip(),
+                        "advised_party": str(adv.get("advised_party", "")).strip(),
+                        "announcement_url": str(adv.get("announcement_url", "")).strip()
+                    })
+            
             result.append({
                 "Announcement Date": announcement_date,
                 "Closed Date": closed_date,
@@ -1331,7 +1612,8 @@ JSON:'''
                 "Event type": deal_type,  # Keep for backwards compatibility
                 "Event value (USD)": str(e.get("value_usd", e.get("value", "Undisclosed"))).strip(),
                 "Source URL": str(e.get("source_url", "")).strip(),
-                "counterparties": counterparties
+                "counterparties": counterparties,
+                "advisors": advisors
             })
 
         print(f"SUCCESS: {len(result)} corporate events loaded for {company_name}")
@@ -1343,8 +1625,10 @@ JSON:'''
         # Log counterparty summary
         total_counterparties = sum(len(e.get("counterparties", [])) for e in result)
         total_individuals = sum(len(cp.get("individuals", [])) for e in result for cp in e.get("counterparties", []))
+        total_advisors = sum(len(e.get("advisors", [])) for e in result)
         print(f"   → {total_counterparties} counterparties extracted across {len(result)} events")
         print(f"   → {total_individuals} individuals identified")
+        print(f"   → {total_advisors} advisors identified")
         
         # Log date and status extraction
         events_with_announcement = sum(1 for e in result if e.get("Announcement Date"))

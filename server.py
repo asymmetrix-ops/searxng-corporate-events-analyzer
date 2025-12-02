@@ -14,6 +14,7 @@ from searxng_analyzer import (
     generate_summary,
     generate_description,
     get_wikipedia_summary,
+    get_top_management,
 )
 
 import requests
@@ -315,6 +316,17 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
     else:
         missing_events = ai_events
 
+    # 4.5) Fetch Top Management
+    top_management = []
+    try:
+        print(f"[AI] Fetching top management for {query}...")
+        mgmt_list, mgmt_text = get_top_management(query)
+        if mgmt_list and isinstance(mgmt_list, list):
+            top_management = mgmt_list
+            print(f"[AI] Found {len(top_management)} executives")
+    except Exception as e:
+        print(f"[AI] get_top_management error: {e}")
+
     # 5) DB overview (normalize to same structure as AI side)
     db_overview = None
     if db_company:
@@ -352,6 +364,7 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             "ai_events": ai_events,
             "missing_events": missing_events,
             "matched_events": matched_events,
+            "top_management": top_management,
         }
     )
 

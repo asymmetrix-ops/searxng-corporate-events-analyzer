@@ -271,6 +271,16 @@
         text-decoration: underline;
       }
 
+      /* Date input styling for dark mode */
+      input[type="date"] {
+        color-scheme: dark;
+      }
+      
+      input[type="date"]::-webkit-calendar-picker-indicator {
+        filter: invert(0.8);
+        cursor: pointer;
+      }
+
       @media (max-width: 900px) {
         .split {
           grid-template-columns: 1fr;
@@ -310,10 +320,25 @@
         </div>
         <div class="hint-row">
           <small
-            >If the URL exists in Xano, we’ll fetch DB events and compare to AI
+            >If the URL exists in Xano, we'll fetch DB events and compare to AI
             events.</small
           >
-          <small>AI limited to <code>1</code> corporate event for testing.</small>
+          <small id="dbStatusBadge" style="display: none;"></small>
+        </div>
+        <!-- Database Status Badge -->
+        <div id="xanoStatusContainer" style="margin-top: 12px; display: none;">
+          <div id="xanoStatusBadge" style="
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+          ">
+            <span id="xanoStatusIcon"></span>
+            <span id="xanoStatusText"></span>
+          </div>
         </div>
       </section>
 
@@ -380,6 +405,21 @@
         </div>
       </section>
 
+      <!-- Top Management Section -->
+      <section class="panel" style="margin-top: 18px;">
+        <div class="column-header">
+          <div>
+            <strong>👔 Top Management</strong>
+            <span id="mgmtMeta" class="pill">Waiting for query…</span>
+          </div>
+        </div>
+        <div id="topManagement" class="events-list">
+          <div class="empty-state">
+            Run an analysis to see company leadership here.
+          </div>
+        </div>
+      </section>
+
       <section style="margin-top: 18px">
         <div class="column-header">
           <div>
@@ -404,8 +444,57 @@
       const dbOverviewMeta = document.getElementById("dbOverviewMeta");
       const logEl = document.getElementById("log");
       const statusPill = document.getElementById("statusPill");
+      const xanoStatusContainer = document.getElementById("xanoStatusContainer");
+      const xanoStatusBadge = document.getElementById("xanoStatusBadge");
+      const xanoStatusIcon = document.getElementById("xanoStatusIcon");
+      const xanoStatusText = document.getElementById("xanoStatusText");
+      const topManagementEl = document.getElementById("topManagement");
+      const mgmtMetaEl = document.getElementById("mgmtMeta");
 
       const XANO_BASE = "{{ xano_base_url }}";
+      
+      // Global state flags (initialize early)
+      window._companyExistsInDb = false;
+      window._dbDescription = null;
+      
+      // Function to update Xano status badge
+      function updateXanoStatus(existingCompany, dbCompany) {
+        xanoStatusContainer.style.display = "block";
+        
+        if (existingCompany && existingCompany.id) {
+          // Company found in database
+          window._companyExistsInDb = true;
+          xanoStatusBadge.style.background = "rgba(5, 150, 105, 0.15)";
+          xanoStatusBadge.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+          xanoStatusBadge.style.color = "#6ee7b7";
+          xanoStatusIcon.textContent = "✅";
+          const companyName = dbCompany?.name || `ID: ${existingCompany.id}`;
+          xanoStatusText.innerHTML = `<strong>Found in Database</strong> — ${companyName} (ID: ${existingCompany.id})`;
+          
+          // Hide "Create in DB" button, show "Copy from DB" if description exists
+          const createContainer = document.getElementById("createInDbContainer");
+          if (createContainer) createContainer.style.display = "none";
+        } else {
+          // Company NOT found in database
+          window._companyExistsInDb = false;
+          xanoStatusBadge.style.background = "rgba(239, 68, 68, 0.1)";
+          xanoStatusBadge.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+          xanoStatusBadge.style.color = "#fca5a5";
+          xanoStatusIcon.textContent = "⚠️";
+          xanoStatusText.innerHTML = `<strong>Not in Database</strong> — Company will be analyzed using AI only`;
+          
+          // Show "Create in DB" button, hide "Copy from DB"
+          const createContainer = document.getElementById("createInDbContainer");
+          if (createContainer) createContainer.style.display = "block";
+          const copyContainer = document.getElementById("copyFromDbContainer");
+          if (copyContainer) copyContainer.style.display = "none";
+        }
+      }
+      
+      // Function to reset/hide the status badge
+      function resetXanoStatus() {
+        xanoStatusContainer.style.display = "none";
+      }
 
       // Deal / status options (mirrors Streamlit version)
       const DEAL_TYPES = [
@@ -468,6 +557,7 @@
         dbEventsEl.innerHTML = "";
         aiOverviewEl.innerHTML = "";
         dbOverviewEl.innerHTML = "";
+        topManagementEl.innerHTML = "";
       }
 
       function renderAIOverview(data) {
@@ -578,20 +668,104 @@
         desc.style.color = "#e5e7eb";
         desc.style.fontSize = "12px";
 
+        // "Copy from DB" button container
+        const copyFromDbContainer = document.createElement("div");
+        copyFromDbContainer.id = "copyFromDbContainer";
+        copyFromDbContainer.style.marginTop = "8px";
+        copyFromDbContainer.style.display = "none"; // Hidden by default, shown if DB has description
+
+        const copyFromDbBtn = document.createElement("button");
+        copyFromDbBtn.id = "copyFromDbBtn";
+        copyFromDbBtn.innerHTML = "📋 Copy Description from Database";
+        copyFromDbBtn.style.padding = "6px 12px";
+        copyFromDbBtn.style.borderRadius = "8px";
+        copyFromDbBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+        copyFromDbBtn.style.background = "rgba(99, 102, 241, 0.15)";
+        copyFromDbBtn.style.color = "#a5b4fc";
+        copyFromDbBtn.style.fontSize = "11px";
+        copyFromDbBtn.style.cursor = "pointer";
+        copyFromDbBtn.style.transition = "all 0.15s ease";
+        copyFromDbBtn.onmouseover = () => {
+          copyFromDbBtn.style.background = "rgba(99, 102, 241, 0.25)";
+          copyFromDbBtn.style.borderColor = "rgba(99, 102, 241, 0.6)";
+        };
+        copyFromDbBtn.onmouseout = () => {
+          copyFromDbBtn.style.background = "rgba(99, 102, 241, 0.15)";
+          copyFromDbBtn.style.borderColor = "rgba(99, 102, 241, 0.4)";
+        };
+        copyFromDbBtn.onclick = () => {
+          if (window._dbDescription) {
+            desc.value = window._dbDescription;
+            log("Copied description from database", "ok");
+            // Visual feedback
+            copyFromDbBtn.innerHTML = "✅ Copied!";
+            copyFromDbBtn.style.background = "rgba(16, 185, 129, 0.2)";
+            copyFromDbBtn.style.borderColor = "rgba(16, 185, 129, 0.5)";
+            copyFromDbBtn.style.color = "#6ee7b7";
+            setTimeout(() => {
+              copyFromDbBtn.innerHTML = "📋 Copy Description from Database";
+              copyFromDbBtn.style.background = "rgba(99, 102, 241, 0.15)";
+              copyFromDbBtn.style.borderColor = "rgba(99, 102, 241, 0.4)";
+              copyFromDbBtn.style.color = "#a5b4fc";
+            }, 2000);
+          }
+        };
+        copyFromDbContainer.appendChild(copyFromDbBtn);
+
+        // "Create in DB" button container (shown when company NOT in database)
+        const createInDbContainer = document.createElement("div");
+        createInDbContainer.id = "createInDbContainer";
+        createInDbContainer.style.marginTop = "10px";
+        // Show by default if company is NOT in DB (checked via global flag)
+        createInDbContainer.style.display = window._companyExistsInDb ? "none" : "block";
+
+        const createInDbBtn = document.createElement("button");
+        createInDbBtn.id = "createInDbBtn";
+        createInDbBtn.innerHTML = "➕ Create Company in Database";
+        createInDbBtn.style.padding = "8px 16px";
+        createInDbBtn.style.borderRadius = "8px";
+        createInDbBtn.style.border = "1px solid rgba(16, 185, 129, 0.4)";
+        createInDbBtn.style.background = "rgba(16, 185, 129, 0.15)";
+        createInDbBtn.style.color = "#6ee7b7";
+        createInDbBtn.style.fontSize = "12px";
+        createInDbBtn.style.fontWeight = "600";
+        createInDbBtn.style.cursor = "pointer";
+        createInDbBtn.style.transition = "all 0.15s ease";
+        createInDbBtn.onmouseover = () => {
+          createInDbBtn.style.background = "rgba(16, 185, 129, 0.25)";
+          createInDbBtn.style.borderColor = "rgba(16, 185, 129, 0.6)";
+        };
+        createInDbBtn.onmouseout = () => {
+          createInDbBtn.style.background = "rgba(16, 185, 129, 0.15)";
+          createInDbBtn.style.borderColor = "rgba(16, 185, 129, 0.4)";
+        };
+        createInDbBtn.onclick = async () => {
+          await createCompanyInDb(createInDbBtn);
+        };
+        createInDbContainer.appendChild(createInDbBtn);
+
         card.appendChild(nameInput);
         card.appendChild(rowLoc);
         card.appendChild(rowLinks);
         card.appendChild(desc);
+        card.appendChild(copyFromDbContainer);
+        card.appendChild(createInDbContainer);
 
         aiOverviewEl.appendChild(card);
       }
 
       function renderDBOverview(data) {
         dbOverviewEl.innerHTML = "";
+        // Reset the DB description
+        window._dbDescription = null;
+        
         if (!data) {
           dbOverviewEl.innerHTML =
             '<div class="empty-state">No DB overview available.</div>';
           dbOverviewMeta.textContent = "No company";
+          // Hide the "Copy from DB" button
+          const copyContainer = document.getElementById("copyFromDbContainer");
+          if (copyContainer) copyContainer.style.display = "none";
           return;
         }
         dbOverviewMeta.textContent = "Loaded from Xano";
@@ -656,9 +830,159 @@
           p.style.color = "#d1d5db";
           p.textContent = data.description;
           card.appendChild(p);
+          
+          // Store the DB description and show the "Copy from DB" button
+          window._dbDescription = data.description;
+          const copyContainer = document.getElementById("copyFromDbContainer");
+          if (copyContainer) {
+            copyContainer.style.display = "block";
+          }
+        } else {
+          // Hide the "Copy from DB" button if no description
+          const copyContainer = document.getElementById("copyFromDbContainer");
+          if (copyContainer) copyContainer.style.display = "none";
         }
 
         dbOverviewEl.appendChild(card);
+      }
+
+      function renderTopManagement(executives) {
+        topManagementEl.innerHTML = "";
+        if (!executives || !executives.length) {
+          topManagementEl.innerHTML =
+            '<div class="empty-state">No top management data found.</div>';
+          mgmtMetaEl.textContent = "0 executives";
+          return;
+        }
+
+        mgmtMetaEl.textContent = `${executives.length} executive${executives.length > 1 ? "s" : ""}`;
+
+        // Create a grid for executives
+        const grid = document.createElement("div");
+        grid.style.display = "grid";
+        grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(280px, 1fr))";
+        grid.style.gap = "12px";
+
+        executives.forEach((exec, idx) => {
+          const card = document.createElement("div");
+          card.className = "event-card";
+          card.style.padding = "12px";
+
+          // Name and position
+          const nameRow = document.createElement("div");
+          nameRow.style.display = "flex";
+          nameRow.style.justifyContent = "space-between";
+          nameRow.style.alignItems = "flex-start";
+          nameRow.style.marginBottom = "6px";
+
+          const nameDiv = document.createElement("div");
+          const name = document.createElement("div");
+          name.className = "event-title";
+          name.textContent = exec.name || "Unknown";
+          name.style.fontSize = "14px";
+          nameDiv.appendChild(name);
+
+          const position = document.createElement("div");
+          position.style.fontSize = "12px";
+          position.style.color = "#a5b4fc";
+          position.style.marginTop = "2px";
+          position.textContent = exec.position || "";
+          nameDiv.appendChild(position);
+
+          nameRow.appendChild(nameDiv);
+
+          // Status badge
+          const status = exec.status || "Current";
+          const statusBadge = document.createElement("span");
+          statusBadge.style.fontSize = "10px";
+          statusBadge.style.padding = "2px 8px";
+          statusBadge.style.borderRadius = "999px";
+          statusBadge.style.whiteSpace = "nowrap";
+          if (status.toLowerCase() === "current") {
+            statusBadge.style.background = "rgba(16, 185, 129, 0.15)";
+            statusBadge.style.color = "#6ee7b7";
+            statusBadge.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+          } else {
+            statusBadge.style.background = "rgba(156, 163, 175, 0.15)";
+            statusBadge.style.color = "#9ca3af";
+            statusBadge.style.border = "1px solid rgba(156, 163, 175, 0.3)";
+          }
+          statusBadge.textContent = status;
+          nameRow.appendChild(statusBadge);
+
+          card.appendChild(nameRow);
+
+          // Location
+          if (exec.location) {
+            const loc = document.createElement("div");
+            loc.style.fontSize = "11px";
+            loc.style.color = "#9ca3af";
+            loc.style.marginBottom = "6px";
+            loc.textContent = "📍 " + exec.location;
+            card.appendChild(loc);
+          }
+
+          // Bio
+          if (exec.bio) {
+            const bio = document.createElement("div");
+            bio.style.fontSize = "11px";
+            bio.style.color = "#d1d5db";
+            bio.style.lineHeight = "1.5";
+            bio.style.marginTop = "8px";
+            bio.textContent = exec.bio;
+            card.appendChild(bio);
+          }
+
+          // LinkedIn link if available
+          if (exec.linkedin_url) {
+            const link = document.createElement("a");
+            link.href = exec.linkedin_url;
+            link.target = "_blank";
+            link.className = "source-link";
+            link.style.display = "inline-block";
+            link.style.marginTop = "8px";
+            link.textContent = "🔗 LinkedIn Profile";
+            card.appendChild(link);
+          }
+
+          // Add to DB button
+          const addBtnContainer = document.createElement("div");
+          addBtnContainer.style.marginTop = "10px";
+          addBtnContainer.style.borderTop = "1px solid rgba(255,255,255,0.1)";
+          addBtnContainer.style.paddingTop = "10px";
+
+          const addBtn = document.createElement("button");
+          addBtn.textContent = "➕ Add to Database";
+          addBtn.style.padding = "6px 12px";
+          addBtn.style.fontSize = "11px";
+          addBtn.style.borderRadius = "6px";
+          addBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          addBtn.style.background = "rgba(99, 102, 241, 0.15)";
+          addBtn.style.color = "#a5b4fc";
+          addBtn.style.cursor = "pointer";
+          addBtn.style.transition = "all 0.15s ease";
+          addBtn.style.width = "100%";
+          addBtn.onmouseover = () => {
+            addBtn.style.background = "rgba(99, 102, 241, 0.25)";
+            addBtn.style.borderColor = "rgba(99, 102, 241, 0.6)";
+          };
+          addBtn.onmouseout = () => {
+            addBtn.style.background = "rgba(99, 102, 241, 0.15)";
+            addBtn.style.borderColor = "rgba(99, 102, 241, 0.4)";
+          };
+          addBtn.onclick = async () => {
+            const execName = exec.name || "";
+            const execBio = exec.position || exec.bio || "";
+            const execLinkedIn = exec.linkedin_url || "";
+            await addIndividualToDb(execName, execBio, execLinkedIn, addBtn);
+          };
+          addBtnContainer.appendChild(addBtn);
+          card.appendChild(addBtnContainer);
+
+          grid.appendChild(card);
+        });
+
+        topManagementEl.appendChild(grid);
       }
 
       function renderAIEvents(events, missing) {
@@ -735,11 +1059,24 @@
           datesRow.style.gap = "6px";
           datesRow.style.marginTop = "6px";
 
+          // Helper to convert various date formats to YYYY-MM-DD for date input
+          function parseToDateValue(dateStr) {
+            if (!dateStr || dateStr === "Unknown" || dateStr === "Not available") return "";
+            // Try to parse the date
+            const d = new Date(dateStr);
+            if (!isNaN(d.getTime())) {
+              return d.toISOString().split('T')[0];
+            }
+            // If already in YYYY-MM-DD format
+            if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+            return "";
+          }
+
           const annInput = document.createElement("input");
-          annInput.type = "text";
-          annInput.placeholder = "Announcement (YYYY-MM-DD)";
+          annInput.type = "date";
+          annInput.title = "Announcement Date";
           annInput.id = `ev_${idx}_ann`;
-          annInput.value = annDate !== "Unknown" ? annDate : "";
+          annInput.value = parseToDateValue(annDate);
           annInput.style.flex = "1";
           annInput.style.padding = "3px 7px";
           annInput.style.borderRadius = "999px";
@@ -747,13 +1084,13 @@
           annInput.style.background = "#020617";
           annInput.style.color = "#e5e7eb";
           annInput.style.fontSize = "11px";
+          annInput.style.cursor = "pointer";
 
           const closedInput = document.createElement("input");
-          closedInput.type = "text";
-          closedInput.placeholder = "Closed (YYYY-MM-DD)";
+          closedInput.type = "date";
+          closedInput.title = "Closed Date";
           closedInput.id = `ev_${idx}_closed`;
-          closedInput.value =
-            closed && closed !== "Not available" ? closed : "";
+          closedInput.value = parseToDateValue(closed);
           closedInput.style.flex = "1";
           closedInput.style.padding = "3px 7px";
           closedInput.style.borderRadius = "999px";
@@ -761,6 +1098,7 @@
           closedInput.style.background = "#020617";
           closedInput.style.color = "#e5e7eb";
           closedInput.style.fontSize = "11px";
+          closedInput.style.cursor = "pointer";
 
           datesRow.appendChild(annInput);
           datesRow.appendChild(closedInput);
@@ -900,24 +1238,122 @@
               cpBlock.appendChild(line);
 
               if (indiv.length) {
-                const ppl = document.createElement("div");
-                ppl.style.marginLeft = "10px";
-                ppl.style.color = "#9ca3af";
-                ppl.textContent =
-                  "Key people: " +
-                  indiv
-                    .slice(0, 4)
-                    .map((i) =>
-                      [i.name || "Unknown", i.title || i.job_title || ""]
-                        .filter(Boolean)
-                        .join(" – ")
-                    )
-                    .join(", ");
-                cpBlock.appendChild(ppl);
+                const pplContainer = document.createElement("div");
+                pplContainer.style.marginLeft = "10px";
+                pplContainer.style.marginTop = "4px";
+                
+                const pplLabel = document.createElement("div");
+                pplLabel.style.color = "#9ca3af";
+                pplLabel.style.fontSize = "11px";
+                pplLabel.style.marginBottom = "4px";
+                pplLabel.textContent = "Key people:";
+                pplContainer.appendChild(pplLabel);
+                
+                indiv.slice(0, 6).forEach((person, personIdx) => {
+                  const personName = person.name || "Unknown";
+                  const personTitle = person.title || person.job_title || "";
+                  const personLinkedIn = person.linkedin_url || "";
+                  
+                  const personRow = document.createElement("div");
+                  personRow.style.display = "flex";
+                  personRow.style.alignItems = "center";
+                  personRow.style.gap = "8px";
+                  personRow.style.marginBottom = "3px";
+                  personRow.style.marginLeft = "8px";
+                  
+                  // Person info
+                  const personInfo = document.createElement("span");
+                  personInfo.style.color = "#d1d5db";
+                  personInfo.style.fontSize = "12px";
+                  let personHtml = `👤 <strong>${personName}</strong>`;
+                  if (personTitle) {
+                    personHtml += ` <span style="opacity:0.7;">– ${personTitle}</span>`;
+                  }
+                  if (personLinkedIn) {
+                    personHtml += ` <a href="${personLinkedIn}" target="_blank" class="source-link">[LinkedIn]</a>`;
+                  }
+                  personInfo.innerHTML = personHtml;
+                  personRow.appendChild(personInfo);
+                  
+                  // Add button for individual
+                  const addBtn = document.createElement("button");
+                  addBtn.textContent = "Add";
+                  addBtn.style.padding = "2px 8px";
+                  addBtn.style.fontSize = "10px";
+                  addBtn.style.borderRadius = "4px";
+                  addBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+                  addBtn.style.background = "rgba(99, 102, 241, 0.15)";
+                  addBtn.style.color = "#a5b4fc";
+                  addBtn.style.cursor = "pointer";
+                  addBtn.style.transition = "all 0.15s ease";
+                  addBtn.onmouseover = () => {
+                    addBtn.style.background = "rgba(99, 102, 241, 0.25)";
+                    addBtn.style.borderColor = "rgba(99, 102, 241, 0.6)";
+                  };
+                  addBtn.onmouseout = () => {
+                    addBtn.style.background = "rgba(99, 102, 241, 0.15)";
+                    addBtn.style.borderColor = "rgba(99, 102, 241, 0.4)";
+                  };
+                  addBtn.onclick = async () => {
+                    await addIndividualToDb(personName, personTitle, personLinkedIn, addBtn);
+                  };
+                  personRow.appendChild(addBtn);
+                  
+                  pplContainer.appendChild(personRow);
+                });
+                
+                cpBlock.appendChild(pplContainer);
               }
             });
 
             container.appendChild(cpBlock);
+          }
+
+          // Advisors section for AI events
+          const advisors = ev.advisors || [];
+          if (advisors.length) {
+            const advisorBlock = document.createElement("div");
+            advisorBlock.style.marginTop = "8px";
+            advisorBlock.style.padding = "8px";
+            advisorBlock.style.background = "rgba(251, 191, 36, 0.08)";
+            advisorBlock.style.borderRadius = "6px";
+            advisorBlock.style.border = "1px solid rgba(251, 191, 36, 0.2)";
+            advisorBlock.style.fontSize = "11px";
+
+            const advisorHeading = document.createElement("div");
+            advisorHeading.style.color = "#fbbf24";
+            advisorHeading.style.marginBottom = "4px";
+            advisorHeading.style.fontWeight = "600";
+            advisorHeading.textContent = `🎯 Advisors (${advisors.length})`;
+            advisorBlock.appendChild(advisorHeading);
+
+            advisors.forEach((adv) => {
+              const advName = adv.advisor_name || "Unknown Advisor";
+              const advType = adv.advisor_type || "";
+              const advisedParty = adv.advised_party || "";
+              const advUrl = adv.announcement_url || "";
+
+              const advRow = document.createElement("div");
+              advRow.style.marginLeft = "8px";
+              advRow.style.marginBottom = "3px";
+              advRow.style.color = "#fcd34d";
+
+              let advHtml = `• <strong>${advName}</strong>`;
+              if (advType) {
+                advHtml += ` <span style="opacity:0.7;">(${advType})</span>`;
+              }
+              if (advisedParty) {
+                advHtml += ` <span style="color:#9ca3af;">→ advised ${advisedParty}</span>`;
+              }
+              if (advUrl) {
+                advHtml += ` <a href="${advUrl}" target="_blank" class="source-link">[Link]</a>`;
+              }
+
+              advRow.innerHTML = advHtml;
+              advisorBlock.appendChild(advRow);
+            });
+
+            container.appendChild(advisorBlock);
           }
 
           aiEventsEl.appendChild(container);
@@ -1015,8 +1451,270 @@
             card.appendChild(cpContainer);
           }
 
+          // Advisors section for DB events
+          const advisors = ev.advisors || [];
+          if (advisors.length) {
+            const advisorContainer = document.createElement("div");
+            advisorContainer.style.marginTop = "8px";
+            advisorContainer.style.fontSize = "11px";
+            advisorContainer.style.padding = "8px";
+            advisorContainer.style.background = "rgba(251, 191, 36, 0.08)";
+            advisorContainer.style.borderRadius = "6px";
+            advisorContainer.style.border = "1px solid rgba(251, 191, 36, 0.2)";
+
+            const advisorHeading = document.createElement("div");
+            advisorHeading.style.color = "#fbbf24";
+            advisorHeading.style.marginBottom = "4px";
+            advisorHeading.style.fontWeight = "600";
+            advisorHeading.textContent = `🎯 Advisors (${advisors.length})`;
+            advisorContainer.appendChild(advisorHeading);
+
+            advisors.forEach((adv) => {
+              const advCompany = adv.advisor_company || {};
+              const advName = advCompany.name || "Unknown Advisor";
+              const advUrl = adv.announcement_url || "";
+
+              const advLine = document.createElement("div");
+              advLine.style.marginLeft = "8px";
+              advLine.style.marginBottom = "2px";
+              let advHtml = `• <strong>${advName}</strong>`;
+              if (advUrl) {
+                advHtml += ` <a href="${advUrl}" target="_blank" class="source-link">[Link]</a>`;
+              }
+              advLine.innerHTML = advHtml;
+              advisorContainer.appendChild(advLine);
+            });
+
+            card.appendChild(advisorContainer);
+          }
+
           dbEventsEl.appendChild(card);
         });
+      }
+
+      // Create company in database (when company doesn't exist)
+      async function createCompanyInDb(button) {
+        button.disabled = true;
+        button.innerHTML = "⏳ Creating…";
+        log("Creating company in database...", "warn");
+
+        try {
+          // Get values from AI overview form
+          const nameInput = document.getElementById("ai_name");
+          const cityInput = document.getElementById("ai_city");
+          const countryInput = document.getElementById("ai_country");
+          const websiteInput = document.getElementById("ai_website");
+          const linkedinInput = document.getElementById("ai_linkedin");
+          const descInput = document.getElementById("ai_description");
+
+          const name = nameInput?.value?.trim() || "";
+          const city = cityInput?.value?.trim() || "";
+          const country = countryInput?.value?.trim() || "";
+          const website = websiteInput?.value?.trim() || "";
+          const linkedin = linkedinInput?.value?.trim() || "";
+          const description = descInput?.value?.trim() || "";
+
+          if (!name) {
+            log("Error: Company name is required", "err");
+            button.disabled = false;
+            button.innerHTML = "➕ Create Company in Database";
+            return;
+          }
+
+          // Step 1: Get location_id from city/country
+          log(`Step 1: Getting location ID for ${city}, ${country}...`, "info");
+          let locationId = 0;
+          
+          if (city || country) {
+            try {
+              const locUrl = `${XANO_BASE}/api:8Bv5PK4I/get_location?city=${encodeURIComponent(city)}&country=${encodeURIComponent(country)}`;
+              log(`GET ${locUrl}`, "info");
+              
+              const locRes = await fetch(locUrl, {
+                method: "GET",
+                headers: { "Content-Type": "application/json" },
+              });
+              
+              const locData = await locRes.json();
+              log(`Location response: ${JSON.stringify(locData)}`, "info");
+              
+              if (locData && locData.id) {
+                locationId = locData.id;
+                log(`✅ Got location ID: ${locationId}`, "ok");
+              } else {
+                log("⚠️ No location ID found, using 0", "warn");
+              }
+            } catch (locErr) {
+              log(`⚠️ Location lookup failed: ${locErr.message}`, "warn");
+            }
+          }
+
+          // Step 2: Create company with POST
+          log(`Step 2: Creating company "${name}"...`, "info");
+          
+          const payload = {
+            name: name,
+            website: website,
+            linkedin: linkedin,
+            description: description,
+            new_company_id: 0,  // Will be assigned by Xano
+            locations_id: locationId,
+          };
+          
+          log(`POST ${XANO_BASE}/api:8Bv5PK4I/post_company_overview`, "info");
+          log(`Payload: ${JSON.stringify(payload)}`, "info");
+
+          const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/post_company_overview`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          const responseText = await res.text();
+          log(`Response status: ${res.status}`, res.ok ? "ok" : "err");
+          log(`Response: ${responseText}`, res.ok ? "ok" : "err");
+
+          if (res.ok) {
+            button.innerHTML = "✅ Created!";
+            button.style.background = "rgba(16, 185, 129, 0.3)";
+            button.style.borderColor = "rgba(16, 185, 129, 0.6)";
+            log(`✅ Company "${name}" created successfully!`, "ok");
+            
+            // Parse response to get new company ID if available
+            try {
+              const resData = JSON.parse(responseText);
+              if (resData.id || resData.new_company_id) {
+                const newId = resData.id || resData.new_company_id;
+                log(`New company ID: ${newId}`, "ok");
+                // Update the Xano status badge
+                updateXanoStatus({ id: newId }, { name: name });
+              }
+            } catch (e) {
+              // Response might not be JSON
+            }
+            
+            // Hide the create button after success
+            setTimeout(() => {
+              const container = document.getElementById("createInDbContainer");
+              if (container) container.style.display = "none";
+            }, 2000);
+          } else {
+            button.innerHTML = "❌ Failed";
+            button.style.background = "rgba(239, 68, 68, 0.2)";
+            button.style.borderColor = "rgba(239, 68, 68, 0.5)";
+            button.style.color = "#fca5a5";
+            log(`❌ Failed to create company: ${responseText}`, "err");
+            
+            // Re-enable button after delay
+            setTimeout(() => {
+              button.disabled = false;
+              button.innerHTML = "➕ Create Company in Database";
+              button.style.background = "rgba(16, 185, 129, 0.15)";
+              button.style.borderColor = "rgba(16, 185, 129, 0.4)";
+              button.style.color = "#6ee7b7";
+            }, 3000);
+          }
+        } catch (err) {
+          log(`❌ Error creating company: ${err.message}`, "err");
+          button.disabled = false;
+          button.innerHTML = "➕ Create Company in Database";
+          button.style.background = "rgba(16, 185, 129, 0.15)";
+          button.style.borderColor = "rgba(16, 185, 129, 0.4)";
+          button.style.color = "#6ee7b7";
+        }
+      }
+
+      // Add individual to database
+      async function addIndividualToDb(name, bio, linkedinUrl, button) {
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = "⏳";
+        log(`Adding individual "${name}" to database...`, "warn");
+
+        try {
+          // Step 1: Get location_id from AI overview city/country (if available)
+          let locationId = 0;
+          const cityInput = document.getElementById("ai_city");
+          const countryInput = document.getElementById("ai_country");
+          const city = cityInput?.value?.trim() || "";
+          const country = countryInput?.value?.trim() || "";
+
+          if (city || country) {
+            try {
+              const locUrl = `${XANO_BASE}/api:8Bv5PK4I/get_location?city=${encodeURIComponent(city)}&country=${encodeURIComponent(country)}`;
+              log(`GET location for ${city}, ${country}...`, "info");
+              
+              const locRes = await fetch(locUrl, {
+                method: "GET",
+                headers: { "Content-Type": "application/json" },
+              });
+              
+              const locData = await locRes.json();
+              
+              if (locData && locData.id) {
+                locationId = locData.id;
+                log(`Got location ID: ${locationId}`, "ok");
+              } else {
+                log("No location ID found, using 0", "warn");
+              }
+            } catch (locErr) {
+              log(`Location lookup failed: ${locErr.message}`, "warn");
+            }
+          }
+
+          // Step 2: POST individual
+          const payload = {
+            name: name || "",
+            bio: bio || "",  // Using title/job as bio
+            linkedin_URL: linkedinUrl || "",
+            locations_id: locationId,
+          };
+
+          log(`POST ${XANO_BASE}/api:8Bv5PK4I/post_individual`, "info");
+          log(`Payload: ${JSON.stringify(payload)}`, "info");
+
+          const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/post_individual`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          const responseText = await res.text();
+          log(`Response status: ${res.status}`, res.ok ? "ok" : "err");
+          log(`Response: ${responseText}`, res.ok ? "ok" : "err");
+
+          if (res.ok) {
+            button.textContent = "✅";
+            button.style.background = "rgba(16, 185, 129, 0.3)";
+            button.style.borderColor = "rgba(16, 185, 129, 0.6)";
+            button.style.color = "#6ee7b7";
+            log(`✅ Individual "${name}" added successfully!`, "ok");
+            
+            // Keep button disabled after success
+          } else {
+            button.textContent = "❌";
+            button.style.background = "rgba(239, 68, 68, 0.2)";
+            button.style.borderColor = "rgba(239, 68, 68, 0.5)";
+            button.style.color = "#fca5a5";
+            log(`❌ Failed to add individual: ${responseText}`, "err");
+            
+            // Re-enable button after delay
+            setTimeout(() => {
+              button.disabled = false;
+              button.textContent = originalText;
+              button.style.background = "rgba(99, 102, 241, 0.15)";
+              button.style.borderColor = "rgba(99, 102, 241, 0.4)";
+              button.style.color = "#a5b4fc";
+            }, 3000);
+          }
+        } catch (err) {
+          log(`❌ Error adding individual: ${err.message}`, "err");
+          button.disabled = false;
+          button.textContent = originalText;
+          button.style.background = "rgba(99, 102, 241, 0.15)";
+          button.style.borderColor = "rgba(99, 102, 241, 0.4)";
+          button.style.color = "#a5b4fc";
+        }
       }
 
       async function addEventToDb(eventObj, idx, button) {
@@ -1160,6 +1858,7 @@
         }
 
         clearEvents();
+        resetXanoStatus();  // Hide the status badge while loading
         aiMetaEl.textContent = "Loading…";
         dbMetaEl.textContent = "Loading…";
         logEl.innerHTML = "";
@@ -1198,6 +1897,9 @@
             matched_events,
           } = json;
 
+          // Update the prominent Xano status badge
+          updateXanoStatus(existing_company, db_company);
+
           if (existing_company && existing_company.id) {
             dbMetaEl.textContent = `Company ID ${existing_company.id}`;
             log(
@@ -1215,13 +1917,15 @@
           renderDBOverview(db_overview || null);
           renderAIEvents(ai_events || [], missing_events || []);
           renderDBEvents(db_events || []);
+          renderTopManagement(json.top_management || []);
 
           const aiCount = (ai_events || []).length;
           const dbCount = (db_events || []).length;
+          const mgmtCount = (json.top_management || []).length;
           log(
             `AI events: ${aiCount}, DB events: ${dbCount}, matched: ${
               (matched_events || []).length
-            }, missing: ${(missing_events || []).length}`,
+            }, missing: ${(missing_events || []).length}, executives: ${mgmtCount}`,
             "ok"
           );
           setStatus("Done", "ok");
