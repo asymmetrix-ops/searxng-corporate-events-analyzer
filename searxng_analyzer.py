@@ -547,8 +547,9 @@ IMPORTANT: You MUST include ALL of these roles if they exist:
 For EACH executive, provide:
 - name: Full legal name
 - position: Official title
-- status: "Current" or "Past"
+  - status: "Current" or "Past"
 - location: City, State/Country (if known, else "")
+- current_employee_url: Full URL to the company's webpage that features/mentions this executive (e.g., https://company.com/team/john-smith, https://company.com/leadership, https://company.com/about/team). This is a page on the company's website, NOT LinkedIn. If not found, use empty string "".
 - bio: Professional executive summary (3-5 sentences) in THIS EXACT STYLE:
 
 EXAMPLE BIO STYLE:
@@ -576,6 +577,7 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "position": "Chief Executive Officer",
     "status": "Current",
     "location": "San Francisco, CA",
+    "current_employee_url": "https://company.com/team/john-smith",
     "bio": "Experienced CEO and Operating Partner with successful track record in Technology and SaaS. 25+ years in decision making roles for Private Equity and Fortune 500 companies. Skilled in General Management, Digital Transformation, Strategy Development and M&A. International profile having operated across US, Europe and Asia Pacific. MBA from Stanford Graduate School of Business."
   }}
 ]
@@ -606,12 +608,13 @@ For each person provide:
 - position: Official title
 - status: "Current"
 - location: Where they are based
+- current_employee_url: Full URL to company webpage featuring this executive (or "")
 - bio: Brief professional background (1-2 sentences)
 
 Context: {text[:5000]}
 
 Return JSON array only:
-[{{"name": "...", "position": "...", "status": "Current", "location": "...", "bio": "..."}}]
+[{{"name": "...", "position": "...", "status": "Current", "location": "...", "current_employee_url": "...", "bio": "..."}}]
 """
         fallback_resp = openrouter_chat("anthropic/claude-3.5-sonnet", fallback_prompt, f"FallbackMgmt-{company_name}")
         try:
@@ -654,6 +657,7 @@ Return JSON array only:
         linkedin_url = m.get("linkedin_url", "").strip()
         location = m.get("location", "").strip()
         bio = m.get("bio", "").strip()
+        current_employee_url = m.get("current_employee_url", "").strip()
         
         if not name or not position:
             continue
@@ -666,6 +670,7 @@ Return JSON array only:
                 "position": position,
                 "status": status,
                 "linkedin_url": linkedin_url if linkedin_url.startswith("http") else "",
+                "current_employee_url": current_employee_url if current_employee_url.startswith("http") else "",
                 "location": location,
                 "bio": bio
             })
@@ -1187,7 +1192,7 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
             f'"{company_name}" site:apollo.io',
             f'"{company_name}" site:linkedin.com/company',
             f'"{company_name}" company funding history',
-        ]
+    ]
 
     search_results = []
     seen_urls = set()
@@ -1215,7 +1220,7 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     results_to_analyze = len(search_results)
     for i, result in enumerate(search_results, 1):
         context += f"[{i}] {result['title']}\n{result['snippet']}\nSource: {result['link']}\n\n"
-    
+
     print(f"   → Analyzing all {results_to_analyze} search results...")
     
     # Determine if this is a startup for prompt customization
@@ -1899,8 +1904,82 @@ def generate_summary(company_name, text=""):
         if search_text.strip():
             text = search_text
             print(f"   → Collected {len(text)} chars of search data")
+    
+    # ------ Step 1.5: Find press page via dedicated search ------
+    press_page_url = ""
+    domain_for_search = ""
+    if website_from_input:
+        from urllib.parse import urlparse
+        parsed = urlparse(website_from_input)
+        domain_for_search = parsed.netloc.replace("www.", "")
+    
+    # Search for press releases page
+    press_search_queries = [
+        f'site:{domain_for_search} press releases' if domain_for_search else None,
+        f'site:{domain_for_search} newsroom' if domain_for_search else None,
+        f'"{search_name}" press releases official site',
+    ]
+    
+    for pq in press_search_queries:
+        if pq and not press_page_url:
+            try:
+                # Use SerpAPI to find press page
+                import os
+                import requests
+                serpapi_key = os.environ.get("SERPAPI_KEY", "")
+                if serpapi_key:
+                    resp = requests.get(
+                        "https://serpapi.com/search",
+                        params={
+                            "q": pq,
+                            "api_key": serpapi_key,
+                            "num": 5,
+                        },
+                        timeout=10
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        organic = data.get("organic_results", [])
+                        for result in organic:
+                            link = result.get("link", "")
+                            # Check if it's a press/news page
+                            press_keywords = ["/press", "/news", "/newsroom", "/media", "/announcements", "press-release"]
+                            if any(kw in link.lower() for kw in press_keywords):
+                                press_page_url = link
+                                print(f"   → Found press page via search: {press_page_url}")
+                                break
+            except Exception as e:
+                print(f"   → Press page search error: {e}")
 
     # ------ Step 2: Use Perplexity for accurate company info ------
+    
+    # Ownership status types - comprehensive classification
+    ownership_types = [
+        # Public vs Private (most universal)
+        "Public",           # Listed on stock exchange
+        "Private",          # Privately held, general
+        # By Investor/Owner Type
+        "Venture-Backed",   # Owned by VC firms
+        "Private Equity-Backed",  # Owned by PE firms
+        "Family-Owned",     # Controlled by a family
+        "Employee-Owned",   # ESOP structure
+        "Founder-Owned",    # Still controlled by founders
+        "Institutional-Owned",  # Owned by institutions
+        # Special Categories
+        "Government-Owned", # Public sector/state-owned
+        "Non-Profit",       # Mission-driven, no shareholders
+        "Subsidiary",       # Owned by parent company
+        "Cooperative",      # Member-owned cooperative
+        "Partnership",      # LP, LLP structure
+    ]
+    
+    # Build the website base for press page hints
+    website_base = ""
+    if website_from_input:
+        from urllib.parse import urlparse
+        parsed = urlparse(website_from_input)
+        website_base = f"{parsed.scheme}://{parsed.netloc}"
+    
     prompt = f"""
 You are a professional researcher. Find and extract complete company details for "{search_name}".
 
@@ -1911,15 +1990,91 @@ Return ONLY in this exact markdown format (no extra text):
 - Year Founded: <year>
 - Website: <full URL like https://www.example.com>
 - LinkedIn: <full LinkedIn URL like https://www.linkedin.com/company/example>
+- Press Page: <full URL to company's press releases or news page>
 - Headquarters: <city, country>
+- Ownership Status: <ownership type>
+- Primary Business Focus: <the main business focus category that best describes this company's core activity>
+- Primary Sectors: <comma-separated list of the main sectors this company operates in>
+- Secondary Sectors: <comma-separated list of additional but less central sectors, or "None">
 - CEO: <full name>
 
 CRITICAL RULES:
+
 1. For Website: Must be a full URL starting with https:// or http://
+
 2. For LinkedIn: Must be the full LinkedIn company page URL
-3. For Headquarters: Format as "City, Country" (e.g., "London, United Kingdom")
-4. Search your knowledge for this company if the source text is insufficient
-5. If you truly cannot find a value, write "Unknown"
+
+3. For Press Page: THIS IS IMPORTANT - Find the company's official press releases, news, or announcements page.
+   {f"Start by checking: {website_base}/press, {website_base}/news, {website_base}/newsroom, {website_base}/press-releases, {website_base}/about-us/press-room" if website_base else ""}
+   Common URL patterns to look for:
+   - /press, /press-releases, /news, /newsroom, /media
+   - /about/press, /about-us/press, /about-us/press-room
+   - /company/news, /corporate/press
+   Examples of real press pages:
+   - https://risk.lexisnexis.co.uk/about-us/press-room/press-release
+   - https://plana.earth/press
+   - https://www.apple.com/newsroom/
+   Must be a FULL URL. If you cannot find it, write "Unknown"
+
+4. For Headquarters: Format as "City, Country" using STANDARDIZED country names:
+   - Use "UK" (not England, Scotland, Wales, Britain, United Kingdom, Great Britain)
+   - Use "USA" (not United States, America, US)
+   - Use "UAE" (not United Arab Emirates)
+   - Use standard country names for others (Germany, France, etc.)
+
+5. For Ownership Status: Choose EXACTLY ONE from this list:
+   {', '.join(ownership_types)}
+   
+   ⚠️ FIRST CHECK IF PUBLIC: Before anything else, check if company is publicly traded!
+   - Search for ticker symbol (e.g., NASDAQ: TEM, NYSE: AAPL)
+   - Check if company had an IPO
+   - If listed on ANY stock exchange → answer "Public"
+   
+   CLASSIFICATION GUIDELINES:
+   - "Public" = Listed on stock exchange (NYSE, NASDAQ, LSE, TSX, etc.) - CHECK THIS FIRST!
+   - "Private" = Privately held with no known institutional backing
+   - "Venture-Backed" = Has received VC funding (Series A, B, C, etc.) but NOT public
+   - "Private Equity-Backed" = Owned/controlled by PE firm(s) like KKR, Blackstone, Carlyle
+   - "Family-Owned" = Controlled by a founding family
+   - "Founder-Owned" = Still majority-controlled by original founders
+   - "Employee-Owned" = ESOP or employee ownership structure
+   - "Institutional-Owned" = Owned by pension funds, sovereign wealth funds (but not public)
+   - "Government-Owned" = State-owned enterprise or public sector entity
+   - "Non-Profit" = 501(c)(3), charity, foundation, mission-driven organization
+   - "Subsidiary" = Wholly or majority owned by another company
+   - "Cooperative" = Member-owned cooperative structure
+   - "Partnership" = LP, LLP, or partnership structure
+   
+   Examples: Tempus AI = "Public" (NASDAQ: TEM), Apple = "Public" (NASDAQ: AAPL)
+   
+6. Primary Business Focus Definition:
+   - This is the SINGLE most important business focus category that describes the company's core activity.
+   - Choose the ONE category that best fits the company's primary business model and main revenue source.
+   - Examples of business focus categories:
+     - "Software" = Companies that develop and sell software products (SaaS, enterprise software, etc.)
+     - "Financial Services" = Banks, payment processors, fintech, investment firms
+     - "Healthcare" = Hospitals, health services, medical providers
+     - "Data & Analytics" = Data platforms, analytics tools, business intelligence
+     - "Consumer Internet" = Online consumer services, marketplaces, e-commerce platforms
+     - "Business Services" = B2B services, consulting, professional services
+     - "Pharmaceuticals" = Drug development, pharma companies
+     - "Medical Equipment" = Medical devices, equipment manufacturers
+     - "Telecommunications" = Telecom providers, network infrastructure
+     - "Manufacturing" = Industrial manufacturing, production
+     - "Retail" = Retail stores, consumer goods retail
+     - "Energy & Commodities" = Energy companies, commodity trading
+     - And many more specific categories
+   - This should be more specific than a sector - it's the primary business model/focus area.
+
+7. Sector Definition (for Primary/Secondary Sectors):
+   - A *sector* is a broad category of the economy that groups together companies with similar business activities.
+   - Examples: Technology, Healthcare, Financial Services, Consumer Goods, Industrials, Energy, Real Estate,
+     Telecommunications, Utilities, Materials, Public Sector, Education, Non-Profit, Government, etc.
+   - Primary Sectors = where the company generates most of its value / core business.
+   - Secondary Sectors = adjacent areas or important but non-core activities.
+
+8. Search your knowledge for this company if the source text is insufficient
+9. If you truly cannot find a value, write "Unknown"
 
 {"Known website: " + website_from_input if website_from_input else ""}
 
@@ -1951,9 +2106,10 @@ Source text for reference:
     if not ceo:
         ceo = ""   # fallback empty — but NEVER hallucinate
 
-    # ------ Step 4: Replace CEO line forcefully ------
+    # ------ Step 4: Replace CEO line and inject press page if found ------
     final_lines = []
     ceo_replaced = False
+    press_page_replaced = False
 
     for line in summary.split("\n"):
         cleaned = line.lower().replace("–", "-").replace("—", "-").strip()
@@ -1961,11 +2117,27 @@ Source text for reference:
         if cleaned.startswith("- ceo") or cleaned.startswith("ceo"):
             final_lines.append(f"- CEO: {ceo}")
             ceo_replaced = True
+        elif ("press page:" in cleaned or "press-page:" in cleaned) and press_page_url:
+            # Check if AI returned "Unknown" for press page - replace with our found URL
+            val = line.split(":", 1)[-1].strip().lower()
+            if val in ["unknown", "", "not found", "n/a"]:
+                final_lines.append(f"- Press Page: {press_page_url}")
+                press_page_replaced = True
+                print(f"   → Injected press page URL from search: {press_page_url}")
+            else:
+                final_lines.append(line)
         else:
             final_lines.append(line)
 
     if not ceo_replaced:
         final_lines.append(f"- CEO: {ceo}")
+    
+    # If press page wasn't in the output at all but we found one, add it
+    if press_page_url and not press_page_replaced:
+        result_text = "\n".join(final_lines)
+        if "press page:" not in result_text.lower():
+            final_lines.append(f"- Press Page: {press_page_url}")
+            print(f"   → Added press page URL from search: {press_page_url}")
 
     return "\n".join(final_lines).strip()
 

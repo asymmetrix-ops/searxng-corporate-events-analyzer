@@ -835,21 +835,21 @@ if st.button("🚀 Analyze Company"):
 
             # Store report if new company
             if not db_company_data:
-                store_report(
-                    search_query,
-                    summary,
-                    description,
-                    json.dumps(corporate_events),
-                    json.dumps(mgmt_list),
-                )
-                store_search(
-                    search_query,
-                    wiki_text,
-                    summary,
-                    description,
-                    json.dumps(corporate_events),
-                    json.dumps(mgmt_list),
-                )
+            store_report(
+                search_query,
+                summary,
+                description,
+                json.dumps(corporate_events),
+                json.dumps(mgmt_list),
+            )
+            store_search(
+                search_query,
+                wiki_text,
+                summary,
+                description,
+                json.dumps(corporate_events),
+                json.dumps(mgmt_list),
+            )
             
             progress.progress(100)
             status.text("✅ Done")
@@ -1164,7 +1164,7 @@ if st.button("🚀 Analyze Company"):
                                 st.markdown("---")
                                 if is_missing:
                                     st.warning("⚠️ This event is not in the database")
-                                else:
+            else:
                                     st.info("✅ This event appears to match a database record")
                                 
                                 # Check if this event was already added (persisted in session state)
