@@ -1,0 +1,63 @@
+System Flow: From URL Input to Rendered Results
+
+User
+  |
+  v
+Frontend (index.html)
+  - Input company URL
+  - Click "Analyze" -> POST /analyze
+  |
+  v
+Backend /analyze (server.py)
+  1) Xano lookup:
+     - check_company_by_url(query)
+     - if found: get_company_by_id + get_corporate_events_by_company_id
+  2) AI overview:
+     - get_wikipedia_summary
+     - generate_summary + generate_description
+     - strip_marketing_phrases
+     - parse overview fields (name, website, HQ, sectors, business focus, etc.)
+  3) AI events:
+     - generate_corporate_events(query, max_events=20)
+  4) Matching:
+     - keyword overlap AI events vs DB events -> matched_events, missing_events
+  5) Top management:
+     - get_top_management(query)
+  6) Response JSON:
+     {
+       ai_overview,
+       ai_events,
+       matched_events,
+       missing_events,
+       db_company,
+       db_events,
+       db_management,
+       top_management
+     }
+  |
+  v
+Frontend render
+  - AI Overview card (editable)
+  - AI Events cards (editable)
+  - DB Overview / DB Events / DB Management (if Xano data exists)
+  |
+  v
+User edits/saves (direct to Xano APIs)
+  - Company: edit_company/{new_company_id}
+  - Event: create_corporate_event / edit_corporate_event/{id}
+  - Counterparty: create_counterparty / edit_counterparty/{id}
+  - Individual: create_individual / edit_individual/{id}
+  |
+  v
+Refresh
+  - refresh_db (or Get_new_company/{id}) to re-render DB side
+
+Parsing helper (optional per-event)
+  - "Parse from source" button -> /extract_event_meta
+  - Direct GET fetch; heuristically extracts title/date/long_description
+  - (LLM/Scrapfly enrichment was removed)
+
+Catalog/lookup helpers (frontend)
+  - Fetch sectors, roles, business_focus lists from Xano
+  - Lookup location, sector, role IDs before save
+

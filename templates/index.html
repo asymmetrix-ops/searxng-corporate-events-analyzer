@@ -1679,7 +1679,7 @@
       }
 
       // Create new counterparty API function
-      async function createCounterpartyInDb(corporateEventId, companyName, counterpartyTypeId, button, pressReleaseUrl = "") {
+      async function createCounterpartyInDb(corporateEventId, companyName, counterpartyTypeId, button, pressReleaseUrl = "", websiteUrl = "") {
         button.disabled = true;
         const originalText = button.textContent;
         button.textContent = "⏳";
@@ -1699,18 +1699,22 @@
             company_id: companyId,  // Use the current company ID
             counterparty_type_id: counterpartyTypeId || 17,  // Default to "Target"
             press_release_url: pressReleaseUrl || "",
+            company_url: websiteUrl || "",
             individual_role_ids: {},
             company_name: companyName,  // Pass name for Xano to create/lookup counterparty company
           };
           
+          // Clean payload: convert 0 and "" to null
+          const cleanedPayload = cleanPayloadKeepRequired(payload, ['corporate_event_id', 'company_name']);
+          
           log(`Using company_id: ${companyId} (window._companyId: ${window._companyId})`, "info");
           log(`POST ${XANO_BASE}/api:8Bv5PK4I/create_counterparty`, "info");
-          log(`Payload: ${JSON.stringify(payload)}`, "info");
+          log(`Payload (cleaned): ${JSON.stringify(cleanedPayload)}`, "info");
           
           const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/create_counterparty`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(cleanedPayload),
           });
           
           const data = await res.json();
@@ -1837,6 +1841,204 @@
         }
       }
 
+      // Cache for sectors to avoid repeated network calls
+      // Catalog caches with pending promise pattern to prevent duplicate fetches
+      let sectorOptionsCache = null;
+      let sectorOptionsPending = null;
+      const sectorLookupCache = new Map();
+      // Cache for roles (job titles) to avoid repeated network calls
+      let roleOptionsCache = null;
+      let roleOptionsPending = null;
+      // Cache for currencies
+      let currencyOptionsCache = null;
+      let currencyOptionsPending = null;
+      // Cache for business focus options
+      let businessFocusOptionsCache = null;
+      let businessFocusOptionsPending = null;
+
+      async function fetchSectorOptions() {
+        if (sectorOptionsCache) return sectorOptionsCache;
+        if (sectorOptionsPending) return sectorOptionsPending;
+        
+        sectorOptionsPending = (async () => {
+          try {
+            log("🌐 Fetching sectors catalog...", "info");
+            const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/get_sectors`, {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data) && data.length) {
+              sectorOptionsCache = data
+                .map((s) => ({ id: s.id, name: s.sector_name || s.name || "" }))
+                .filter((s) => s.id && s.name);
+              log(`✅ Loaded ${sectorOptionsCache.length} sectors`, "ok");
+            } else {
+              log("⚠️ Sectors list empty", "warn");
+              sectorOptionsCache = [];
+            }
+          } catch (err) {
+            log(`❌ Failed to fetch sectors list: ${err.message}`, "err");
+            sectorOptionsCache = [];
+          }
+          sectorOptionsPending = null;
+          return sectorOptionsCache;
+        })();
+        
+        return sectorOptionsPending;
+      }
+
+      async function fetchRoleOptions() {
+        if (roleOptionsCache) return roleOptionsCache;
+        if (roleOptionsPending) return roleOptionsPending;
+        
+        roleOptionsPending = (async () => {
+          try {
+            log("🌐 Fetching roles catalog...", "info");
+            const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/get_roles`, {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data) && data.length) {
+              roleOptionsCache = data
+                .map((r) => ({ id: r.id, name: r.job_title || r.name || "" }))
+                .filter((r) => r.id && r.name);
+              log(`✅ Loaded ${roleOptionsCache.length} roles`, "ok");
+            } else {
+              log("⚠️ Roles list empty", "warn");
+              roleOptionsCache = [];
+            }
+          } catch (err) {
+            log(`❌ Failed to fetch roles list: ${err.message}`, "err");
+            roleOptionsCache = [];
+          }
+          roleOptionsPending = null;
+          return roleOptionsCache;
+        })();
+        
+        return roleOptionsPending;
+      }
+
+      async function fetchCurrencyOptions() {
+        if (currencyOptionsCache) return currencyOptionsCache;
+        if (currencyOptionsPending) return currencyOptionsPending;
+        
+        currencyOptionsPending = (async () => {
+          try {
+            log("🌐 Fetching currency catalog...", "info");
+            const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/currency_lookup`, {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data) && data.length) {
+              currencyOptionsCache = data
+                .map((c) => ({ id: c.id, code: c.Currency }))
+                .filter((c) => c.id && c.code);
+              log(`✅ Loaded ${currencyOptionsCache.length} currencies`, "ok");
+            } else {
+              log("⚠️ Currency list empty", "warn");
+              currencyOptionsCache = [];
+            }
+          } catch (err) {
+            log(`❌ Failed to fetch currency list: ${err.message}`, "err");
+            currencyOptionsCache = [];
+          }
+          currencyOptionsPending = null;
+          return currencyOptionsCache;
+        })();
+        
+        return currencyOptionsPending;
+      }
+
+      async function fetchBusinessFocusOptions() {
+        if (businessFocusOptionsCache) return businessFocusOptionsCache;
+        if (businessFocusOptionsPending) return businessFocusOptionsPending;
+        
+        businessFocusOptionsPending = (async () => {
+          try {
+            log("🌐 Fetching business focus catalog...", "info");
+            const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/business_focuses`, {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data) && data.length) {
+              businessFocusOptionsCache = data
+                .map((b) => ({ id: b.id, name: b.business_focus || b.name || "" }))
+                .filter((b) => b.id && b.name);
+              log(`✅ Loaded ${businessFocusOptionsCache.length} business focus options`, "ok");
+            } else {
+              log("⚠️ Business focus list empty", "warn");
+              businessFocusOptionsCache = [];
+            }
+          } catch (err) {
+            log(`❌ Failed to fetch business focus list: ${err.message}`, "err");
+            businessFocusOptionsCache = [];
+          }
+          businessFocusOptionsPending = null;
+          return businessFocusOptionsCache;
+        })();
+        
+        return businessFocusOptionsPending;
+      }
+
+      async function lookupSectorIdByName(name) {
+        const key = (name || "").trim().toLowerCase();
+        if (!key) return null;
+        if (sectorLookupCache.has(key)) return sectorLookupCache.get(key);
+        const synonymMap = {
+          "environmental services": "Environment",
+          "environmental service": "Environment",
+          "environment": "Environment",
+        };
+        const fallbackName = synonymMap[key] || null;
+        try {
+          const lookupUrl = `${XANO_BASE}/api:8Bv5PK4I/sectors_lookup?sector_name=${encodeURIComponent(name)}`;
+          log(`🔍 Sector lookup for "${name}"...`, "info");
+          const res = await fetch(lookupUrl, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.id) {
+              sectorLookupCache.set(key, data.id);
+              log(`✅ Sector "${name}" → ID ${data.id}`, "ok");
+              return data.id;
+            }
+          }
+          // Try synonym if first lookup failed
+          if (fallbackName && fallbackName !== name) {
+            const altKey = fallbackName.toLowerCase();
+            const altUrl = `${XANO_BASE}/api:8Bv5PK4I/sectors_lookup?sector_name=${encodeURIComponent(fallbackName)}`;
+            log(`🔍 Sector synonym lookup for "${fallbackName}" (from "${name}")...`, "info");
+            const altRes = await fetch(altUrl, {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (altRes.ok) {
+              const altData = await altRes.json();
+              if (altData && altData.id) {
+                sectorLookupCache.set(key, altData.id);
+                sectorLookupCache.set(altKey, altData.id);
+                log(`✅ Sector "${fallbackName}" → ID ${altData.id}`, "ok");
+                return altData.id;
+              }
+            }
+          }
+        } catch (err) {
+          log(`⚠️ Sector lookup error for "${name}": ${err.message}`, "warn");
+        }
+        sectorLookupCache.set(key, null);
+        return null;
+      }
+
       function log(msg, level = "info") {
         const time = new Date().toLocaleTimeString();
         const div = document.createElement("div");
@@ -1844,6 +2046,57 @@
         div.textContent = `[${time}] ${msg}`;
         logEl.appendChild(div);
         logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      /**
+       * Clean payload before sending to API:
+       * - Convert 0 to null (for numeric fields)
+       * - Convert "" to null (for string fields)
+       * - Convert empty arrays [] to null
+       * - Keep non-empty values as-is
+       */
+      function cleanPayload(obj) {
+        if (obj === null || obj === undefined) return null;
+        if (Array.isArray(obj)) {
+          // Empty array → null, otherwise keep array with cleaned items
+          if (obj.length === 0) return null;
+          return obj.map(item => cleanPayload(item)).filter(item => item !== null);
+        }
+        if (typeof obj === 'object') {
+          const cleaned = {};
+          for (const [key, value] of Object.entries(obj)) {
+            const cleanedValue = cleanPayload(value);
+            // Only include non-null values
+            if (cleanedValue !== null) {
+              cleaned[key] = cleanedValue;
+            }
+          }
+          return Object.keys(cleaned).length > 0 ? cleaned : null;
+        }
+        // Primitives
+        if (typeof obj === 'number') {
+          return obj === 0 ? null : obj;
+        }
+        if (typeof obj === 'string') {
+          return obj.trim() === '' ? null : obj.trim();
+        }
+        return obj;
+      }
+
+      /**
+       * Clean payload but keep required fields even if empty/zero
+       * @param obj - The payload object
+       * @param requiredFields - Array of field names that should not be nullified
+       */
+      function cleanPayloadKeepRequired(obj, requiredFields = []) {
+        const cleaned = cleanPayload(obj) || {};
+        // Restore required fields from original object
+        for (const field of requiredFields) {
+          if (obj && obj[field] !== undefined) {
+            cleaned[field] = obj[field];
+          }
+        }
+        return cleaned;
       }
 
       function setStatus(text, tone = "info") {
@@ -2044,434 +2297,487 @@
         
         rowLoc.appendChild(saveLocBtn);
 
-        // Primary Business Focus row
+        // Business Focus row (multiple dropdowns like sectors)
         const rowBusinessFocus = document.createElement("div");
         rowBusinessFocus.style.display = "flex";
+        rowBusinessFocus.style.flexDirection = "column";
         rowBusinessFocus.style.gap = "6px";
         rowBusinessFocus.style.marginTop = "6px";
-        rowBusinessFocus.style.alignItems = "center";
-        rowBusinessFocus.style.position = "relative"; // For dropdown positioning
+        rowBusinessFocus.style.alignItems = "stretch";
+
+        const businessFocusHeader = document.createElement("div");
+        businessFocusHeader.style.display = "flex";
+        businessFocusHeader.style.alignItems = "center";
+        businessFocusHeader.style.gap = "6px";
 
         const businessFocusLabel = document.createElement("span");
-        businessFocusLabel.textContent = "Business Focus:";
+        businessFocusLabel.textContent = "🎯 Business Focus:";
         businessFocusLabel.style.fontSize = "11px";
         businessFocusLabel.style.color = "#9ca3af";
-        businessFocusLabel.style.minWidth = "90px";
+        businessFocusLabel.style.minWidth = "100px";
 
-        // Container for input and suggestions
+        const addBusinessFocusBtn = document.createElement("button");
+        addBusinessFocusBtn.type = "button";
+        addBusinessFocusBtn.innerHTML = "➕ Add";
+        addBusinessFocusBtn.title = "Add another business focus";
+        addBusinessFocusBtn.style.padding = "3px 8px";
+        addBusinessFocusBtn.style.fontSize = "10px";
+        addBusinessFocusBtn.style.borderRadius = "6px";
+        addBusinessFocusBtn.style.border = "1px solid rgba(99, 102, 241, 0.3)";
+        addBusinessFocusBtn.style.background = "rgba(99, 102, 241, 0.1)";
+        addBusinessFocusBtn.style.color = "#a5b4fc";
+        addBusinessFocusBtn.style.cursor = "pointer";
+
+        const saveBusinessFocusBtn = document.createElement("button");
+        saveBusinessFocusBtn.type = "button";
+        saveBusinessFocusBtn.innerHTML = "💾 Save";
+        saveBusinessFocusBtn.title = "Save business focuses to database";
+        saveBusinessFocusBtn.style.padding = "3px 8px";
+        saveBusinessFocusBtn.style.fontSize = "10px";
+        saveBusinessFocusBtn.style.borderRadius = "6px";
+        saveBusinessFocusBtn.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+        saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+        saveBusinessFocusBtn.style.color = "#34d399";
+        saveBusinessFocusBtn.style.cursor = "pointer";
+
+        businessFocusHeader.appendChild(businessFocusLabel);
+        businessFocusHeader.appendChild(addBusinessFocusBtn);
+        businessFocusHeader.appendChild(saveBusinessFocusBtn);
+        rowBusinessFocus.appendChild(businessFocusHeader);
+
         const businessFocusContainer = document.createElement("div");
-        businessFocusContainer.style.flex = "1";
-        businessFocusContainer.style.position = "relative";
+        businessFocusContainer.id = "ai_business_focus_container";
+        businessFocusContainer.style.display = "flex";
+        businessFocusContainer.style.flexDirection = "column";
+        businessFocusContainer.style.gap = "6px";
+        businessFocusContainer.style.width = "100%";
+        rowBusinessFocus.appendChild(businessFocusContainer);
 
-        const businessFocusInput = document.createElement("input");
-        businessFocusInput.type = "text";
-        businessFocusInput.id = "ai_primary_business_focus";
-        businessFocusInput.placeholder = "e.g., Software, Healthcare";
-        businessFocusInput.value = data.primary_business_focus || "";
-        businessFocusInput.style.width = "100%";
-        businessFocusInput.style.padding = "3px 7px";
-        businessFocusInput.style.borderRadius = "999px";
-        businessFocusInput.style.border = "1px solid #1f2937";
-        businessFocusInput.style.background = "#020617";
-        businessFocusInput.style.color = "#e5e7eb";
-        businessFocusInput.style.fontSize = "11px";
-        businessFocusInput.autocomplete = "off";
+        const createBusinessFocusSelectRow = (options, selectedId = "", fallbackName = "") => {
+          const row = document.createElement("div");
+          row.style.display = "flex";
+          row.style.gap = "6px";
+          row.style.alignItems = "center";
 
-        // Store the ID in a data attribute
-        if (data.primary_business_focus_id) {
-          businessFocusInput.dataset.businessFocusId = data.primary_business_focus_id;
-        }
+          const select = document.createElement("select");
+          select.className = "business-focus-select";
+          select.dataset.fallbackName = fallbackName || "";
+          select.style.flex = "1";
+          select.style.padding = "6px 8px";
+          select.style.borderRadius = "8px";
+          select.style.border = "1px solid #1f2937";
+          select.style.background = "#020617";
+          select.style.color = "#e5e7eb";
+          select.style.fontSize = "12px";
 
-        // Create suggestions dropdown
-        const suggestionsDropdown = document.createElement("div");
-        suggestionsDropdown.style.position = "absolute";
-        suggestionsDropdown.style.top = "100%";
-        suggestionsDropdown.style.left = "0";
-        suggestionsDropdown.style.right = "0";
-        suggestionsDropdown.style.background = "#0b1020";
-        suggestionsDropdown.style.border = "1px solid #1f2937";
-        suggestionsDropdown.style.borderRadius = "8px";
-        suggestionsDropdown.style.maxHeight = "200px";
-        suggestionsDropdown.style.overflowY = "auto";
-        suggestionsDropdown.style.zIndex = "1000";
-        suggestionsDropdown.style.display = "none";
-        suggestionsDropdown.style.boxShadow = "0 4px 12px rgba(0, 0, 0, 0.5)";
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = fallbackName ? `AI: ${fallbackName}` : "Select business focus";
+          select.appendChild(placeholder);
 
+          options.forEach((opt) => {
+            const optionEl = document.createElement("option");
+            optionEl.value = opt.id;
+            optionEl.textContent = opt.name;
+            select.appendChild(optionEl);
+          });
 
-        // Hide suggestions when clicking outside
-        document.addEventListener("click", (e) => {
-          if (!businessFocusContainer.contains(e.target)) {
-            suggestionsDropdown.style.display = "none";
+          if (selectedId) {
+            select.value = String(selectedId);
           }
-        });
 
-        businessFocusContainer.appendChild(businessFocusInput);
-        businessFocusContainer.appendChild(suggestionsDropdown);
+          const removeBtn = document.createElement("button");
+          removeBtn.type = "button";
+          removeBtn.textContent = "✕";
+          removeBtn.title = "Remove business focus";
+          removeBtn.style.padding = "4px 6px";
+          removeBtn.style.fontSize = "11px";
+          removeBtn.style.borderRadius = "6px";
+          removeBtn.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+          removeBtn.style.background = "rgba(239, 68, 68, 0.1)";
+          removeBtn.style.color = "#fca5a5";
+          removeBtn.style.cursor = "pointer";
 
-        // Show ID badge if mapped
-        const idBadge = document.createElement("span");
-        if (data.primary_business_focus_id && data.primary_business_focus_id > 0) {
-          idBadge.textContent = `ID: ${data.primary_business_focus_id}`;
-          idBadge.style.fontSize = "9px";
-          idBadge.style.color = "#10b981";
-          idBadge.style.background = "rgba(16, 185, 129, 0.15)";
-          idBadge.style.padding = "2px 6px";
-          idBadge.style.borderRadius = "4px";
-          idBadge.style.border = "1px solid rgba(16, 185, 129, 0.3)";
-          idBadge.title = "Mapped to database ID";
-        } else if (data.primary_business_focus) {
-          idBadge.textContent = "Not mapped";
-          idBadge.style.fontSize = "9px";
-          idBadge.style.color = "#f59e0b";
-          idBadge.style.background = "rgba(245, 158, 11, 0.15)";
-          idBadge.style.padding = "2px 6px";
-          idBadge.style.borderRadius = "4px";
-          idBadge.style.border = "1px solid rgba(245, 158, 11, 0.3)";
-          idBadge.title = "Not found in predefined list";
-        }
+          removeBtn.onclick = () => {
+            if (businessFocusContainer.children.length > 1) {
+              row.remove();
+            } else {
+              select.value = "";
+              select.dataset.fallbackName = "";
+            }
+          };
 
-        // Add smart suggestions button
-        const suggestBtn = document.createElement("button");
-        suggestBtn.type = "button";
-        suggestBtn.title = "Get AI suggestions";
-        suggestBtn.innerHTML = "🧠";
-        suggestBtn.style.padding = "2px 6px";
-        suggestBtn.style.fontSize = "10px";
-        suggestBtn.style.borderRadius = "4px";
-        suggestBtn.style.border = "1px solid rgba(99, 102, 241, 0.3)";
-        suggestBtn.style.background = "rgba(99, 102, 241, 0.1)";
-        suggestBtn.style.color = "#a5b4fc";
-        suggestBtn.style.cursor = "pointer";
-        suggestBtn.style.marginRight = "4px";
-        // Function to update suggestions (defined in scope)
-        const updateSuggestionsLocal = () => {
-          const currentData = window._aiOverviewData || data;
-          const suggestions = suggestBusinessFocus(currentData);
+          row.appendChild(select);
+          row.appendChild(removeBtn);
+          businessFocusContainer.appendChild(row);
+        };
 
-          suggestionsDropdown.innerHTML = "";
+        const populateBusinessFocuses = async () => {
+          const options = await fetchBusinessFocusOptions();
+          businessFocusContainer.innerHTML = "";
 
-          if (suggestions.length === 0) {
-            suggestionsDropdown.style.display = "none";
+          // Support both single value and array
+          let sourceFocuses = [];
+          if (Array.isArray(data.business_focuses) && data.business_focuses.length) {
+            sourceFocuses = data.business_focuses;
+          } else if (data.primary_business_focus) {
+            sourceFocuses = [{ name: data.primary_business_focus, id: data.primary_business_focus_id }];
+          } else {
+            sourceFocuses = [{}]; // Empty dropdown
+          }
+
+          for (const focus of sourceFocuses) {
+            const name = (focus.name || focus.business_focus || focus.primary_business_focus || `${focus}` || "").trim();
+            let matchedId = focus.id || "";
+            
+            if (!matchedId && name && options.length) {
+              const lower = name.toLowerCase();
+              const exact = options.find((o) => o.name.toLowerCase() === lower);
+              const contains = options.find((o) => lower.includes(o.name.toLowerCase()) || o.name.toLowerCase().includes(lower));
+              matchedId = (exact || contains || {}).id || "";
+            }
+
+            createBusinessFocusSelectRow(options, matchedId, name);
+          }
+        };
+
+        addBusinessFocusBtn.onclick = async () => {
+          const options = await fetchBusinessFocusOptions();
+          createBusinessFocusSelectRow(options, "", "");
+        };
+
+        saveBusinessFocusBtn.onclick = async () => {
+          if (!window._dbCompanyId) {
+            log("No company ID - cannot save business focuses", "err");
             return;
           }
 
-          suggestions.forEach(suggestion => {
-            const suggestionItem = document.createElement("div");
-            suggestionItem.style.padding = "8px 12px";
-            suggestionItem.style.cursor = "pointer";
-            suggestionItem.style.borderBottom = "1px solid #1f2937";
-            suggestionItem.style.display = "flex";
-            suggestionItem.style.justifyContent = "space-between";
-            suggestionItem.style.alignItems = "center";
-            suggestionItem.style.fontSize = "11px";
+          saveBusinessFocusBtn.innerHTML = "⏳";
+          saveBusinessFocusBtn.disabled = true;
 
-            const suggestionText = document.createElement("span");
-            suggestionText.textContent = suggestion.name;
+          try {
+            const selects = Array.from(businessFocusContainer.querySelectorAll("select.business-focus-select"));
+            const focusSet = new Set();
 
-            const confidenceBadge = document.createElement("span");
-            confidenceBadge.textContent = suggestion.confidence;
-            confidenceBadge.style.fontSize = "9px";
-            confidenceBadge.style.padding = "2px 6px";
-            confidenceBadge.style.borderRadius = "4px";
-
-            if (suggestion.confidence === "High") {
-              confidenceBadge.style.background = "rgba(16, 185, 129, 0.2)";
-              confidenceBadge.style.color = "#10b981";
-            } else if (suggestion.confidence === "Medium") {
-              confidenceBadge.style.background = "rgba(245, 158, 11, 0.2)";
-              confidenceBadge.style.color = "#f59e0b";
-            } else {
-              confidenceBadge.style.background = "rgba(156, 163, 175, 0.2)";
-              confidenceBadge.style.color = "#9ca3af";
-            }
-
-            suggestionItem.appendChild(suggestionText);
-            suggestionItem.appendChild(confidenceBadge);
-
-            suggestionItem.addEventListener("mouseenter", () => {
-              suggestionItem.style.background = "rgba(99, 102, 241, 0.1)";
-            });
-            suggestionItem.addEventListener("mouseleave", () => {
-              suggestionItem.style.background = "transparent";
-            });
-            suggestionItem.addEventListener("click", () => {
-              businessFocusInput.value = suggestion.name;
-              const id = getBusinessFocusId(suggestion.name);
-              if (id) {
-                businessFocusInput.dataset.businessFocusId = id;
+            for (const sel of selects) {
+              const val = parseInt(sel.value, 10);
+              if (!isNaN(val) && val > 0) {
+                focusSet.add(val);
               }
-              suggestionsDropdown.style.display = "none";
-              // Trigger change event to update ID badge
-              businessFocusInput.dispatchEvent(new Event('input'));
-            });
-
-            suggestionsDropdown.appendChild(suggestionItem);
-          });
-
-          suggestionsDropdown.style.display = suggestions.length > 0 ? "block" : "none";
-        };
-
-        // Remove the old updateSuggestions function definition
-        // Add event listeners to input
-        businessFocusInput.addEventListener("focus", updateSuggestionsLocal);
-        businessFocusInput.addEventListener("input", () => {
-          // Filter suggestions based on input
-          const filterText = businessFocusInput.value.toLowerCase();
-          const suggestionItems = suggestionsDropdown.querySelectorAll("div");
-
-          let visibleCount = 0;
-          suggestionItems.forEach(item => {
-            const text = item.querySelector("span:first-child").textContent.toLowerCase();
-            if (text.includes(filterText) || filterText === "") {
-              item.style.display = "flex";
-              visibleCount++;
-            } else {
-              item.style.display = "none";
             }
-          });
 
-          suggestionsDropdown.style.display = visibleCount > 0 ? "block" : "none";
-        });
-
-        suggestBtn.addEventListener("click", (e) => {
-          e.preventDefault();
-          updateSuggestionsLocal();
-          if (suggestionsDropdown.style.display === "none" || suggestionsDropdown.style.display === "") {
-            suggestionsDropdown.style.display = "block";
-          } else {
-            suggestionsDropdown.style.display = "none";
-          }
-        });
-
-        rowBusinessFocus.appendChild(businessFocusLabel);
-        rowBusinessFocus.appendChild(businessFocusContainer);
-        if (idBadge.textContent) {
-          rowBusinessFocus.appendChild(idBadge);
-        }
-        rowBusinessFocus.appendChild(suggestBtn);
-        rowBusinessFocus.appendChild(createCopyBtn("ai_primary_business_focus", "primary_business_focus", "Business Focus"));
-        rowBusinessFocus.appendChild(createSaveBtn("ai_primary_business_focus", "primary_business_focus", "Business Focus"));
-
-        // AI Sectors row (read-only chips from AI research)
-        const rowSectors = document.createElement("div");
-        rowSectors.style.display = "flex";
-        rowSectors.style.flexWrap = "wrap";
-        rowSectors.style.gap = "4px";
-        rowSectors.style.marginTop = "6px";
-        rowSectors.style.alignItems = "center";
-
-        const sectorsLabel = document.createElement("span");
-        sectorsLabel.textContent = "📊 Sectors (AI):";
-        sectorsLabel.style.fontSize = "11px";
-        sectorsLabel.style.color = "#9ca3af";
-        sectorsLabel.style.marginRight = "4px";
-        sectorsLabel.style.fontWeight = "600";
-        rowSectors.appendChild(sectorsLabel);
-
-        if (data.sectors && data.sectors.length) {
-          const primarySectorsAi = data.sectors.filter(
-            (s) => (s.importance || "").toLowerCase() === "primary"
-          );
-          const secondarySectorsAi = data.sectors.filter(
-            (s) => (s.importance || "").toLowerCase() === "secondary"
-          );
-          const otherSectorsAi = data.sectors.filter(
-            (s) =>
-              !s.importance ||
-              (s.importance.toLowerCase() !== "primary" &&
-                s.importance.toLowerCase() !== "secondary")
-          );
-
-          primarySectorsAi.forEach((s) => {
-            const badge = document.createElement("span");
-            badge.textContent = "🎯 " + (s.sector || s.name || s);
-            badge.style.background = "rgba(59, 130, 246, 0.18)";
-            badge.style.color = "#bfdbfe";
-            badge.style.padding = "2px 8px";
-            badge.style.borderRadius = "999px";
-            badge.style.border = "1px solid rgba(59, 130, 246, 0.5)";
-            badge.title = "Primary sector (AI guess)";
-            rowSectors.appendChild(badge);
-          });
-
-          secondarySectorsAi.forEach((s) => {
-            const badge = document.createElement("span");
-            badge.textContent = "📊 " + (s.sector || s.name || s);
-            badge.style.background = "rgba(96, 165, 250, 0.12)";
-            badge.style.color = "#bfdbfe";
-            badge.style.padding = "2px 8px";
-            badge.style.borderRadius = "999px";
-            badge.style.border = "1px solid rgba(96, 165, 250, 0.4)";
-            badge.title = "Secondary sector (AI guess)";
-            rowSectors.appendChild(badge);
-          });
-
-          if (
-            otherSectorsAi.length &&
-            primarySectorsAi.length === 0 &&
-            secondarySectorsAi.length === 0
-          ) {
-            const sectorsText = otherSectorsAi
-              .map((s) => s.sector || s.name || s)
-              .join(", ");
-            const badge = document.createElement("span");
-            badge.textContent = "📊 " + sectorsText;
-            badge.style.background = "rgba(148, 163, 184, 0.12)";
-            badge.style.color = "#e5e7eb";
-            badge.style.padding = "2px 8px";
-            badge.style.borderRadius = "999px";
-            badge.style.border = "1px solid rgba(148, 163, 184, 0.4)";
-            badge.title = "Sectors (AI guess)";
-            rowSectors.appendChild(badge);
-          }
-        } else {
-          const placeholder = document.createElement("span");
-          placeholder.textContent = "Not detected";
-          placeholder.style.fontSize = "11px";
-          placeholder.style.color = "#6b7280";
-          rowSectors.appendChild(placeholder);
-        }
-
-        // Save Sectors button (if sectors exist and company is in DB)
-        if (data.sectors && data.sectors.length > 0) {
-          const saveSectorsBtn = document.createElement("button");
-          saveSectorsBtn.type = "button";
-          saveSectorsBtn.title = "Save Sectors to DB";
-          saveSectorsBtn.innerHTML = "💾 Save Sectors";
-          saveSectorsBtn.style.padding = "3px 8px";
-          saveSectorsBtn.style.fontSize = "10px";
-          saveSectorsBtn.style.borderRadius = "4px";
-          saveSectorsBtn.style.border = "1px solid rgba(16, 185, 129, 0.3)";
-          saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-          saveSectorsBtn.style.color = "#6ee7b7";
-          saveSectorsBtn.style.cursor = "pointer";
-          saveSectorsBtn.style.marginLeft = "8px";
-          saveSectorsBtn.style.transition = "all 0.15s ease";
-          saveSectorsBtn.style.display = "none"; // Hidden until company exists in DB
-          saveSectorsBtn.className = "save-to-db-btn";
-          
-          saveSectorsBtn.onmouseover = () => {
-            saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.25)";
-            saveSectorsBtn.style.borderColor = "rgba(16, 185, 129, 0.5)";
-          };
-          saveSectorsBtn.onmouseout = () => {
-            saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-            saveSectorsBtn.style.borderColor = "rgba(16, 185, 129, 0.3)";
-          };
-          
-          saveSectorsBtn.onclick = async () => {
-            if (!window._dbCompanyId) {
-              log("No company ID - cannot save sectors", "err");
+            const focusIds = Array.from(focusSet);
+            if (focusIds.length === 0) {
+              log("❌ No business focus selected to save", "err");
+              saveBusinessFocusBtn.innerHTML = "❌";
+              saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
+              setTimeout(() => {
+                saveBusinessFocusBtn.innerHTML = "💾 Save";
+                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                saveBusinessFocusBtn.disabled = false;
+              }, 1600);
               return;
             }
-            
-            saveSectorsBtn.innerHTML = "⏳";
-            saveSectorsBtn.disabled = true;
-            
-            try {
-              // Step 1: Lookup sector IDs for all sectors
-              const allSectors = data.sectors || [];
-              const sectorIds = [];
-              
-              log(`Looking up ${allSectors.length} sectors...`, "info");
-              
-              for (const sector of allSectors) {
-                const sectorName = sector.sector || sector.name || "";
-                if (!sectorName) continue;
-                
-                try {
-                  const lookupUrl = `${XANO_BASE}/api:8Bv5PK4I/sectors_lookup?sector_name=${encodeURIComponent(sectorName)}`;
-                  log(`Looking up sector: ${sectorName}...`, "info");
-                  
-                  const lookupRes = await fetch(lookupUrl, {
-                    method: "GET",
-                    headers: { "Content-Type": "application/json" },
-                  });
-                  
-                  if (lookupRes.ok) {
-                    const lookupData = await lookupRes.json();
-                    if (lookupData && lookupData.id) {
-                      sectorIds.push(lookupData.id);
-                      log(`✅ Found sector ID ${lookupData.id} for "${sectorName}"`, "ok");
-                    } else {
-                      log(`⚠️ No ID found for sector: ${sectorName}`, "warn");
-                    }
-                  } else {
-                    log(`⚠️ Lookup failed for sector: ${sectorName}`, "warn");
-                  }
-                } catch (lookupErr) {
-                  log(`⚠️ Error looking up sector "${sectorName}": ${lookupErr.message}`, "warn");
+
+            log(`Saving primary_business_focus_id: [${focusIds.join(", ")}]`, "info");
+
+            const response = await fetch(
+              `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
+              {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  new_company_id: window._dbCompanyId,
+                  updates: { primary_business_focus_id: focusIds },
+                }),
+              }
+            );
+
+            const result = await response.json();
+
+            if (response.ok && result.success) {
+              saveBusinessFocusBtn.innerHTML = "✅";
+              saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.3)";
+              log(`✅ Saved ${focusIds.length} business focus(es) to DB`, "ok");
+              await refreshXanoData();
+              setTimeout(() => {
+                saveBusinessFocusBtn.innerHTML = "💾 Save";
+                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                saveBusinessFocusBtn.disabled = false;
+              }, 1800);
+            } else {
+              saveBusinessFocusBtn.innerHTML = "❌";
+              saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
+              log(`❌ Failed to save business focuses: ${result.message || "Unknown error"}`, "err");
+              setTimeout(() => {
+                saveBusinessFocusBtn.innerHTML = "💾 Save";
+                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                saveBusinessFocusBtn.disabled = false;
+              }, 1800);
+            }
+          } catch (err) {
+            saveBusinessFocusBtn.innerHTML = "❌";
+            saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
+            log(`❌ Error saving business focuses: ${err.message}`, "err");
+            setTimeout(() => {
+              saveBusinessFocusBtn.innerHTML = "💾 Save";
+              saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+              saveBusinessFocusBtn.disabled = false;
+            }, 1800);
+          }
+        };
+
+        populateBusinessFocuses();
+
+        // AI Sectors row (editable dropdowns with add/remove and lookup)
+        const rowSectors = document.createElement("div");
+        rowSectors.style.display = "flex";
+        rowSectors.style.flexDirection = "column";
+        rowSectors.style.gap = "6px";
+        rowSectors.style.marginTop = "6px";
+        rowSectors.style.alignItems = "stretch";
+
+        const sectorsHeader = document.createElement("div");
+        sectorsHeader.style.display = "flex";
+        sectorsHeader.style.alignItems = "center";
+        sectorsHeader.style.gap = "6px";
+
+        const sectorsLabel = document.createElement("span");
+        sectorsLabel.textContent = "📊 Sectors:";
+        sectorsLabel.style.fontSize = "11px";
+        sectorsLabel.style.color = "#9ca3af";
+        sectorsLabel.style.fontWeight = "600";
+        sectorsHeader.appendChild(sectorsLabel);
+
+        const addSectorBtn = document.createElement("button");
+        addSectorBtn.type = "button";
+        addSectorBtn.textContent = "+ Add sector";
+        addSectorBtn.style.padding = "3px 8px";
+        addSectorBtn.style.fontSize = "10px";
+        addSectorBtn.style.borderRadius = "4px";
+        addSectorBtn.style.border = "1px solid rgba(59, 130, 246, 0.35)";
+        addSectorBtn.style.background = "rgba(59, 130, 246, 0.12)";
+        addSectorBtn.style.color = "#bfdbfe";
+        addSectorBtn.style.cursor = "pointer";
+
+        const saveSectorsBtn = document.createElement("button");
+        saveSectorsBtn.type = "button";
+        saveSectorsBtn.title = "Save Sectors to DB";
+        saveSectorsBtn.innerHTML = "💾 Save Sectors";
+        saveSectorsBtn.style.padding = "3px 8px";
+        saveSectorsBtn.style.fontSize = "10px";
+        saveSectorsBtn.style.borderRadius = "4px";
+        saveSectorsBtn.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+        saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+        saveSectorsBtn.style.color = "#6ee7b7";
+        saveSectorsBtn.style.cursor = "pointer";
+        saveSectorsBtn.style.transition = "all 0.15s ease";
+        saveSectorsBtn.style.display = "none";
+        saveSectorsBtn.className = "save-to-db-btn";
+
+        saveSectorsBtn.onmouseover = () => {
+          saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.25)";
+          saveSectorsBtn.style.borderColor = "rgba(16, 185, 129, 0.5)";
+        };
+        saveSectorsBtn.onmouseout = () => {
+          saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+          saveSectorsBtn.style.borderColor = "rgba(16, 185, 129, 0.3)";
+        };
+
+        sectorsHeader.appendChild(addSectorBtn);
+        sectorsHeader.appendChild(saveSectorsBtn);
+        rowSectors.appendChild(sectorsHeader);
+
+        const sectorsContainer = document.createElement("div");
+        sectorsContainer.id = "ai_sectors_container";  // ID for easy lookup
+        sectorsContainer.style.display = "flex";
+        sectorsContainer.style.flexDirection = "column";
+        sectorsContainer.style.gap = "6px";
+        sectorsContainer.style.width = "100%";
+        rowSectors.appendChild(sectorsContainer);
+
+        const createSectorSelectRow = (options, selectedId = "", fallbackName = "") => {
+          const row = document.createElement("div");
+          row.style.display = "flex";
+          row.style.gap = "6px";
+          row.style.alignItems = "center";
+
+          const select = document.createElement("select");
+          select.className = "sector-select";
+          select.dataset.fallbackName = fallbackName || "";
+          select.style.flex = "1";
+          select.style.padding = "6px 8px";
+          select.style.borderRadius = "8px";
+          select.style.border = "1px solid #1f2937";
+          select.style.background = "#020617";
+          select.style.color = "#e5e7eb";
+          select.style.fontSize = "12px";
+
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = fallbackName ? `AI: ${fallbackName}` : "Select sector";
+          select.appendChild(placeholder);
+
+          options.forEach((opt) => {
+            const optionEl = document.createElement("option");
+            optionEl.value = opt.id;
+            optionEl.textContent = opt.name;
+            select.appendChild(optionEl);
+          });
+
+          if (selectedId) {
+            // Ensure we set as string since option values are strings
+            select.value = String(selectedId);
+          }
+
+          const removeBtn = document.createElement("button");
+          removeBtn.type = "button";
+          removeBtn.textContent = "✕";
+          removeBtn.title = "Remove sector";
+          removeBtn.style.padding = "4px 6px";
+          removeBtn.style.fontSize = "11px";
+          removeBtn.style.borderRadius = "6px";
+          removeBtn.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+          removeBtn.style.background = "rgba(239, 68, 68, 0.1)";
+          removeBtn.style.color = "#fca5a5";
+          removeBtn.style.cursor = "pointer";
+
+          removeBtn.onclick = () => {
+            if (sectorsContainer.children.length > 1) {
+              row.remove();
+            } else {
+              select.value = "";
+              select.dataset.fallbackName = "";
+            }
+          };
+
+          row.appendChild(select);
+          row.appendChild(removeBtn);
+          sectorsContainer.appendChild(row);
+        };
+
+        const populateSectors = async () => {
+          const options = await fetchSectorOptions();
+          sectorsContainer.innerHTML = "";
+
+          const sourceSectors = Array.isArray(data.sectors) && data.sectors.length
+            ? data.sectors
+            : [{}];
+
+          for (const sector of sourceSectors) {
+            const name = (sector.sector || sector.name || `${sector}` || "").trim();
+            let matchedId = "";
+            if (name && options.length) {
+              const lower = name.toLowerCase();
+              const exact = options.find((o) => o.name.toLowerCase() === lower);
+              const contains = options.find((o) => lower.includes(o.name.toLowerCase()) || o.name.toLowerCase().includes(lower));
+              matchedId = (exact || contains || {}).id || "";
+            }
+
+            if (!matchedId && name) {
+              const lookedUpId = await lookupSectorIdByName(name);
+              if (lookedUpId) matchedId = lookedUpId;
+            }
+
+            createSectorSelectRow(options, matchedId, name);
+          }
+        };
+
+        addSectorBtn.onclick = async () => {
+          const options = await fetchSectorOptions();
+          createSectorSelectRow(options, "", "");
+        };
+
+        saveSectorsBtn.onclick = async () => {
+          if (!window._dbCompanyId) {
+            log("No company ID - cannot save sectors", "err");
+            return;
+          }
+
+          saveSectorsBtn.innerHTML = "⏳";
+          saveSectorsBtn.disabled = true;
+
+          try {
+            const selects = Array.from(sectorsContainer.querySelectorAll("select.sector-select"));
+            const sectorSet = new Set();
+
+            for (const sel of selects) {
+              const val = parseInt(sel.value, 10);
+              if (!isNaN(val)) {
+                sectorSet.add(val);
+              } else if (sel.dataset.fallbackName) {
+                const lookedUp = await lookupSectorIdByName(sel.dataset.fallbackName);
+                if (lookedUp) {
+                  sectorSet.add(lookedUp);
+                  sel.value = lookedUp;
                 }
               }
-              
-              if (sectorIds.length === 0) {
-                log("❌ No sector IDs found - cannot save", "err");
-                saveSectorsBtn.innerHTML = "❌";
-                saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-                setTimeout(() => {
-                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
-                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                  saveSectorsBtn.disabled = false;
-                }, 2000);
-                return;
-              }
-              
-              // Step 2: Save sectors_id array to company
-              log(`Saving ${sectorIds.length} sector IDs: [${sectorIds.join(", ")}]`, "info");
-              
-              const response = await fetch(
-                `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
-                {
-                  method: "PATCH",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    new_company_id: window._dbCompanyId,
-                    updates: {
-                      sectors_id: sectorIds
-                    }
-                  })
-                }
-              );
-              
-              const result = await response.json();
-              
-              if (response.ok && result.success) {
-                saveSectorsBtn.innerHTML = "✅";
-                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.3)";
-                log(`✅ Saved ${sectorIds.length} sectors (IDs: [${sectorIds.join(", ")}])`, "ok");
-                
-                // Refresh Xano data
-                await refreshXanoData();
-                
-                setTimeout(() => {
-                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
-                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                  saveSectorsBtn.disabled = false;
-                }, 2000);
-              } else {
-                saveSectorsBtn.innerHTML = "❌";
-                saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-                log(`❌ Failed to save sectors: ${result.message || "Unknown error"}`, "err");
-                setTimeout(() => {
-                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
-                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                  saveSectorsBtn.disabled = false;
-                }, 2000);
-              }
-            } catch (err) {
+            }
+
+            const sectorIds = Array.from(sectorSet);
+            if (sectorIds.length === 0) {
+              log("❌ No sector selected to save", "err");
               saveSectorsBtn.innerHTML = "❌";
               saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              log(`❌ Error saving sectors: ${err.message}`, "err");
               setTimeout(() => {
                 saveSectorsBtn.innerHTML = "💾 Save Sectors";
                 saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
                 saveSectorsBtn.disabled = false;
-              }, 2000);
+              }, 1600);
+              return;
             }
-          };
-          
-          rowSectors.appendChild(saveSectorsBtn);
-        }
+
+            log(`Saving sectors_id: [${sectorIds.join(", ")}]`, "info");
+
+            const response = await fetch(
+              `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
+              {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  new_company_id: window._dbCompanyId,
+                  updates: { sectors_id: sectorIds },
+                }),
+              }
+            );
+
+            const result = await response.json();
+
+            if (response.ok && result.success) {
+              saveSectorsBtn.innerHTML = "✅";
+              saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.3)";
+              log(`✅ Saved ${sectorIds.length} sectors to DB`, "ok");
+              await refreshXanoData();
+              setTimeout(() => {
+                saveSectorsBtn.innerHTML = "💾 Save Sectors";
+                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                saveSectorsBtn.disabled = false;
+              }, 1800);
+            } else {
+              saveSectorsBtn.innerHTML = "❌";
+              saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
+              log(`❌ Failed to save sectors: ${result.message || "Unknown error"}`, "err");
+              setTimeout(() => {
+                saveSectorsBtn.innerHTML = "💾 Save Sectors";
+                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                saveSectorsBtn.disabled = false;
+              }, 1800);
+            }
+          } catch (err) {
+            saveSectorsBtn.innerHTML = "❌";
+            saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
+            log(`❌ Error saving sectors: ${err.message}`, "err");
+            setTimeout(() => {
+              saveSectorsBtn.innerHTML = "💾 Save Sectors";
+              saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+              saveSectorsBtn.disabled = false;
+            }, 1800);
+          }
+        };
+
+        populateSectors();
+
+        // Old AI Sectors block removed (replaced with editable dropdowns above)
 
         // Ownership Status row
         const rowOwnership = document.createElement("div");
@@ -3288,21 +3594,31 @@
               }
               
               const roleId = result.roles[0].id;
-              const value = getValue();
+              const rawValue = getValue();
+              const value = (rawValue && typeof rawValue === "object") ? rawValue.text : rawValue;
+              const selectedJobId = (rawValue && typeof rawValue === "object") ? (rawValue.id || null) : null;
               
               // Handle different field types that need lookups
               let updates = {};
               if (updateKey === "job_title" || updateKey === "position") {
-                // Use smart job title lookup (returns array, pick best for PATCH)
-                const jobTitleIds = await window.lookupJobTitles(value);
+                // Support multiple job titles; send array + primary for compatibility
+                let ids = [];
+                if (rawValue && typeof rawValue === "object" && Array.isArray(rawValue.ids)) {
+                  ids = rawValue.ids.filter((n) => typeof n === "number" && !isNaN(n));
+                }
 
-                // For PATCH updates, send single job_title_id (best match)
-                if (jobTitleIds.length > 0) {
+                if (ids.length === 0) {
+                  const lookedUp = await window.lookupJobTitles(value);
+                  ids = lookedUp;
+                }
+
+                if (ids.length > 0) {
                   updates = {
-                    job_title_id: jobTitleIds[0]  // Use first/best match for updates
+                    job_title_id: ids[0],
+                    job_titles_id: ids,
                   };
+                  log(`✅ Using job_title_id ${ids[0]} (all IDs: [${ids.join(", ")}]) for "${value}"`, "ok");
                 } else {
-                  // If lookup failed, still try to update (API might handle it)
                   log(`⚠️ No job title ID found, skipping update`, "warn");
                   btn.textContent = "❌";
                   setTimeout(() => {
@@ -3376,24 +3692,139 @@
           nameGroup.appendChild(nameInputRow);
           editSection.appendChild(nameGroup);
 
-          // Job Title field
+          // Job Title field (multi-select with add/remove like sectors)
           const titleGroup = document.createElement("div");
           titleGroup.className = "form-group";
           const titleLabel = document.createElement("label");
           titleLabel.className = "form-label";
-          titleLabel.textContent = "💼 Job Title";
+          titleLabel.textContent = "💼 Job Title(s)";
+          
+          const rolesHeader = document.createElement("div");
+          rolesHeader.style.display = "flex";
+          rolesHeader.style.alignItems = "center";
+          rolesHeader.style.gap = "8px";
+          
+          const addRoleBtn = document.createElement("button");
+          addRoleBtn.type = "button";
+          addRoleBtn.textContent = "+ Add role";
+          addRoleBtn.style.padding = "4px 10px";
+          addRoleBtn.style.fontSize = "10px";
+          addRoleBtn.style.borderRadius = "6px";
+          addRoleBtn.style.border = "1px solid rgba(59, 130, 246, 0.4)";
+          addRoleBtn.style.background = "rgba(59, 130, 246, 0.12)";
+          addRoleBtn.style.color = "#bfdbfe";
+          addRoleBtn.style.cursor = "pointer";
+          addRoleBtn.style.flexShrink = "0";
+          
+          rolesHeader.appendChild(titleLabel);
+          rolesHeader.appendChild(addRoleBtn);
+          
+          const rolesContainer = document.createElement("div");
+          rolesContainer.style.display = "flex";
+          rolesContainer.style.flexDirection = "column";
+          rolesContainer.style.gap = "6px";
+          rolesContainer.style.marginTop = "6px";
+          
+          let roleOptionsCacheLocal = [];
+          const ensureRoleOptions = async () => {
+            if (roleOptionsCacheLocal.length) return roleOptionsCacheLocal;
+            const roles = await fetchRoleOptions();
+            roleOptionsCacheLocal = roles || [];
+            return roleOptionsCacheLocal;
+          };
+          
+          const createRoleRow = (preselectId = null) => {
+            const row = document.createElement("div");
+            row.style.display = "flex";
+            row.style.gap = "6px";
+            row.style.alignItems = "center";
+            
+            const select = document.createElement("select");
+            select.className = "form-select";
+            select.style.flex = "1";
+            select.dataset.roleId = preselectId ? String(preselectId) : "";
+            
+            const removeBtn = document.createElement("button");
+            removeBtn.type = "button";
+            removeBtn.textContent = "✕";
+            removeBtn.style.padding = "4px 6px";
+            removeBtn.style.fontSize = "11px";
+            removeBtn.style.borderRadius = "6px";
+            removeBtn.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+            removeBtn.style.background = "rgba(239, 68, 68, 0.1)";
+            removeBtn.style.color = "#fca5a5";
+            removeBtn.style.cursor = "pointer";
+            
+            removeBtn.onclick = () => {
+              if (rolesContainer.children.length > 1) {
+                row.remove();
+              }
+            };
+            
+            ensureRoleOptions().then((roles) => {
+              const placeholder = document.createElement("option");
+              placeholder.value = "";
+              placeholder.textContent = "Select role";
+              select.appendChild(placeholder);
+              
+              roles.forEach((r) => {
+                const opt = document.createElement("option");
+                opt.value = r.id;
+                opt.textContent = r.name;
+                select.appendChild(opt);
+              });
+              
+              if (preselectId) {
+                select.value = preselectId;
+              } else {
+                const lowerTitle = (execPosition || "").toLowerCase();
+                const found = roles.find(r => r.name.toLowerCase() === lowerTitle);
+                if (found) select.value = found.id;
+              }
+            });
+            
+            select.addEventListener("change", () => {
+              const val = parseInt(select.value, 10);
+              select.dataset.roleId = isNaN(val) ? "" : String(val);
+            });
+            
+            row.appendChild(select);
+            row.appendChild(removeBtn);
+            rolesContainer.appendChild(row);
+          };
+          
+          addRoleBtn.onclick = () => createRoleRow();
+          createRoleRow(); // initial row
+          
           const titleInputRow = document.createElement("div");
           titleInputRow.style.display = "flex";
           titleInputRow.style.alignItems = "center";
-          const titleInput = document.createElement("input");
-          titleInput.type = "text";
-          titleInput.className = "form-input";
-          titleInput.id = `exec_${idx}_title`;
-          titleInput.value = execPosition;
-          titleInput.style.flex = "1";
-          titleInputRow.appendChild(titleInput);
-          titleInputRow.appendChild(createIndividualFieldSaveBtn("job title", () => titleInput.value.trim(), "job_title"));
-          titleGroup.appendChild(titleLabel);
+          titleInputRow.style.gap = "6px";
+          
+          // Save button uses selected IDs (allow multiple titles)
+          titleInputRow.appendChild(
+            createIndividualFieldSaveBtn(
+              "job title",
+              () => {
+                const selects = Array.from(rolesContainer.querySelectorAll("select.form-select"));
+                const ids = selects
+                  .map((sel) => parseInt(sel.value, 10))
+                  .filter((v) => !isNaN(v));
+                const texts = selects
+                  .map((sel) => sel.options[sel.selectedIndex]?.textContent?.trim() || "")
+                  .filter(Boolean);
+                return {
+                  text: texts.join(", "),
+                  id: ids.length ? ids[0] : null, // for PATCH fallback single
+                  ids,
+                };
+              },
+              "job_title"
+            )
+          );
+          
+          titleGroup.appendChild(rolesHeader);
+          titleGroup.appendChild(rolesContainer);
           titleGroup.appendChild(titleInputRow);
           editSection.appendChild(titleGroup);
 
@@ -3711,6 +4142,29 @@
             "Unknown";
           const status = ev["Deal Status"] || ev.deal_status || "";
           const source = ev["Source URL"] || ev.source_url || "";
+          const invAmount =
+            ev.investment_amount_m ||
+            ev.investment_amount ||
+            ev["Investment Amount"] ||
+            ev["Investment Amount (USD millions)"] ||
+            "";
+          const invCurrency =
+            ev.investment_currency ||
+            ev.currency ||
+            ev["Investment Currency"] ||
+            "";
+          const invStage =
+            ev.funding_stage ||
+            ev.stage ||
+            ev["Funding Stage"] ||
+            ev["Investment Stage"] ||
+            "";
+          const invSource =
+            ev.investment_amount_source ||
+            ev.investment_source ||
+            ev["Investment Amount Source"] ||
+            ev["Source"] ||
+            "";
 
           const titleRow = document.createElement("div");
           titleRow.className = "event-title-row";
@@ -3728,6 +4182,12 @@
           } AI Event #${idx + 1} <span style="font-size:11px;color:${
             isMissing ? "#facc15" : "#6ee7b7"
           };">(${matchLabel})</span>`;
+
+          // Helper to get current event title (either from edited input or original)
+          const getCurrentEventTitle = () => {
+            const titleInputEl = document.getElementById(`ev_${idx}_title`);
+            return (titleInputEl && titleInputEl.value.trim()) || shortTitle;
+          };
 
           // Helper to create inline save button for a field
           function createFieldSaveBtn(fieldName, getValue, updateKey) {
@@ -3758,10 +4218,12 @@
               btn.disabled = true;
               btn.textContent = "🔍";
               
-              const eventId = await queryEventId(shortTitle);
+              // Use current title from input (might have been edited or parsed)
+              const currentTitle = getCurrentEventTitle();
+              const eventId = await queryEventId(currentTitle);
               if (!eventId) {
                 btn.textContent = "❌";
-                log(`❌ Event not found in DB: ${shortTitle}`, "err");
+                log(`❌ Event not found in DB: ${currentTitle}`, "err");
                 setTimeout(() => {
                   btn.disabled = false;
                   btn.textContent = "💾";
@@ -3816,13 +4278,23 @@
           // Helper to convert various date formats to YYYY-MM-DD for date input
           function parseToDateValue(dateStr) {
             if (!dateStr || dateStr === "Unknown" || dateStr === "Not available") return "";
+            const cleaned = (dateStr || "").trim();
+            // DD/MM/YYYY or DD.MM.YYYY
+            const ddmmyyyy = cleaned.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+            if (ddmmyyyy) {
+              const d = ddmmyyyy[1].padStart(2, "0");
+              const m = ddmmyyyy[2].padStart(2, "0");
+              let y = ddmmyyyy[3];
+              if (y.length === 2) y = `20${y}`;
+              return `${y}-${m}-${d}`;
+            }
             // Try to parse the date
-            const d = new Date(dateStr);
+            const d = new Date(cleaned);
             if (!isNaN(d.getTime())) {
               return d.toISOString().split('T')[0];
             }
             // If already in YYYY-MM-DD format
-            if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+            if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) return cleaned;
             return "";
           }
 
@@ -3958,7 +4430,7 @@
           typeRow.appendChild(typeGroup);
           typeRow.appendChild(statusGroup);
 
-          // Source URL
+          // Source URL + parse helper
           const sourceGroup = document.createElement("div");
           sourceGroup.className = "form-group";
           const sourceLabel = document.createElement("label");
@@ -3970,13 +4442,337 @@
           sourceInput.placeholder = "https://company.com/press/announcement...";
           sourceInput.id = `ev_${idx}_source`;
           sourceInput.value = source;
+
+          const parseBtn = document.createElement("button");
+          parseBtn.textContent = "🧠 Parse from source";
+          parseBtn.title = "Fetch page and extract title/date/description";
+          parseBtn.style.marginLeft = "8px";
+          parseBtn.style.padding = "4px 10px";
+          parseBtn.style.fontSize = "10px";
+          parseBtn.style.borderRadius = "6px";
+          parseBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          parseBtn.style.background = "rgba(99, 102, 241, 0.1)";
+          parseBtn.style.color = "#c7d2fe";
+          parseBtn.style.cursor = "pointer";
+
+          parseBtn.onclick = async () => {
+            const urlToParse = sourceInput.value.trim();
+            if (!urlToParse) {
+              log("⚠️ No source URL to parse", "warn");
+              return;
+            }
+            parseBtn.disabled = true;
+            parseBtn.textContent = "⏳ Parsing…";
+            try {
+              const res = await fetch("/extract_event_meta", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: urlToParse, use_scrapfly: true }),
+              });
+              const data = await res.json();
+              if (!res.ok || data.error) {
+                log(`⚠️ Parse failed: ${data.error || res.status}`, "warn");
+              } else {
+                if (data.title && titleInput) {
+                  titleInput.value = data.title;
+                  log(`✅ Parsed title: ${data.title}`, "ok");
+                }
+                if (data.announcement_date && annInput) {
+                  annInput.value = data.announcement_date;
+                  log(`✅ Parsed date: ${data.announcement_date}`, "ok");
+                }
+                const longDescEl = document.getElementById(`ev_${idx}_longdesc`);
+                if (data.long_description) {
+                  if (longDescEl) {
+                    longDescEl.value = data.long_description;
+                  }
+                  log(`✅ Parsed description (${data.long_description.length} chars)`, "ok");
+                }
+                if (typeof data.investment_amount_m !== "undefined" && amountInput) {
+                  amountInput.value = data.investment_amount_m;
+                  log(`✅ Parsed amount (m): ${data.investment_amount_m}`, "ok");
+                }
+                if (data.investment_currency && currencySelect) {
+                  const match = [...currencySelect.options].find(
+                    (o) =>
+                      (o.dataset.code && o.dataset.code.toUpperCase() === data.investment_currency.toUpperCase()) ||
+                      (o.textContent && o.textContent.toUpperCase() === data.investment_currency.toUpperCase())
+                  );
+                  if (match) {
+                    currencySelect.value = match.value;
+                  }
+                  log(`✅ Parsed currency: ${data.investment_currency}`, "ok");
+                }
+                if (data.funding_stage && stageInput) {
+                  stageInput.value = data.funding_stage;
+                  log(`✅ Parsed stage: ${data.funding_stage}`, "ok");
+                }
+                if (data.long_description && sourceInputInvestment) {
+                  // If amount source empty, default to the URL we parsed
+                  if (!sourceInputInvestment.value.trim()) {
+                    sourceInputInvestment.value = urlToParse;
+                  }
+                }
+              }
+            } catch (err) {
+              log(`⚠️ Parse error: ${err.message}`, "warn");
+            } finally {
+              parseBtn.disabled = false;
+              parseBtn.textContent = "🧠 Parse from source";
+            }
+          };
+
           sourceGroup.appendChild(sourceLabel);
-          sourceGroup.appendChild(sourceInput);
+          const sourceRow = document.createElement("div");
+          sourceRow.style.display = "flex";
+          sourceRow.style.alignItems = "center";
+          sourceRow.appendChild(sourceInput);
+          sourceRow.appendChild(parseBtn);
+          sourceGroup.appendChild(sourceRow);
+
+          // Enrich Event button (calls /enrich_event)
+          const enrichBtn = document.createElement("button");
+          enrichBtn.textContent = "🧪 Enrich Event";
+          enrichBtn.title = "Gather external evidence and populate fields (no DB save)";
+          enrichBtn.style.marginTop = "6px";
+          enrichBtn.style.padding = "6px 10px";
+          enrichBtn.style.fontSize = "11px";
+          enrichBtn.style.borderRadius = "6px";
+          enrichBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          enrichBtn.style.background = "rgba(99, 102, 241, 0.12)";
+          enrichBtn.style.color = "#c7d2fe";
+          enrichBtn.style.cursor = "pointer";
+
+          enrichBtn.onclick = async () => {
+            const urlToParse = sourceInput.value.trim();
+            if (!urlToParse) {
+              log("⚠️ No source URL to enrich", "warn");
+              return;
+            }
+            enrichBtn.disabled = true;
+            enrichBtn.textContent = "⏳ Enriching…";
+            try {
+              const counterparties = (ev.counterparties || []).map(cp => cp.company_name || cp.name || cp.company || "").filter(Boolean);
+              const body = {
+                event: {
+                  title: titleInput ? titleInput.value : shortTitle,
+                  company: document.getElementById("ai_name")?.value || "",
+                  counterparties,
+                  source_url: urlToParse,
+                  announcement_date: annInput?.value || annDate || null,
+                  deal_type: typeSelect?.value || type || ""
+                }
+              };
+              const res = await fetch("/enrich_event", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+              });
+              const data = await res.json();
+              if (!res.ok || data.error) {
+                log(`⚠️ Enrich failed: ${data.error || res.status}`, "warn");
+              } else {
+                const enr = data.enriched_event || {};
+                if (enr.title && titleInput) titleInput.value = enr.title;
+                if (enr.announcement_date && annInput) annInput.value = parseToDateValue(enr.announcement_date);
+                if (enr.deal_type && typeSelect) typeSelect.value = enr.deal_type;
+                if (enr.deal_status && statusSelect) statusSelect.value = enr.deal_status;
+                if (typeof enr.amount !== "undefined" && amountInput) amountInput.value = enr.amount ?? "";
+                if (enr.currency && currencySelect) {
+                  const match = [...currencySelect.options].find(
+                    (o) =>
+                      (o.dataset.code && o.dataset.code.toUpperCase() === enr.currency.toUpperCase()) ||
+                      (o.textContent && o.textContent.toUpperCase() === enr.currency.toUpperCase())
+                  );
+                  if (match) {
+                    currencySelect.value = match.value;
+                  }
+                }
+                if (enr.stage && stageInput) stageInput.value = enr.stage;
+                if (enr.amount_source_url && sourceInputInvestment) sourceInputInvestment.value = enr.amount_source_url;
+                const longDescEl = document.getElementById(`ev_${idx}_longdesc`);
+                if (enr.long_description && longDescEl) longDescEl.value = enr.long_description;
+                log("✅ Enrichment populated fields (not saved to DB)", "ok");
+              }
+            } catch (err) {
+              log(`⚠️ Enrich error: ${err.message}`, "warn");
+            } finally {
+              enrichBtn.disabled = false;
+              enrichBtn.textContent = "🧪 Enrich Event";
+            }
+          };
+
+          sourceGroup.appendChild(enrichBtn);
 
           left.appendChild(titleLabel);
           left.appendChild(titleGroup);
           left.appendChild(datesRow);
           left.appendChild(typeRow);
+
+          // Investment details (amount, currency, stage, source)
+          const invGroup = document.createElement("div");
+          invGroup.className = "form-row";
+
+          const amountGroup = document.createElement("div");
+          amountGroup.className = "form-group";
+          const amountLabel = document.createElement("label");
+          amountLabel.className = "form-label";
+          amountLabel.textContent = "💵 Amount (millions)";
+          const amountInput = document.createElement("input");
+          amountInput.type = "number";
+          amountInput.step = "0.01";
+          amountInput.className = "form-input";
+          amountInput.value = invAmount || "";
+          amountInput.placeholder = "e.g., 25.5";
+          amountInput.id = `ev_${idx}_amount`;
+          amountGroup.appendChild(amountLabel);
+          amountGroup.appendChild(amountInput);
+          invGroup.appendChild(amountGroup);
+
+          const currencyGroup = document.createElement("div");
+          currencyGroup.className = "form-group";
+          const currencyLabel = document.createElement("label");
+          currencyLabel.className = "form-label";
+          currencyLabel.textContent = "💱 Currency";
+          const currencySelect = document.createElement("select");
+          currencySelect.className = "form-select";
+          currencySelect.id = `ev_${idx}_currency`;
+
+          const defaultCurrencies = [
+            { id: "", code: "AUD" },
+            { id: "", code: "BRL" },
+            { id: "", code: "CAD" },
+            { id: "", code: "CHF" },
+            { id: "", code: "DKK" },
+            { id: "", code: "EUR" },
+            { id: "", code: "GBP" },
+            { id: "", code: "HKD" },
+            { id: "", code: "JPY" },
+            { id: "", code: "KRW" },
+            { id: "", code: "RM" },
+            { id: "", code: "SEK" },
+            { id: "", code: "SGD" },
+            { id: "", code: "USD" },
+            { id: "", code: "INR" },
+          ];
+
+          const applyCurrencyOptions = (list) => {
+            currencySelect.innerHTML = "";
+            const placeholder = document.createElement("option");
+            placeholder.value = "";
+            placeholder.textContent = "Select currency...";
+            currencySelect.appendChild(placeholder);
+
+            const options = list && list.length ? list : defaultCurrencies;
+            options.forEach((c) => {
+              const opt = document.createElement("option");
+              opt.value = c.id ?? "";
+              opt.textContent = c.code || c.Currency || "";
+              opt.dataset.code = c.code || c.Currency || "";
+              currencySelect.appendChild(opt);
+            });
+
+            // Preselect by code if we have invCurrency
+            if (invCurrency) {
+              const match = [...currencySelect.options].find(
+                (o) => o.dataset.code && o.dataset.code.toUpperCase() === invCurrency.toUpperCase()
+              );
+              if (match) {
+                currencySelect.value = match.value;
+              }
+            }
+          };
+
+          if (currencyOptionsCache && currencyOptionsCache.length) {
+            applyCurrencyOptions(currencyOptionsCache);
+          } else {
+            applyCurrencyOptions(defaultCurrencies);
+            fetchCurrencyOptions().then((list) => applyCurrencyOptions(list));
+          }
+
+          currencyGroup.appendChild(currencyLabel);
+          currencyGroup.appendChild(currencySelect);
+          invGroup.appendChild(currencyGroup);
+
+          const stageGroup = document.createElement("div");
+          stageGroup.className = "form-group";
+          const stageLabel = document.createElement("label");
+          stageLabel.className = "form-label";
+          stageLabel.textContent = "🚀 Funding Stage";
+          const stageInput = document.createElement("input");
+          stageInput.type = "text";
+          stageInput.className = "form-input";
+          stageInput.value = invStage || "";
+          stageInput.placeholder = "Seed, Series A, Growth…";
+          stageInput.id = `ev_${idx}_stage`;
+          stageGroup.appendChild(stageLabel);
+          stageGroup.appendChild(stageInput);
+          invGroup.appendChild(stageGroup);
+
+          const sourceGroupInvestment = document.createElement("div");
+          sourceGroupInvestment.className = "form-group";
+          const sourceLabelInvestment = document.createElement("label");
+          sourceLabelInvestment.className = "form-label";
+          sourceLabelInvestment.textContent = "🔗 Amount Source";
+          const sourceInputInvestment = document.createElement("input");
+          sourceInputInvestment.type = "url";
+          sourceInputInvestment.className = "form-input";
+          sourceInputInvestment.value = invSource || "";
+          sourceInputInvestment.placeholder = "Source link for investment amount";
+          sourceInputInvestment.id = `ev_${idx}_inv_source`;
+          sourceGroupInvestment.appendChild(sourceLabelInvestment);
+          sourceGroupInvestment.appendChild(sourceInputInvestment);
+          invGroup.appendChild(sourceGroupInvestment);
+
+          // Save investment details (only when matched)
+          if (!isMissing) {
+            const invSaveBtn = document.createElement("button");
+            invSaveBtn.textContent = "💾 Save Investment";
+            invSaveBtn.title = "Save investment amount, currency, stage, and source";
+            invSaveBtn.className = "save-btn";
+            invSaveBtn.style.alignSelf = "flex-end";
+            invSaveBtn.onclick = async () => {
+              invSaveBtn.disabled = true;
+              invSaveBtn.textContent = "🔍";
+
+              // Use current title from input (might have been edited or parsed)
+              const currentTitle = getCurrentEventTitle();
+              const eventId = await queryEventId(currentTitle);
+              if (!eventId) {
+                invSaveBtn.textContent = "❌";
+                log(`❌ Event not found in DB: ${currentTitle}`, "err");
+                setTimeout(() => {
+                  invSaveBtn.disabled = false;
+                  invSaveBtn.textContent = "💾 Save Investment";
+                }, 2000);
+                return;
+              }
+
+              const updates = {};
+              const amt = parseFloat(amountInput.value);
+              if (!isNaN(amt)) updates.investment_amount_m = amt;
+              if (currencyInput.value.trim()) updates.investment_currency = currencyInput.value.trim();
+              if (stageInput.value.trim()) updates.funding_stage = stageInput.value.trim();
+              if (sourceInputInvestment.value.trim()) updates.investment_amount_source = sourceInputInvestment.value.trim();
+
+              if (Object.keys(updates).length === 0) {
+                invSaveBtn.textContent = "❌";
+                log("⚠️ No investment fields to update", "warn");
+                setTimeout(() => {
+                  invSaveBtn.disabled = false;
+                  invSaveBtn.textContent = "💾 Save Investment";
+                }, 1500);
+                return;
+              }
+
+              await editCorporateEventInDb(eventId, updates, invSaveBtn);
+              invSaveBtn.textContent = "💾 Save Investment";
+              invSaveBtn.disabled = false;
+            };
+            invGroup.appendChild(invSaveBtn);
+          }
+
+          left.appendChild(invGroup);
           left.appendChild(sourceGroup);
 
           // RIGHT: Button container
@@ -4011,12 +4807,13 @@
               saveAllBtn.disabled = true;
               saveAllBtn.innerHTML = "🔍 Finding...";
               
-              // Query for the event ID using the original title
-              const eventId = await queryEventId(shortTitle);
+              // Query for the event ID using the current title (might have been edited)
+              const currentTitle = getCurrentEventTitle();
+              const eventId = await queryEventId(currentTitle);
               
               if (!eventId) {
                 saveAllBtn.innerHTML = "❌ Not found";
-                log(`❌ Could not find event ID for: ${shortTitle}`, "err");
+                log(`❌ Could not find event ID for: ${currentTitle}`, "err");
                 setTimeout(() => {
                   saveAllBtn.disabled = false;
                   saveAllBtn.innerHTML = "💾 Save All";
@@ -4169,15 +4966,24 @@
               const role = cp.role || cp.role_description || cp.type || "Counterparty";
               const typeId = cp.type_id || 0;
               const link = cp.company_linkedin_url || "";
-              const press = cp.press_release_url || "";
+              const press = cp.press_release_url || cp.counterparty_announcement_url || cp.announcement_url || "";
+              let website = cp.company_website || cp.company_url || cp.website || cp.url || "";
               const indiv = cp.individuals || [];
+              let existsInDb = false;
+              let existingCompanyId = null;
+              let lookupInProgress = false;
+              let websiteInputRef = null;
+              // Normalize common fields for reuse below
+              cp.website = website;
+              cp.announcement_url = press;
+              cp.linkedin = link;
 
               const cpCard = document.createElement("div");
               cpCard.className = "counterparty-card";
               // Store counterparty ID on the card for dynamic updates
               cpCard.dataset.counterpartyId = cpId || "";
 
-              // Header row with name and expand button
+              // Header row with name, badge, and expand button
               const header = document.createElement("div");
               header.className = "counterparty-header";
               
@@ -4188,6 +4994,16 @@
               const roleSpan = document.createElement("span");
               roleSpan.className = "counterparty-role";
               roleSpan.textContent = role;
+
+              // Badge for DB existence
+              const badge = document.createElement("span");
+              badge.style.fontSize = "10px";
+              badge.style.padding = "2px 6px";
+              badge.style.borderRadius = "999px";
+              badge.style.border = "1px solid transparent";
+              badge.style.color = "#9ca3af";
+              badge.style.background = "rgba(148, 163, 184, 0.12)";
+              badge.textContent = "Not checked";
               
               const headerLeft = document.createElement("div");
               headerLeft.style.display = "flex";
@@ -4195,6 +5011,7 @@
               headerLeft.style.gap = "10px";
               headerLeft.appendChild(nameSpan);
               headerLeft.appendChild(roleSpan);
+              headerLeft.appendChild(badge);
               
               const expandBtn = document.createElement("button");
               expandBtn.className = "counterparty-expand-btn";
@@ -4232,12 +5049,18 @@
                 };
                 addCpBtn.onclick = async () => {
                   addCpBtn.disabled = true;
-                  addCpBtn.textContent = "🔍 Finding...";
+                  addCpBtn.textContent = "⏳ Linking to event...";
                   
-                  const eventId = await queryEventId(shortTitle);
+                  // Use current title from input (might have been edited or parsed)
+                  const titleInputEl = document.getElementById(`ev_${idx}_title`);
+                  const currentTitle = titleInputEl ? titleInputEl.value.trim() : shortTitle;
+                  log(`🔍 Looking up event with title: "${currentTitle.substring(0, 50)}..."`, "info");
+                  log(`🔍 Title input element found: ${!!titleInputEl}, value: "${titleInputEl?.value?.substring(0, 50)}..."`, "info");
+                  
+                  const eventId = await queryEventId(currentTitle);
                   if (!eventId) {
                     addCpBtn.textContent = "❌ Event not in DB";
-                    log(`❌ Add event to DB first`, "err");
+                    log(`❌ Cannot add counterparty: Event "${currentTitle}" not found in DB. Add the event first.`, "err");
                     setTimeout(() => {
                       addCpBtn.disabled = false;
                       addCpBtn.textContent = "🚀 Add to DB";
@@ -4245,8 +5068,8 @@
                     return;
                   }
                   
-                  addCpBtn.textContent = "⏳ Creating...";
-                  const result = await createCounterpartyInDb(eventId, name, typeId || 17, addCpBtn, press);
+                  addCpBtn.textContent = "⏳ Creating counterparty...";
+                  const result = await createCounterpartyInDb(eventId, name, typeId || 17, addCpBtn, press, website);
                   if (result && (result.id || result.counterparty_id)) {
                     const newCpId = result.id || result.counterparty_id;
                     // Update the card's dataset with the new counterparty ID
@@ -4265,14 +5088,152 @@
                 headerBtns.appendChild(addCpBtn);
               }
               
+              // Manual check button - checks if counterparty exists in DB via LinkedIn
+              const checkBtn = document.createElement("button");
+              checkBtn.textContent = "🔍 Check";
+              checkBtn.title = "Check if this counterparty exists in the database (by LinkedIn URL)";
+              checkBtn.style.padding = "4px 10px";
+              checkBtn.style.fontSize = "10px";
+              checkBtn.style.borderRadius = "6px";
+              checkBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+              checkBtn.style.background = "rgba(99, 102, 241, 0.1)";
+              checkBtn.style.color = "#c7d2fe";
+              checkBtn.style.cursor = "pointer";
+              checkBtn.style.transition = "all 0.15s ease";
+              headerBtns.appendChild(checkBtn);
+
               headerBtns.appendChild(expandBtn);
               header.appendChild(headerBtns);
               cpCard.appendChild(header);
+
+              // Auto lookup to see if counterparty already exists in DB
+              // 2-round lookup: 1) LinkedIn URL, 2) Company name
+              const getLinkedInUrl = () => {
+                // First try to get from LinkedIn input if it exists
+                const linkedinInput = cpCard.querySelector('input[id*="_linkedin"]');
+                if (linkedinInput && linkedinInput.value.trim()) {
+                  return linkedinInput.value.trim();
+                }
+                // Fall back to original LinkedIn URL from data
+                return link || "";
+              };
+              
+              const getCompanyName = () => {
+                // Try to get from name input if edited
+                const nameInput = cpCard.querySelector('input[id*="_name"]');
+                if (nameInput && nameInput.value.trim()) {
+                  return nameInput.value.trim();
+                }
+                // Fall back to original name
+                return name || "";
+              };
+
+              const runLookup = async () => {
+                if (lookupInProgress) return;
+                
+                const linkedinUrl = getLinkedInUrl();
+                const companyName = getCompanyName();
+                
+                // Need at least one identifier
+                if (!linkedinUrl && !companyName) {
+                  badge.textContent = "No data";
+                  badge.style.background = "rgba(148, 163, 184, 0.12)";
+                  badge.style.color = "#9ca3af";
+                  badge.style.border = "1px solid rgba(148, 163, 184, 0.25)";
+                  log(`⚠️ Counterparty lookup skipped: no LinkedIn or name`, "warn");
+                  return;
+                }
+                
+                lookupInProgress = true;
+                badge.textContent = "Checking…";
+                badge.style.background = "rgba(59, 130, 246, 0.12)";
+                badge.style.color = "#bfdbfe";
+                badge.style.border = "1px solid rgba(59, 130, 246, 0.3)";
+
+                try {
+                  let foundId = null;
+                  
+                  // Round 1: Try LinkedIn URL first (if available)
+                  if (linkedinUrl && linkedinUrl.includes("linkedin.com")) {
+                    log(`🔍 Round 1: Checking counterparty "${companyName}" by LinkedIn...`, "info");
+                    const res1 = await fetch(`${XANO_BASE}/api:8Bv5PK4I/check_counterpaty?linkedin_url=${encodeURIComponent(linkedinUrl)}&company_name=`, {
+                      method: "GET",
+                      headers: { "Content-Type": "application/json" },
+                    });
+                    const data1 = await res1.json();
+                    if (res1.ok && data1 && data1.id) {
+                      foundId = data1.id;
+                      log(`✅ Found by LinkedIn (ID: ${foundId})`, "ok");
+                    }
+                  }
+                  
+                  // Round 2: Try company name if LinkedIn didn't find anything
+                  if (!foundId && companyName) {
+                    log(`🔍 Round 2: Checking counterparty "${companyName}" by name...`, "info");
+                    const res2 = await fetch(`${XANO_BASE}/api:8Bv5PK4I/check_counterpaty?linkedin_url=&company_name=${encodeURIComponent(companyName)}`, {
+                      method: "GET",
+                      headers: { "Content-Type": "application/json" },
+                    });
+                    const data2 = await res2.json();
+                    if (res2.ok && data2 && data2.id) {
+                      foundId = data2.id;
+                      log(`✅ Found by name (ID: ${foundId})`, "ok");
+                    }
+                  }
+                  
+                  // Update badge based on result
+                  if (foundId) {
+                    existsInDb = true;
+                    existingCompanyId = foundId;
+                    badge.textContent = `In DB (ID: ${foundId})`;
+                    badge.style.background = "rgba(16, 185, 129, 0.15)";
+                    badge.style.color = "#10b981";
+                    badge.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+                  } else {
+                    existsInDb = false;
+                    badge.textContent = "Not in DB";
+                    badge.style.background = "rgba(239, 68, 68, 0.12)";
+                    badge.style.color = "#fca5a5";
+                    badge.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+                    log(`⚠️ Counterparty "${companyName}" not found in DB`, "warn");
+                  }
+                } catch (err) {
+                  existsInDb = false;
+                  badge.textContent = "Lookup error";
+                  badge.style.background = "rgba(239, 68, 68, 0.12)";
+                  badge.style.color = "#fca5a5";
+                  badge.style.border = "1px solid rgba(239, 68, 68, 0.3)";
+                  log(`⚠️ Counterparty lookup error for ${name}: ${err.message}`, "warn");
+                } finally {
+                  lookupInProgress = false;
+                }
+              };
+
+              // Wire manual check button - checks if counterparty exists via LinkedIn URL
+              checkBtn.onclick = async () => {
+                checkBtn.disabled = true;
+                checkBtn.textContent = "⏳ Checking...";
+                await runLookup();
+                checkBtn.disabled = false;
+                checkBtn.textContent = "🔍 Check";
+              };
+
+              // Auto-run if any candidate URL exists
+              runLookup();
 
               // Quick links row
               const quickLinks = document.createElement("div");
               quickLinks.style.fontSize = "11px";
               quickLinks.style.marginBottom = "8px";
+              if (website) {
+                const siteLink = document.createElement("a");
+                siteLink.href = website;
+                siteLink.target = "_blank";
+                siteLink.className = "source-link";
+                siteLink.textContent = "🌐 Website";
+                siteLink.style.marginRight = "12px";
+                quickLinks.appendChild(siteLink);
+              }
               if (press) {
                 const pressLink = document.createElement("a");
                 pressLink.href = press;
@@ -4340,6 +5301,30 @@
               typeRow.appendChild(typeGroup);
               details.appendChild(typeRow);
 
+              // Website URL input
+              const websiteGroup = document.createElement("div");
+              websiteGroup.className = "form-group";
+              const websiteLabel = document.createElement("label");
+              websiteLabel.className = "form-label";
+              websiteLabel.textContent = "Company Website";
+              const websiteInput = document.createElement("input");
+              websiteInput.type = "url";
+              websiteInput.className = "form-input";
+              websiteInput.value = website;
+              websiteInput.placeholder = "https://company.com";
+              websiteInput.id = `cp_${idx}_${cpIdx}_website`;
+              websiteGroup.appendChild(websiteLabel);
+              websiteGroup.appendChild(websiteInput);
+              details.appendChild(websiteGroup);
+              // Keep reference for lookup/resets
+              websiteInputRef = websiteInput;
+              websiteInput.addEventListener("input", () => {
+                badge.textContent = "Not checked";
+                badge.style.background = "rgba(148, 163, 184, 0.12)";
+                badge.style.color = "#9ca3af";
+                badge.style.border = "1px solid rgba(148, 163, 184, 0.25)";
+              });
+
               // Press Release URL input
               const pressGroup = document.createElement("div");
               pressGroup.className = "form-group";
@@ -4373,10 +5358,12 @@
                   const newName = document.getElementById(`cp_${idx}_${cpIdx}_name`).value.trim();
                   const newType = parseInt(document.getElementById(`cp_${idx}_${cpIdx}_type`).value);
                   const newPress = document.getElementById(`cp_${idx}_${cpIdx}_press`).value.trim();
+                  const newWebsite = document.getElementById(`cp_${idx}_${cpIdx}_website`).value.trim();
                   
                   if (newName && newName !== name) updates.company_name = newName;
                   if (newType) updates.type_id = newType;
                   if (newPress !== press) updates.press_release_url = newPress;
+                  if (newWebsite !== website) updates.company_url = newWebsite;
                   
                   if (Object.keys(updates).length === 0) {
                     log("No changes to save", "warn");
@@ -4411,11 +5398,16 @@
                 };
                 
                 createBtn.onclick = async () => {
-                  // First, get the event ID by querying with the event short title
+                  // First, get the event ID by querying with the current event title
                   createBtn.disabled = true;
                   createBtn.textContent = "🔍 Finding event...";
                   
-                  const eventId = await queryEventId(shortTitle);
+                  // Use current title from input (might have been edited or parsed)
+                  const titleInputEl = document.getElementById(`ev_${idx}_title`);
+                  const currentTitle = titleInputEl ? titleInputEl.value.trim() : shortTitle;
+                  log(`🔍 Looking up event with title: "${currentTitle.substring(0, 50)}..."`, "info");
+                  
+                  const eventId = await queryEventId(currentTitle);
                   
                   if (!eventId) {
                     createBtn.textContent = "❌ Event not in DB";
@@ -4434,7 +5426,8 @@
                   
                   createBtn.textContent = "⏳ Creating...";
                   
-                  const result = await createCounterpartyInDb(eventId, cpName, cpTypeId, createBtn, cpPressUrl);
+                  const cpWebsite = document.getElementById(`bulk_cp_${i}_website`)?.value.trim() || "";
+                  const result = await createCounterpartyInDb(eventId, cpName, cpTypeId, createBtn, cpPressUrl, cpWebsite);
                   
                   if (result && (result.id || result.counterparty_id)) {
                     const newCpId = result.id || result.counterparty_id;
@@ -4490,19 +5483,24 @@
                 pplLabel.textContent = `👥 Key People (${indiv.length})`;
                 pplSection.appendChild(pplLabel);
                 
-                indiv.slice(0, 6).forEach((person) => {
+                indiv.slice(0, 6).forEach((person, personIdx) => {
                   const personName = person.name || "Unknown";
                   const personTitle = person.title || person.job_title || "";
-                  const personLinkedIn = person.linkedin_url || "";
+                  let personLinkedIn = person.linkedin_url || person.linkedin || "";
                   
                   const personRow = document.createElement("div");
                   personRow.style.display = "flex";
-                  personRow.style.alignItems = "center";
-                  personRow.style.justifyContent = "space-between";
+                  personRow.style.flexDirection = "column";
                   personRow.style.padding = "8px 10px";
                   personRow.style.marginBottom = "6px";
                   personRow.style.background = "rgba(31, 41, 55, 0.3)";
                   personRow.style.borderRadius = "8px";
+                  
+                  // Top row: name, title, buttons
+                  const topRow = document.createElement("div");
+                  topRow.style.display = "flex";
+                  topRow.style.alignItems = "center";
+                  topRow.style.justifyContent = "space-between";
                   
                   const personInfo = document.createElement("div");
                   personInfo.style.flex = "1";
@@ -4510,13 +5508,47 @@
                   if (personTitle) {
                     personHtml += `<span style="color:#9ca3af;font-size:11px;margin-left:8px;">– ${personTitle}</span>`;
                   }
-                  if (personLinkedIn) {
-                    personHtml += ` <a href="${personLinkedIn}" target="_blank" class="source-link" style="font-size:10px;">[LinkedIn]</a>`;
-                  }
                   personInfo.innerHTML = personHtml;
-                  personRow.appendChild(personInfo);
+                  topRow.appendChild(personInfo);
                   
-                  // Button container
+                  // LinkedIn input row
+                  const linkedinRow = document.createElement("div");
+                  linkedinRow.style.display = "flex";
+                  linkedinRow.style.alignItems = "center";
+                  linkedinRow.style.gap = "6px";
+                  linkedinRow.style.marginTop = "6px";
+                  
+                  const linkedinLabel = document.createElement("span");
+                  linkedinLabel.style.fontSize = "10px";
+                  linkedinLabel.style.color = "#9ca3af";
+                  linkedinLabel.textContent = "🔗";
+                  linkedinRow.appendChild(linkedinLabel);
+                  
+                  const linkedinInput = document.createElement("input");
+                  linkedinInput.type = "url";
+                  linkedinInput.className = "form-input";
+                  linkedinInput.style.flex = "1";
+                  linkedinInput.style.fontSize = "11px";
+                  linkedinInput.style.padding = "4px 8px";
+                  linkedinInput.placeholder = "LinkedIn URL...";
+                  linkedinInput.value = personLinkedIn;
+                  linkedinInput.id = `cp_${cpIdx}_person_${personIdx}_linkedin`;
+                  linkedinRow.appendChild(linkedinInput);
+                  
+                  // Helper to get current LinkedIn value
+                  const getCurrentLinkedIn = () => linkedinInput.value.trim() || personLinkedIn;
+                  
+                  if (personLinkedIn) {
+                    const linkedinLink = document.createElement("a");
+                    linkedinLink.href = personLinkedIn;
+                    linkedinLink.target = "_blank";
+                    linkedinLink.className = "source-link";
+                    linkedinLink.style.fontSize = "10px";
+                    linkedinLink.textContent = "Open";
+                    linkedinRow.appendChild(linkedinLink);
+                  }
+                  
+                  // Button container (in top row)
                   const btnGroup = document.createElement("div");
                   btnGroup.style.display = "flex";
                   btnGroup.style.gap = "6px";
@@ -4547,7 +5579,9 @@
                     const currentCpId = cpCard.dataset.counterpartyId 
                       ? parseInt(cpCard.dataset.counterpartyId, 10) 
                       : (cpId ? parseInt(cpId, 10) : 0);
-                    await addIndividualToDb(personName, personTitle, personLinkedIn, addBtn, {
+                    // Get LinkedIn URL from input (might have been edited)
+                    const currentLinkedIn = getCurrentLinkedIn();
+                    await addIndividualToDb(personName, personTitle, currentLinkedIn, addBtn, {
                       job_title: personTitle,
                       counterparty_id: currentCpId,
                     });
@@ -4609,8 +5643,9 @@
                     
                     // Build updates - prefer LinkedIn URL if available, otherwise use name
                     const updates = {};
-                    if (personLinkedIn) {
-                      updates.add_individual_by_linkedin = personLinkedIn;
+                    const currentLinkedIn = getCurrentLinkedIn();
+                    if (currentLinkedIn) {
+                      updates.add_individual_by_linkedin = currentLinkedIn;
                     } else if (personName && personName !== "Unknown") {
                       updates.add_individual_by_name = personName;
                     } else {
@@ -4628,7 +5663,9 @@
                   };
                   btnGroup.appendChild(assignBtn);
                   
-                  personRow.appendChild(btnGroup);
+                  topRow.appendChild(btnGroup);
+                  personRow.appendChild(topRow);
+                  personRow.appendChild(linkedinRow);
                   
                   pplSection.appendChild(personRow);
                 });
@@ -4915,19 +5952,21 @@
             cpData.push({
               name: target.name,
               role: "Target",
-              url: target.counterparty_announcement_url || "",
+              url: target.url || "",
+              announcement_url: target.counterparty_announcement_url || "",
               linkedin: target.linkedin_url || "",
               individuals: target.individuals || target._individuals || []
             });
           }
           
           buckets.forEach((key) => {
-            const arr = ev[key] || [];
+              const arr = ev[key] || [];
             arr.forEach((cp) => {
               cpData.push({
                 name: cp.name || "Unknown",
                 role: cp.counterparty_status || cp.role || key.replace("_", " "),
-                url: cp.counterparty_announcement_url || "",
+              url: cp.url || cp.company_url || cp.website || "",
+                  announcement_url: cp.counterparty_announcement_url || "",
                 linkedin: cp.linkedin_url || "",
                 individuals: cp.individuals || cp._individuals || []
               });
@@ -4953,8 +5992,11 @@
               if (cp.role) {
                 cpHtml += ` <span style="opacity:0.75;">(${cp.role})</span>`;
               }
-              if (cp.url) {
-                cpHtml += ` <a href="${cp.url}" target="_blank" class="source-link">[Announcement]</a>`;
+              if (cp.website) {
+                cpHtml += ` <a href="${cp.website}" target="_blank" class="source-link">[Website]</a>`;
+              }
+              if (cp.announcement_url) {
+                cpHtml += ` <a href="${cp.announcement_url}" target="_blank" class="source-link">[Announcement]</a>`;
               }
               if (cp.linkedin) {
                 cpHtml += ` <a href="${cp.linkedin}" target="_blank" class="source-link">[LinkedIn]</a>`;
@@ -5171,13 +6213,11 @@
           const ownership = ownershipSelect?.value || "";
           const yearFoundedInput = document.getElementById("ai_year_founded");
           const webpageMonitoredInput = document.getElementById("ai_webpage_monitored");
-          const businessFocusInput = document.getElementById("ai_primary_business_focus");
           const yearFounded = yearFoundedInput?.value?.trim() || "";
           const webpageMonitored = webpageMonitoredInput?.value?.trim() || "";
           const website = websiteInput?.value?.trim() || "";
           const linkedin = linkedinInput?.value?.trim() || "";
           const description = descInput?.value?.trim() || "";
-          const businessFocusName = businessFocusInput?.value?.trim() || "";
 
           if (!name) {
             log("Error: Company name is required", "err");
@@ -5209,46 +6249,28 @@
               const locData = await locRes.json();
               log(`Location response: ${JSON.stringify(locData)}`, "info");
               
-              // Validate location ID is reasonable (max 292 as per user)
-              const MAX_LOCATION_ID = 292;
-              
               if (locData) {
-                // Try all possible fields and use the first valid one (<= 292)
-                let foundId = null;
-                
-                // Check direct id field
-                if (locData.id && typeof locData.id === 'number' && locData.id <= MAX_LOCATION_ID) {
-                  foundId = locData.id;
-                  log(`✅ Found valid location ID in 'id' field: ${foundId}`, "ok");
-                }
-                // Try locations_id field
-                else if (locData.locations_id && typeof locData.locations_id === 'number' && locData.locations_id <= MAX_LOCATION_ID) {
-                  foundId = locData.locations_id;
-                  log(`✅ Found valid location ID in 'locations_id' field: ${foundId}`, "ok");
-                }
-                // Try nested location.id
-                else if (locData.location && locData.location.id && typeof locData.location.id === 'number' && locData.location.id <= MAX_LOCATION_ID) {
-                  foundId = locData.location.id;
-                  log(`✅ Found valid location ID in 'location.id' field: ${foundId}`, "ok");
-                }
-                // Try _locations.id
-                else if (locData._locations && locData._locations.id && typeof locData._locations.id === 'number' && locData._locations.id <= MAX_LOCATION_ID) {
-                  foundId = locData._locations.id;
-                  log(`✅ Found valid location ID in '_locations.id' field: ${foundId}`, "ok");
-                }
-                
-                if (foundId !== null) {
-                  locationId = foundId;
-                  log(`✅ Using location ID: ${locationId}`, "ok");
+                // Try all possible fields and use the first numeric one
+                if (locData.id && typeof locData.id === 'number') {
+                  locationId = locData.id;
+                  log(`✅ Found location ID in 'id' field: ${locationId}`, "ok");
+                } else if (locData.locations_id && typeof locData.locations_id === 'number') {
+                  locationId = locData.locations_id;
+                  log(`✅ Found location ID in 'locations_id' field: ${locationId}`, "ok");
+                } else if (locData.location && typeof locData.location.id === 'number') {
+                  locationId = locData.location.id;
+                  log(`✅ Found location ID in 'location.id' field: ${locationId}`, "ok");
+                } else if (locData._locations && typeof locData._locations.id === 'number') {
+                  locationId = locData._locations.id;
+                  log(`✅ Found location ID in '_locations.id' field: ${locationId}`, "ok");
                 } else {
-                  // Log all ID values found (even if invalid) for debugging
                   const allIds = [];
                   if (locData.id) allIds.push(`id: ${locData.id}`);
                   if (locData.locations_id) allIds.push(`locations_id: ${locData.locations_id}`);
                   if (locData.location?.id) allIds.push(`location.id: ${locData.location.id}`);
                   if (locData._locations?.id) allIds.push(`_locations.id: ${locData._locations.id}`);
                   
-                  log(`⚠️ No valid location ID found (max: ${MAX_LOCATION_ID}). Found: ${allIds.join(", ")}`, "warn");
+                  log(`⚠️ No usable location ID found. Found: ${allIds.join(", ")}`, "warn");
                   log(`⚠️ Full response: ${JSON.stringify(locData)}`, "warn");
                   log("⚠️ Using 0 for locations_id", "warn");
                 }
@@ -5260,66 +6282,124 @@
             }
           }
 
-          // Step 2: Lookup primary business focus ID
-          log(`Step 2: Looking up primary business focus...`, "info");
-          let businessFocusId = 0;
-          if (businessFocusName) {
-            try {
-              const focusUrl = `${XANO_BASE}/api:8Bv5PK4I/business_focus_lookup?business_focus_title=${encodeURIComponent(businessFocusName)}`;
-              log(`GET ${focusUrl}`, "info");
+          // Step 2: Get business focus IDs from the EDITED dropdown selects
+          log(`Step 2: Reading business focus IDs from dropdowns...`, "info");
+          const businessFocusIds = [];
+          
+          const businessFocusContainer = document.getElementById("ai_business_focus_container");
+          if (businessFocusContainer) {
+            const focusSelects = businessFocusContainer.querySelectorAll("select.business-focus-select");
+            log(`Found ${focusSelects.length} business focus dropdown(s)`, "info");
+            
+            for (let i = 0; i < focusSelects.length; i++) {
+              const sel = focusSelects[i];
+              const rawValue = sel.value;
+              const fallbackName = sel.dataset.fallbackName || "";
+              const selectedText = sel.options[sel.selectedIndex]?.textContent || "";
               
-              const focusRes = await fetch(focusUrl, {
-                method: "GET",
-                headers: { "Content-Type": "application/json" },
-              });
+              log(`  Dropdown ${i + 1}: value="${rawValue}", fallback="${fallbackName}", text="${selectedText}"`, "info");
               
-              const focusData = await focusRes.json();
-              if (focusData && focusData.id) {
-                businessFocusId = focusData.id;
-                log(`✅ Found business focus ID: ${businessFocusId}`, "ok");
-              } else {
-                log(`⚠️ No ID found for business focus: ${businessFocusName}`, "warn");
+              const val = parseInt(rawValue, 10);
+              if (!isNaN(val) && val > 0) {
+                if (!businessFocusIds.includes(val)) {
+                  businessFocusIds.push(val);
+                  log(`  ✅ Added business focus ID ${val} (${selectedText})`, "ok");
+                }
+              } else if (fallbackName) {
+                // Try lookup by name
+                log(`  🔍 No ID, looking up: "${fallbackName}"`, "info");
+                try {
+                  const focusUrl = `${XANO_BASE}/api:8Bv5PK4I/business_focus_lookup?business_focus_title=${encodeURIComponent(fallbackName)}`;
+                  const focusRes = await fetch(focusUrl, { method: "GET", headers: { "Content-Type": "application/json" } });
+                  const focusData = await focusRes.json();
+                  if (focusData && focusData.id && !businessFocusIds.includes(focusData.id)) {
+                    businessFocusIds.push(focusData.id);
+                    log(`  ✅ Found ID ${focusData.id} for "${fallbackName}" via lookup`, "ok");
+                  }
+                } catch (e) {
+                  log(`  ⚠️ Lookup failed for "${fallbackName}": ${e.message}`, "warn");
+                }
               }
-            } catch (focusErr) {
-              log(`⚠️ Business focus lookup failed: ${focusErr.message}`, "warn");
             }
           }
+          
+          log(`📋 Final business focus IDs: [${businessFocusIds.join(", ")}] (${businessFocusIds.length} total)`, "info");
 
-          // Step 3: Lookup sector IDs
-          log(`Step 3: Looking up sector IDs...`, "info");
+          // Step 3: Get sector IDs from the EDITED dropdown selects (not original AI data)
+          // This handles all edge cases:
+          // - User keeps AI sectors as-is → IDs from pre-selected dropdowns
+          // - User adds new sectors → IDs from additional dropdowns
+          // - User removes sectors → removed rows not included
+          // - User changes sectors → new selected values used
+          log(`Step 3: Reading sector IDs from dropdowns...`, "info");
           const sectorIds = [];
-          // Get sectors from AI overview data (stored in window or from current data)
-          const aiSectors = window._aiOverviewData?.sectors || [];
-          if (aiSectors && aiSectors.length > 0) {
+          
+          // Read from the sector dropdown selects in the AI overview section
+          const sectorsContainer = document.getElementById("ai_sectors_container");
+          if (sectorsContainer) {
+            const sectorSelects = sectorsContainer.querySelectorAll("select.sector-select");
+            log(`Found ${sectorSelects.length} sector dropdown(s) in container`, "info");
+            
+            for (let i = 0; i < sectorSelects.length; i++) {
+              const sel = sectorSelects[i];
+              const rawValue = sel.value;
+              const fallbackName = sel.dataset.fallbackName || "";
+              const selectedText = sel.options[sel.selectedIndex]?.textContent || "";
+              
+              log(`  Dropdown ${i + 1}: value="${rawValue}", fallback="${fallbackName}", text="${selectedText}"`, "info");
+              
+              // Try to parse as number
+              const val = parseInt(rawValue, 10);
+              
+              if (!isNaN(val) && val > 0) {
+                // Valid sector ID selected from dropdown
+                if (!sectorIds.includes(val)) {
+                  sectorIds.push(val);
+                  log(`  ✅ Added sector ID ${val} (${selectedText})`, "ok");
+                } else {
+                  log(`  ⚠️ Duplicate sector ID ${val} skipped`, "warn");
+                }
+              } else if (fallbackName) {
+                // No ID selected but has AI-suggested name - try to lookup
+                log(`  🔍 No ID, looking up fallback name: "${fallbackName}"`, "info");
+                try {
+                  const lookedUp = await lookupSectorIdByName(fallbackName);
+                  if (lookedUp && !sectorIds.includes(lookedUp)) {
+                    sectorIds.push(lookedUp);
+                    log(`  ✅ Found ID ${lookedUp} for "${fallbackName}" via lookup`, "ok");
+                  } else if (lookedUp) {
+                    log(`  ⚠️ Duplicate sector ID ${lookedUp} skipped`, "warn");
+                  } else {
+                    log(`  ⚠️ No ID found for "${fallbackName}"`, "warn");
+                  }
+                } catch (e) {
+                  log(`  ❌ Lookup failed for "${fallbackName}": ${e.message}`, "err");
+                }
+              } else {
+                log(`  ⚠️ Empty dropdown (no value, no fallback) - skipped`, "warn");
+              }
+            }
+          } else {
+            log(`⚠️ Sectors container not found, falling back to AI data`, "warn");
+            // Fallback to original AI data if container not found
+            const aiSectors = window._aiOverviewData?.sectors || [];
+            log(`Found ${aiSectors.length} sectors in AI data`, "info");
             for (const sector of aiSectors) {
               const sectorName = sector.sector || sector.name || "";
               if (!sectorName) continue;
-              
               try {
-                const sectorUrl = `${XANO_BASE}/api:8Bv5PK4I/sectors_lookup?sector_name=${encodeURIComponent(sectorName)}`;
-                log(`Looking up sector: ${sectorName}...`, "info");
-                
-                const sectorRes = await fetch(sectorUrl, {
-                  method: "GET",
-                  headers: { "Content-Type": "application/json" },
-                });
-                
-                if (sectorRes.ok) {
-                  const sectorData = await sectorRes.json();
-                  if (sectorData && sectorData.id) {
-                    sectorIds.push(sectorData.id);
-                    log(`✅ Found sector ID ${sectorData.id} for "${sectorName}"`, "ok");
-                  } else {
-                    log(`⚠️ No ID found for sector: ${sectorName}`, "warn");
-                  }
-                } else {
-                  log(`⚠️ Lookup failed for sector: ${sectorName}`, "warn");
+                const lookedUp = await lookupSectorIdByName(sectorName);
+                if (lookedUp && !sectorIds.includes(lookedUp)) {
+                  sectorIds.push(lookedUp);
+                  log(`✅ Found sector ID ${lookedUp} for "${sectorName}"`, "ok");
                 }
-              } catch (sectorErr) {
-                log(`⚠️ Error looking up sector "${sectorName}": ${sectorErr.message}`, "warn");
+              } catch (e) {
+                log(`⚠️ Sector lookup failed for "${sectorName}": ${e.message}`, "warn");
               }
             }
           }
+          
+          log(`📋 Final sector IDs to POST: [${sectorIds.join(", ")}] (${sectorIds.length} total)`, "info");
 
           // Step 3.5: Lookup year ID
           log(`Step 3.5: Looking up year ID...`, "info");
@@ -5397,10 +6477,10 @@
             payload.webpage_monitored = webpageMonitored;
           }
           
-          // Add primary_business_focus_id as array if found
-          if (businessFocusId > 0) {
-            payload.primary_business_focus_id = [businessFocusId];
-            log(`✅ Including primary_business_focus_id: [${businessFocusId}]`, "ok");
+          // Add primary_business_focus_id as array if any found
+          if (businessFocusIds.length > 0) {
+            payload.primary_business_focus_id = businessFocusIds;
+            log(`✅ Including primary_business_focus_id: [${businessFocusIds.join(", ")}]`, "ok");
           }
           
           // Add sectors_id as array if found
@@ -5409,13 +6489,16 @@
             log(`✅ Including sectors_id: [${sectorIds.join(", ")}]`, "ok");
           }
           
+          // Clean payload: convert 0 and "" to null
+          const cleanedPayload = cleanPayloadKeepRequired(payload, ['name', 'new_company_id']);
+          
           log(`POST ${XANO_BASE}/api:8Bv5PK4I/post_company_overview`, "info");
-          log(`Payload: ${JSON.stringify(payload)}`, "info");
+          log(`Payload (cleaned): ${JSON.stringify(cleanedPayload)}`, "info");
 
           const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/post_company_overview`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(cleanedPayload),
           });
 
           const responseText = await res.text();
@@ -5579,14 +6662,17 @@
             log(`⚠️ Job titles "${jobTitleText}" not found in database - will save without IDs`, "warn");
           }
 
+          // Clean payload: convert 0 and "" to null
+          const cleanedPayload = cleanPayloadKeepRequired(payload, ['name']);
+          
           log(`Using company_id: ${companyId} (window._companyId: ${window._companyId})`, "info");
           log(`POST ${XANO_BASE}/api:8Bv5PK4I/create_individual`, "info");
-          log(`Payload: ${JSON.stringify(payload)}`, "info");
+          log(`Payload (cleaned): ${JSON.stringify(cleanedPayload)}`, "info");
 
           const res = await fetch(`${XANO_BASE}/api:8Bv5PK4I/create_individual`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(cleanedPayload),
           });
 
           const responseText = await res.text();
@@ -5646,6 +6732,10 @@
         const statusSelect = document.getElementById(`ev_${idx}_status`);
         const sourceInput = document.getElementById(`ev_${idx}_source`);
         const longDescInput = document.getElementById(`ev_${idx}_longdesc`);
+        const amountInput = document.getElementById(`ev_${idx}_amount`);
+        const currencySelect = document.getElementById(`ev_${idx}_currency`);
+        const stageInput = document.getElementById(`ev_${idx}_stage`);
+        const sourceInputInvestment = document.getElementById(`ev_${idx}_inv_source`);
 
         const description =
           (titleInput && titleInput.value.trim()) ||
@@ -5701,19 +6791,42 @@
           deal_type: dealType,
           deal_status: dealStatus,
           source_url: sourceUrl || "",
+          currency_id: 0,
+          funding_stage: "",
+          Amount: 0,
+          funding_source: "",
+          investment_amount_m: 0,
           company_id: companyId,  // Link event to the company
         };
 
+        // Investment fields (optional)
+        const amtVal = amountInput ? parseFloat(amountInput.value) : NaN;
+        if (!isNaN(amtVal)) {
+          payload.investment_amount_m = amtVal;
+          payload.Amount = amtVal;
+        }
+        if (currencySelect && currencySelect.value) {
+          payload.currency_id = parseInt(currencySelect.value, 10) || 0;
+        }
+        if (stageInput && stageInput.value.trim()) payload.funding_stage = stageInput.value.trim();
+        if (sourceInputInvestment && sourceInputInvestment.value.trim()) {
+          payload.funding_source = sourceInputInvestment.value.trim();
+        }
+
         const endpoint = `${XANO_BASE}/api:8Bv5PK4I/create_corporate_event`;
+        
+        // Clean payload: convert 0 and "" to null, but keep company_id
+        const cleanedPayload = cleanPayloadKeepRequired(payload, ['company_id', 'description']);
+        
         log(`Using company_id: ${companyId} (window._companyId: ${window._companyId})`, "info");
         log(`POST ${endpoint}`, "info");
-        log(`Payload: ${JSON.stringify(payload)}`, "info");
+        log(`Payload (cleaned): ${JSON.stringify(cleanedPayload)}`, "info");
 
         try {
           const res = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(cleanedPayload),
           });
           const text = await res.text();
           log(`HTTP ${res.status}: ${text.slice(0, 300)}`, "info");
@@ -5820,8 +6933,8 @@
               // Extract db_overview from the company data
               const db_overview = extractDBOverviewFromCompany(companyInfo);
 
-              // Extract management roles
-              const db_management = extractDBManagementFromCompany(companyInfo);
+              // Extract management roles (pass full response since roles are at root level)
+              const db_management = extractDBManagementFromCompany(xanoData);
 
               // Extract events (counterparties)
               const db_events = extractDBEventsFromCompany(companyInfo);
@@ -5871,6 +6984,24 @@
             db_management,
           } = json;
 
+          let derived_db_overview = db_overview;
+          let derived_db_management = db_management;
+          let derived_db_events = db_events;
+
+          if (db_company && (!db_overview || !db_management || !db_events)) {
+            const companyInfo = db_company.Company || db_company;
+            if (!derived_db_overview) {
+              derived_db_overview = extractDBOverviewFromCompany(companyInfo);
+            }
+            if (!derived_db_management) {
+              // Pass full response (db_company) since roles are at root level, not inside Company
+              derived_db_management = extractDBManagementFromCompany(db_company);
+            }
+            if (!derived_db_events) {
+              derived_db_events = extractDBEventsFromCompany(companyInfo);
+            }
+          }
+
           // Update the prominent Xano status badge
           if (existing_company) {
             updateXanoStatus(existing_company, db_company);
@@ -5883,14 +7014,17 @@
           }
 
           // Re-render ONLY DB sections with fresh data (don't touch AI sections)
-          if (db_overview) {
-            renderDBOverview(db_overview);
+          if (derived_db_overview) {
+            renderDBOverview(derived_db_overview);
           }
-          if (db_management) {
-            renderDBManagement(db_management);
+          if (derived_db_management) {
+            log(`📋 Refreshing DB management: ${derived_db_management.length} people`, "info");
+            renderDBManagement(derived_db_management);
+          } else {
+            log(`⚠️ No DB management data to refresh`, "warn");
           }
-          if (db_events) {
-            renderDBEvents(db_events);
+          if (derived_db_events) {
+            renderDBEvents(derived_db_events);
           }
 
           log("✅ Xano data refreshed", "ok");
@@ -5992,68 +7126,117 @@
         }
       }
 
-      // Helper function to extract db_management from company data
-      function extractDBManagementFromCompany(companyInfo) {
-        const db_management = [];
+          // Helper function to extract db_management from company data
+          function extractDBManagementFromCompany(companyInfo) {
+            const db_management = [];
 
-        try {
-          // Current management roles
-          const mgmt_current = companyInfo.Management_Roles_current || [];
-          mgmt_current.forEach(role => {
-            const job_titles = [];
-            const job_titles_id = role.job_titles_id || [];
-            if (Array.isArray(job_titles_id)) {
-              job_titles_id.forEach(jt => {
-                if (typeof jt === 'object' && jt.job_title) {
-                  job_titles.push(jt.job_title);
+            const pushRole = (role, defaultStatus = "Current") => {
+              const job_titles = [];
+              const job_titles_id = role.job_titles_id || role.job_title_ids || [];
+              if (Array.isArray(job_titles_id)) {
+                job_titles_id.forEach((jt) => {
+                  if (typeof jt === "object" && jt.job_title) job_titles.push(jt.job_title);
+                  if (typeof jt === "string") job_titles.push(jt);
+                });
+              }
+
+              const name =
+                role.Individual_text ||
+                role.advisor_individuals ||
+                role.name ||
+                role.individual_name ||
+                "";
+
+              db_management.push({
+                Individual_text: name,
+                name,
+                position: job_titles.join(", "),
+                job_titles_id,
+                Status: role.Status || role.status || defaultStatus,
+                linkedin_url: role.linkedin_url || role.linkedin || "",
+                current_employee_url: role.current_employer_url || role.current_employee_url || "",
+                individuals_id: role.individuals_id || role.individual_id || 0,
+                role_id: role.id || role.role_id || 0,
+              });
+            };
+
+            try {
+              // Get the FULL API response (management roles are at root level, not inside Company)
+              // companyInfo might be the Company object, but we need to check the parent too
+              const fullResponse = companyInfo._parentResponse || companyInfo;
+              
+              // Current management roles (note: API uses "Managmant" typo)
+              // Check BOTH the full response (root level) AND companyInfo (in case structure varies)
+              const mgmt_current =
+                fullResponse.Managmant_Roles_current ||
+                fullResponse.Management_Roles_current ||
+                companyInfo.Managmant_Roles_current ||
+                companyInfo.Management_Roles_current ||
+                companyInfo.management_roles_current ||
+                companyInfo.roles_current ||
+                companyInfo.management_roles ||
+                [];
+              console.log("[extractDBManagement] Found current roles:", mgmt_current?.length || 0, mgmt_current);
+              mgmt_current.forEach((role) => pushRole(role, "Current"));
+
+              // Past management roles (note: API uses "Managmant" typo)
+              const mgmt_past =
+                fullResponse.Managmant_Roles_past ||
+                fullResponse.Management_Roles_past ||
+                companyInfo.Managmant_Roles_past ||
+                companyInfo.Management_Roles_past ||
+                companyInfo.management_roles_past ||
+                companyInfo.roles_past ||
+                [];
+              mgmt_past.forEach((role) => pushRole(role, "Past"));
+
+              // Fallback: individuals array without explicit roles
+              const individuals =
+                companyInfo._individuals ||
+                companyInfo.individuals ||
+                companyInfo.Individuals ||
+                [];
+              individuals.forEach((ind) => {
+                if (ind.advisor_individuals || ind.name) {
+                  pushRole(
+                    {
+                      Individual_text: ind.advisor_individuals || ind.name,
+                      job_titles_id: ind.job_titles_id || ind.job_title_ids || [],
+                      Status: ind.Status || ind.status || "Current",
+                      linkedin_url: ind.linkedin_URL || ind.linkedin_url || ind.linkedin,
+                      individuals_id: ind.id || 0,
+                    },
+                    ind.Status || ind.status || "Current"
+                  );
                 }
               });
-            }
 
-            db_management.push({
-              Individual_text: role.Individual_text || "",
-              name: role.Individual_text || role.advisor_individuals || "",
-              position: job_titles.join(", "),
-              job_titles_id,
-              Status: role.Status || "Current",
-              linkedin_url: "",
-              current_employee_url: role.current_employer_url || "",
-              individuals_id: role.individuals_id || 0,
-              role_id: role.id || 0,
-            });
-          });
-
-          // Past management roles
-          const mgmt_past = companyInfo.Management_Roles_past || [];
-          mgmt_past.forEach(role => {
-            const job_titles = [];
-            const job_titles_id = role.job_titles_id || [];
-            if (Array.isArray(job_titles_id)) {
-              job_titles_id.forEach(jt => {
-                if (typeof jt === 'object' && jt.job_title) {
-                  job_titles.push(jt.job_title);
-                }
+              // Fallback: roles collection (e.g., _roles) that references _individual
+              const roles =
+                companyInfo._roles ||
+                companyInfo.roles ||
+                companyInfo.Role ||
+                [];
+              roles.forEach((r) => {
+                const ind = r._individual || {};
+                pushRole(
+                  {
+                    Individual_text: ind.advisor_individuals || ind.name || "",
+                    job_titles_id: r.job_titles_id || r.job_title_ids || [],
+                    Status: r.Status || r.status || "Current",
+                    linkedin_url: ind.linkedin_URL || ind.linkedin_url || ind.linkedin,
+                    individuals_id: ind.id || r.individuals_id || r.individual_id || 0,
+                    role_id: r.id || r.role_id || 0,
+                  },
+                  r.Status || r.status || "Current"
+                );
               });
+            } catch (e) {
+              console.log("Error extracting db_management:", e);
             }
 
-            db_management.push({
-              Individual_text: role.Individual_text || "",
-              name: role.Individual_text || role.advisor_individuals || "",
-              position: job_titles.join(", "),
-              job_titles_id,
-              Status: role.Status || "Past",
-              linkedin_url: "",
-              current_employee_url: role.current_employer_url || "",
-              individuals_id: role.individuals_id || 0,
-              role_id: role.id || 0,
-            });
-          });
-        } catch (e) {
-          console.log("Error extracting db_management:", e);
-        }
-
-        return db_management;
-      }
+            return db_management;
+          }
 
       // Helper function to extract db_events from company data
       function extractDBEventsFromCompany(companyInfo) {
@@ -6062,6 +7245,14 @@
         try {
           const new_counterparties = companyInfo.new_counterparties || [];
           new_counterparties.forEach(cp => {
+            const target_company = cp.target_company || {};
+            const targetUrl =
+              target_company.url ||
+              target_company.company_url ||
+              target_company.website ||
+              target_company.counterparty_announcement_url ||
+              "";
+
             db_events.push({
               id: cp.id,
               announcement_date: cp.announcement_date || "",
@@ -6070,6 +7261,14 @@
               investment_display: cp.investment_display || "",
               ev_display: cp.ev_display || "",
               this_company_status: cp.this_company_status || "",
+              target_company: {
+                id: target_company.id || cp.target_company_id || null,
+                name: target_company.name || "",
+                counterparty_announcement_url: target_company.counterparty_announcement_url || "",
+                url: targetUrl,
+                linkedin_url: target_company.linkedin_url || "",
+                individuals: target_company.individuals || target_company._individuals || [],
+              },
               counterparties: [], // We can populate this if needed
             });
           });
@@ -6122,10 +7321,29 @@
             db_overview,
             ai_overview,
             db_events,
+            db_management,
             ai_events,
             missing_events,
             matched_events,
           } = json;
+
+          // Fallback: if DB sections are missing but we have full company data, derive them
+          let derived_db_overview = db_overview;
+          let derived_db_management = db_management;
+          let derived_db_events = db_events;
+          if (db_company && (!db_overview || !db_management || !db_events)) {
+            const companyInfo = db_company.Company || db_company;
+            if (!derived_db_overview) {
+              derived_db_overview = extractDBOverviewFromCompany(companyInfo);
+            }
+            if (!derived_db_management) {
+              // Pass full response (db_company) since roles are at root level, not inside Company
+              derived_db_management = extractDBManagementFromCompany(db_company);
+            }
+            if (!derived_db_events) {
+              derived_db_events = extractDBEventsFromCompany(companyInfo);
+            }
+          }
 
           // Update the prominent Xano status badge
           updateXanoStatus(existing_company, db_company);
@@ -6148,11 +7366,11 @@
           }
 
           renderAIOverview(ai_overview || null);
-          renderDBOverview(db_overview || null);
+          renderDBOverview(derived_db_overview || null);
           renderTopManagement(json.top_management || []);
-          renderDBManagement(json.db_management || []);
+          renderDBManagement(derived_db_management || []);
           renderAIEvents(ai_events || [], missing_events || []);
-          renderDBEvents(db_events || []);
+          renderDBEvents(derived_db_events || []);
 
           const aiCount = (ai_events || []).length;
           const dbCount = (db_events || []).length;
@@ -6180,6 +7398,19 @@
           runAnalyze();
         }
       });
+
+      // Check for URL query parameter and auto-fill search
+      // This enables the "Enrich" button to open new tab with pre-filled search
+      (function checkUrlParams() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const queryParam = urlParams.get('query');
+        if (queryParam) {
+          queryInput.value = queryParam;
+          log(`📥 Pre-filled search from URL: ${queryParam}`, "info");
+          // Optionally auto-run the search (uncomment next line if desired)
+          // setTimeout(runAnalyze, 500);
+        }
+      })();
     </script>
   </body>
 </html>

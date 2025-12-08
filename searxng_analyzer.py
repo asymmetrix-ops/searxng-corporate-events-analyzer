@@ -259,6 +259,115 @@ def serpapi_search(query, num_results=5):
         return ""
 
 # ============================================================
+# 🔹 Parallel SerpAPI Search (OPTIMIZED)
+# ============================================================
+import asyncio
+import aiohttp
+
+async def _serpapi_search_async(session: aiohttp.ClientSession, query: str, api_key: str, num_results: int = 10):
+    """
+    Single async SerpAPI search using aiohttp.
+    """
+    try:
+        params = {
+            "q": query,
+            "hl": "en",
+            "gl": "us",
+            "num": num_results,
+            "api_key": api_key,
+            "output": "json"
+        }
+        url = "https://serpapi.com/search"
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("organic_results", [])
+    except Exception as e:
+        print(f"⚠️ Async SerpAPI error for query '{query[:50]}...': {e}")
+    return []
+
+
+async def _run_parallel_searches(queries: list, api_key: str, num_results: int = 10, batch_size: int = 10):
+    """
+    Run multiple SerpAPI queries in parallel batches.
+    
+    Args:
+        queries: List of search query strings
+        api_key: SerpAPI key
+        num_results: Results per query
+        batch_size: How many queries to run simultaneously (default 10)
+    
+    Returns:
+        List of all results (deduplicated by URL)
+    """
+    all_results = []
+    seen_urls = set()
+    
+    connector = aiohttp.TCPConnector(limit=batch_size, limit_per_host=batch_size)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Process in batches
+        for i in range(0, len(queries), batch_size):
+            batch = queries[i:i + batch_size]
+            tasks = [_serpapi_search_async(session, q, api_key, num_results) for q in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for results in batch_results:
+                if isinstance(results, Exception):
+                    continue
+                for r in results:
+                    url = r.get("link", "")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append({
+                            "title": r.get("title", ""),
+                            "snippet": r.get("snippet", ""),
+                            "link": url
+                        })
+            
+            # Small delay between batches to avoid rate limits
+            if i + batch_size < len(queries):
+                await asyncio.sleep(0.3)
+    
+    return all_results
+
+
+def serpapi_parallel_search(queries: list, api_key: str, num_results: int = 10) -> list:
+    """
+    Synchronous wrapper for parallel SerpAPI searches.
+    Runs all queries in parallel batches for ~5-10x speedup.
+    
+    Args:
+        queries: List of search query strings
+        api_key: SerpAPI key
+        num_results: Results per query
+        
+    Returns:
+        List of deduplicated results with title, snippet, link
+    """
+    if not queries or not api_key:
+        return []
+    
+    try:
+        # Try to get existing event loop (for environments like Jupyter)
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're already in an async context, use nest_asyncio or run in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    _run_parallel_searches(queries, api_key, num_results)
+                )
+                return future.result(timeout=120)
+        except RuntimeError:
+            # No running loop, safe to use asyncio.run
+            return asyncio.run(_run_parallel_searches(queries, api_key, num_results))
+    except Exception as e:
+        print(f"⚠️ Parallel search error: {e}")
+        return []
+
+
+# ============================================================
 # 🔹 Date Parsing & Validation
 # ============================================================
 def parse_date(date_str):
@@ -980,6 +1089,8 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     Fetches and extracts corporate M&A events for a company using web search and LLM.
     Automatically detects if company is a startup and adjusts search strategy accordingly.
     
+    OPTIMIZED: Uses parallel SerpAPI queries for ~5x faster search.
+    
     Args:
         company_name: Name of the company to search for
         max_events: Maximum number of events to return
@@ -987,8 +1098,7 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     Returns:
         List of dictionaries with keys: "Date", "Event (short)", "Event type", "Event value (USD)", "Source URL", "counterparties"
     """
-    import os, json, re, requests, time
-    from serpapi import GoogleSearch
+    import os, json, re, time
 
     OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_KEY")
     SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -996,232 +1106,102 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
         print("Missing API keys")
         return []
 
-    print(f"Fetching corporate events for: {company_name} (max_events={max_events})")
+    print(f"⚡ Fetching corporate events for: {company_name} (max_events={max_events})")
     
     # Detect company type to optimize search strategy
     company_info = detect_company_type(company_name, SERPAPI_KEY)
-
-    def search(query):
-        try:
-            # Limit results based on max_events
-            num_results = 5 if max_events <= 1 else 25
-            params = {"q": query, "num": num_results, "api_key": SERPAPI_KEY}
-            results = GoogleSearch(params).get_dict().get("organic_results", [])
-            return [
-                {
-                    "title": r.get('title', ''),
-                    "snippet": r.get('snippet', ''),
-                    "link": r.get('link', '')
-                }
-                for r in results[:num_results]
-            ]
-        except Exception as e:
-            print(f"Search error: {e}")
-            return []
 
     # TESTING MODE: Only 1 query when max_events <= 1
     if max_events <= 1:
         print("⚡ TESTING MODE: Using minimal queries to save credits")
         queries = [
-            f'"{company_name}" acquisition OR merger OR investment OR funding',  # Single comprehensive query
+            f'"{company_name}" acquisition OR merger OR investment OR funding',
         ]
     elif company_info.get("is_startup") or company_info.get("is_small_company") or company_info.get("company_type") in ["startup", "small_company"]:
-        # === STARTUP-OPTIMIZED QUERIES ===
-        print("🚀 Using STARTUP-optimized search queries")
+        # === STARTUP-OPTIMIZED QUERIES (reduced to 18 highest-yield) ===
+        print("🚀 Using STARTUP-optimized search queries (PARALLEL)")
         queries = [
-            # === FUNDING ROUNDS (PRIMARY for startups) ===
-            f'"{company_name}" "raises" OR "raised" funding',
-            f'"{company_name}" "seed round" OR "pre-seed"',
-            f'"{company_name}" "series A" OR "series B" OR "series C"',
-            f'"{company_name}" funding round announced',
-            f'"{company_name}" "led by" investment OR funding',
-            f'"{company_name}" "venture capital" OR "VC" investment',
-            f'"{company_name}" angel investment OR angel investor',
+            # FUNDING (highest priority - 6 queries)
+            f'"{company_name}" "raises" OR "raised" million funding',
+            f'"{company_name}" "seed round" OR "pre-seed" OR "series A"',
+            f'"{company_name}" "series B" OR "series C" OR "series D"',
             f'"{company_name}" funding 2025 OR 2024 OR 2023',
+            f'"{company_name}" "led by" investment venture capital',
+            f'"{company_name}" grant OR award OR prize',
             
-            # === STARTUP NEWS SOURCES ===
+            # NEWS SOURCES (best coverage - 6 queries)
             f'"{company_name}" site:techcrunch.com',
-            f'"{company_name}" site:crunchbase.com',
-            f'"{company_name}" site:eu-startups.com',
-            f'"{company_name}" site:sifted.eu',
+            f'"{company_name}" site:crunchbase.com funding',
+            f'"{company_name}" site:eu-startups.com OR site:sifted.eu',
+            f'"{company_name}" site:prnewswire.com OR site:businesswire.com',
+            f'"{company_name}" site:venturebeat.com OR site:forbes.com startup',
             f'"{company_name}" site:dealroom.co',
-            f'"{company_name}" site:tech.eu',
-            f'"{company_name}" site:venturebeat.com',
-            f'"{company_name}" site:forbes.com startup',
-            f'"{company_name}" site:businessinsider.com funding',
             
-            # === ACCELERATORS & INCUBATORS ===
-            f'"{company_name}" accelerator OR incubator',
-            f'"{company_name}" Y Combinator OR YC',
-            f'"{company_name}" Techstars OR 500 Startups',
-            f'"{company_name}" accelerator program graduate',
-            f'"{company_name}" startup competition winner',
-            f'"{company_name}" demo day OR pitch competition',
-            
-            # === GRANTS & NON-DILUTIVE FUNDING ===
-            f'"{company_name}" grant OR award funding',
-            f'"{company_name}" government grant OR innovation grant',
-            f'"{company_name}" EU grant OR Horizon Europe',
-            f'"{company_name}" climate grant OR sustainability grant',
-            f'"{company_name}" research grant OR R&D funding',
-            f'"{company_name}" Innovate UK OR EIC Accelerator',
-            
-            # === PARTNERSHIPS (important for startups) ===
-            f'"{company_name}" partnership announced',
-            f'"{company_name}" "strategic partnership" OR "partners with"',
-            f'"{company_name}" collaboration OR alliance',
-            f'"{company_name}" pilot program OR proof of concept',
-            f'"{company_name}" enterprise customer OR contract',
-            
-            # === STARTUP-SPECIFIC DEAL TYPES ===
+            # DEALS & PARTNERSHIPS (6 queries)
+            f'"{company_name}" accelerator OR incubator Y Combinator Techstars',
+            f'"{company_name}" partnership OR "strategic partnership"',
+            f'"{company_name}" acquired by OR acquisition',
             f'"{company_name}" "backed by" OR "portfolio company"',
-            f'"{company_name}" "growth equity" OR "growth stage"',
-            f'"{company_name}" bridge round OR extension',
-            f'"{company_name}" convertible note OR SAFE',
-            f'"{company_name}" crowdfunding OR equity crowdfunding',
-            
-            # === CLIMATE/IMPACT TECH (if relevant) ===
-            f'"{company_name}" climate tech OR cleantech funding',
-            f'"{company_name}" sustainability startup investment',
-            f'"{company_name}" impact investing OR ESG',
-            f'"{company_name}" green investment OR carbon',
-            
-            # === ACQUISITIONS (startups get acquired too) ===
-            f'"{company_name}" acquired by',
-            f'"{company_name}" acquisition announced',
-            f'"{company_name}" exit OR "sold to"',
-            
-            # === PRESS RELEASES ===
-            f'"{company_name}" site:prnewswire.com',
-            f'"{company_name}" site:businesswire.com',
-            f'"{company_name}" announces funding OR investment',
+            f'"{company_name}" climate tech OR cleantech OR sustainability',
+            f'"{company_name}" announces investment OR funding round',
         ]
     else:
-        # === ENTERPRISE/ESTABLISHED COMPANY QUERIES ===
-        print("🏢 Using ENTERPRISE-optimized search queries")
+        # === ENTERPRISE-OPTIMIZED QUERIES (reduced to 18 highest-yield) ===
+        print("🏢 Using ENTERPRISE-optimized search queries (PARALLEL)")
         queries = [
-            # === OFFICIAL PRESS RELEASES (most accurate for dates) ===
-            f'"{company_name}" acquisition site:prnewswire.com',
-            f'"{company_name}" acquisition site:businesswire.com',
-            f'"{company_name}" acquisition site:globenewswire.com',
-            
-            # === HIGH-YIELD ACQUISITION PATTERNS ===
-            f'"{company_name}" acquires',
-            f'"{company_name}" acquired',
-            f'"{company_name}" "has acquired"',
-            f'"{company_name}" buys',
-            f'"{company_name}" bought',
-            f'"{company_name}" merger',
-            
-            # === YEAR-SPECIFIC SEARCHES (find all deals by year) ===
-            f'"{company_name}" acquisition 2025',
-            f'"{company_name}" acquisition 2024',
-            f'"{company_name}" acquisition 2023',
-            f'"{company_name}" acquisition 2022',
-            f'"{company_name}" acquisition 2021',
-            f'"{company_name}" acquisition 2020',
-            f'"{company_name}" acquisition 2019',
-            f'"{company_name}" acquisition 2018',
-            f'"{company_name}" acquisition 2017',
-            f'"{company_name}" acquisition 2016',
-            f'"{company_name}" acquisition 2015',
-            
-            # === PRIVATE EQUITY / INVESTMENT DEALS ===
-            f'"{company_name}" "private equity" investment',
-            f'"{company_name}" "growth equity" OR "growth investment"',
-            f'"{company_name}" investor OR "backed by"',
-            f'"{company_name}" "majority stake" OR "minority stake"',
-            f'"{company_name}" "portfolio company"',
-            
-            # === PE/VC NEWS SOURCES ===
-            f'"{company_name}" site:pitchbook.com',
-            f'"{company_name}" site:pehub.com',
-            f'"{company_name}" site:privateequitywire.com',
-            f'"{company_name}" site:agfundernews.com',
-            
-            # === STARTUP / VC FUNDING SOURCES ===
-            f'"{company_name}" site:crunchbase.com',
-            f'"{company_name}" site:techcrunch.com funding',
-            f'"{company_name}" "series A" OR "series B" OR "seed round"',
-            f'"{company_name}" "raises" OR "raised" funding',
-            f'"{company_name}" "venture capital" OR "VC funding"',
-            f'"{company_name}" site:eu-startups.com',
-            f'"{company_name}" site:sifted.eu',
-            f'"{company_name}" site:dealroom.co',
-            
-            # === DIVESTITURES & SALES ===
-            f'"{company_name}" sold OR divested',
-            f'"{company_name}" divestiture OR "sale of"',
-            f'"{company_name}" "sold to" OR "sells"',
-            
-            # === REGIONAL / GEOGRAPHIC EXPANSION ===
-            f'"{company_name}" acquired Brazil',
-            f'"{company_name}" acquired "Latin America"',
-            f'"{company_name}" acquired UK OR Australia',
-            f'"{company_name}" acquired Europe OR Germany',
-            f'"{company_name}" "bolt-on acquisition"',
-            f'"{company_name}" "strategic acquisition"',
-            f'"{company_name}" "expands" acquisition OR acquires',
-            
-            # === SPECIFIC TARGET PATTERNS (catches smaller deals) ===
-            f'"{company_name}" acquired site:agfundernews.com',
-            f'"{company_name}" acquired site:feednavigator.com',
-            f'"{company_name}" buys site:agribusinessglobal.com',
-            f'"{company_name}" "has acquired" OR "has bought"',
-            f'"{company_name}" "completed acquisition" OR "completes acquisition"',
-            f'"{company_name}" "joins" OR "joined" acquisition',
-            f'"{company_name}" "transaction" acquisition OR acquired',
-            
-            # === ANNOUNCEMENT PATTERNS ===
-            f'"{company_name}" "announces acquisition"',
-            f'"{company_name}" "completes acquisition"',
-            f'"{company_name}" "acquisition of"',
-            
-            # === INDUSTRY NEWS ===
-            f'"{company_name}" M&A deal',
-            f'"{company_name}" acquisition site:reuters.com',
+            # PRESS RELEASES (most accurate - 3 queries)
+            f'"{company_name}" acquisition site:prnewswire.com OR site:businesswire.com',
+            f'"{company_name}" acquisition site:globenewswire.com OR site:reuters.com',
             f'"{company_name}" acquisition site:bloomberg.com',
             
-            # === PARTNERSHIP & STRATEGIC DEALS ===
-            f'"{company_name}" partnership OR "strategic partnership"',
-            f'"{company_name}" "joint venture" OR JV',
-            f'"{company_name}" collaboration OR alliance',
+            # ACQUISITION PATTERNS (high-yield - 4 queries)
+            f'"{company_name}" acquires OR acquired OR "has acquired"',
+            f'"{company_name}" buys OR bought OR merger',
+            f'"{company_name}" "announces acquisition" OR "completes acquisition"',
+            f'"{company_name}" "acquisition of" OR "strategic acquisition"',
             
-            # === COMPANY INFO SOURCES ===
-            f'"{company_name}" site:zoominfo.com',
-            f'"{company_name}" site:apollo.io',
-            f'"{company_name}" site:linkedin.com/company',
-            f'"{company_name}" company funding history',
-    ]
+            # YEAR-BASED (recent deals - 3 queries covering 6 years)
+            f'"{company_name}" acquisition 2025 OR 2024 OR 2023',
+            f'"{company_name}" acquisition 2022 OR 2021 OR 2020',
+            f'"{company_name}" acquisition 2019 OR 2018 OR 2017',
+            
+            # INVESTMENT/PE (4 queries)
+            f'"{company_name}" "private equity" OR "growth equity" investment',
+            f'"{company_name}" site:pitchbook.com OR site:pehub.com',
+            f'"{company_name}" site:crunchbase.com funding history',
+            f'"{company_name}" "raises" OR "raised" funding series',
+            
+            # DIVESTITURES & PARTNERSHIPS (4 queries)
+            f'"{company_name}" sold OR divested OR divestiture',
+            f'"{company_name}" partnership OR "joint venture" OR collaboration',
+            f'"{company_name}" "bolt-on acquisition" OR "expands" acquisition',
+            f'"{company_name}" M&A deal OR transaction',
+        ]
 
-    search_results = []
-    seen_urls = set()
+    # ========================================
+    # 🚀 PARALLEL SEARCH EXECUTION
+    # ========================================
+    start_time = time.time()
+    print(f"   → Running {len(queries)} search queries in PARALLEL...")
     
-    print(f"   → Running {len(queries)} search queries...")
-    for i, q in enumerate(queries):
-        results = search(q)
-        # Deduplicate by URL
-        for result in results:
-            url = result.get('link', '')
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                search_results.append(result)
-        time.sleep(0.5)  # Rate limiting
+    search_results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=15)
+    
+    elapsed = time.time() - start_time
+    print(f"   ✅ Parallel search completed in {elapsed:.1f}s ({len(search_results)} unique results)")
     
     print(f"   → Collected {len(search_results)} unique search results")
 
     if not search_results:
-        print("No search results found")
+        print("❌ No search results found")
         return []
 
-    # Format context with more structure - include MORE results
-    # Use ALL results for comprehensive coverage
+    # Format context - use all results for comprehensive coverage
     context = ""
     results_to_analyze = len(search_results)
     for i, result in enumerate(search_results, 1):
         context += f"[{i}] {result['title']}\n{result['snippet']}\nSource: {result['link']}\n\n"
 
-    print(f"   → Analyzing all {results_to_analyze} search results...")
+    print(f"   → Sending {results_to_analyze} results to AI for extraction...")
     
     # Determine if this is a startup for prompt customization
     is_startup_search = company_info.get("is_startup") or company_info.get("is_small_company") or company_info.get("company_type") in ["startup", "small_company"]
@@ -1905,36 +1885,74 @@ def generate_summary(company_name, text=""):
             text = search_text
             print(f"   → Collected {len(text)} chars of search data")
     
-    # ------ Step 1.5: Find press page via dedicated search ------
+    # ------ Step 1.5: Find press page via direct URL checking + search ------
     press_page_url = ""
+    website_base = ""
     domain_for_search = ""
+    
     if website_from_input:
         from urllib.parse import urlparse
         parsed = urlparse(website_from_input)
         domain_for_search = parsed.netloc.replace("www.", "")
+        website_base = f"{parsed.scheme}://{parsed.netloc}"
     
-    # Search for press releases page
-    press_search_queries = [
-        f'site:{domain_for_search} press releases' if domain_for_search else None,
-        f'site:{domain_for_search} newsroom' if domain_for_search else None,
-        f'"{search_name}" press releases official site',
-    ]
+    def check_url_exists(url, timeout=5):
+        """Check if a URL exists and returns 200."""
+        try:
+            resp = requests.head(url, timeout=timeout, allow_redirects=True, 
+                               headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                return True
+            # Some sites block HEAD, try GET
+            resp = requests.get(url, timeout=timeout, allow_redirects=True,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            return resp.status_code == 200
+        except:
+            return False
     
-    for pq in press_search_queries:
-        if pq and not press_page_url:
+    # Step 1.5a: Try common press page URL patterns directly
+    if website_base:
+        common_press_paths = [
+            "/press", "/news", "/newsroom", "/media",
+            "/press-releases", "/press-room", "/pressroom",
+            "/about/press", "/about/news", "/about-us/press",
+            "/about-us/news", "/about-us/press-room",
+            "/company/news", "/company/press",
+            "/corporate/press", "/corporate/news",
+            "/insights", "/resources/news", "/resources/press",
+            "/en/press", "/en/news", "/en/newsroom",
+        ]
+        
+        print(f"   → Checking common press page paths on {website_base}...")
+        for path in common_press_paths:
+            if press_page_url:
+                break
+            test_url = website_base + path
             try:
-                # Use SerpAPI to find press page
+                if check_url_exists(test_url):
+                    press_page_url = test_url
+                    print(f"   ✅ Found press page: {press_page_url}")
+                    break
+            except:
+                continue
+    
+    # Step 1.5b: If not found, search via SerpAPI
+    if not press_page_url and domain_for_search:
+        press_search_queries = [
+            f'site:{domain_for_search} press OR newsroom OR "press releases"',
+            f'site:{domain_for_search} news announcements',
+        ]
+        
+        for pq in press_search_queries:
+            if press_page_url:
+                break
+            try:
                 import os
-                import requests
                 serpapi_key = os.environ.get("SERPAPI_KEY", "")
                 if serpapi_key:
                     resp = requests.get(
                         "https://serpapi.com/search",
-                        params={
-                            "q": pq,
-                            "api_key": serpapi_key,
-                            "num": 5,
-                        },
+                        params={"q": pq, "api_key": serpapi_key, "num": 5},
                         timeout=10
                     )
                     if resp.ok:
@@ -1943,13 +1961,20 @@ def generate_summary(company_name, text=""):
                         for result in organic:
                             link = result.get("link", "")
                             # Check if it's a press/news page
-                            press_keywords = ["/press", "/news", "/newsroom", "/media", "/announcements", "press-release"]
+                            press_keywords = ["/press", "/news", "/newsroom", "/media", "/announcements", "press-release", "/insights"]
                             if any(kw in link.lower() for kw in press_keywords):
-                                press_page_url = link
-                                print(f"   → Found press page via search: {press_page_url}")
-                                break
+                                # Validate the URL exists
+                                if check_url_exists(link):
+                                    press_page_url = link
+                                    print(f"   ✅ Found press page via search: {press_page_url}")
+                                    break
             except Exception as e:
                 print(f"   → Press page search error: {e}")
+    
+    if press_page_url:
+        print(f"   📰 Press page URL: {press_page_url}")
+    else:
+        print(f"   ⚠️ No press page found")
 
     # ------ Step 2: Use Perplexity for accurate company info ------
     
@@ -1973,12 +1998,7 @@ def generate_summary(company_name, text=""):
         "Partnership",      # LP, LLP structure
     ]
     
-    # Build the website base for press page hints
-    website_base = ""
-    if website_from_input:
-        from urllib.parse import urlparse
-        parsed = urlparse(website_from_input)
-        website_base = f"{parsed.scheme}://{parsed.netloc}"
+    # website_base already defined in Step 1.5 above
     
     prompt = f"""
 You are a professional researcher. Find and extract complete company details for "{search_name}".
@@ -2146,7 +2166,7 @@ Source text for reference:
 # ============================================================
 def generate_description(company_name, text="", company_details=""):
     """
-    Generates a 5–6 line factual description of the company.
+    Generates a professional, neutral, fact-based company description in a single paragraph.
 
     Args:
         company_name (str): The name of the company.
@@ -2154,7 +2174,7 @@ def generate_description(company_name, text="", company_details=""):
         company_details (str): Optional verified company details to include in context.
 
     Returns:
-        str: A 5–6 line description, or an error message if generation fails.
+        str: A single-paragraph company description, or an error message if generation fails.
     """
     # Use provided text or fetch from Wikipedia
     if not text.strip():
@@ -2167,21 +2187,55 @@ Verified Company Information:
 Additional Context:
 {text[:6000]}
 """
-    prompt = f"""
-Write a factual 5–6 line company description for "{company_name}" using ONLY the verified information provided.
-Do NOT invent data. Focus on what the company does, its products/services, market, and value.
+    prompt = f"""You are Company Description Writer v1. You produce professional, neutral, and fact-based company descriptions in a single paragraph, using only company websites and reliable news sources.
+
+RULES:
+- Write in an objective tone, avoiding marketing language, flowery adjectives, or adverbs.
+- NEVER use generic non-factual words: 'significant', 'important', 'best', 'leading', 'cutting-edge', 'innovative'.
+- Provide SPECIFIC factual details, especially for funding rounds and investors (names, amounts, rounds, percentages).
+- All content must be ONE SINGLE PARAGRAPH - no bullet points, no lists, no line breaks.
+- Do NOT include a concluding sentence or summary - end when factual information ends.
+- Do NOT include promotional sentences like "More information can be found on their website".
+- Do NOT mention the company website URL in the description.
+
+REQUIRED CONTENT (include where available):
+- Year founded
+- Products and services (if data provider: specify data types with granularity)
+- CEO and founder(s)
+- Acquisitions and disposals
+- Funding rounds (last confirmed round, main investors)
+- Headquarters location (city/country only, no street address)
+- Ownership structure
+
+OWNERSHIP RULES:
+- If PE-backed: specify the PE firm and when sponsorship occurred.
+- If VC-funded: list only the last officially confirmed round and main investors.
+- If no disclosed venture/PE backing: simply state "private" - do NOT mention lack of backing.
+- If public: state the exchange.
+
+FOR DATA/ANALYTICS PROVIDERS:
+- Describe data types (e.g., residential vs commercial real estate, financial instruments, etc.)
+- Specify distinct products if 2 or more exist.
+- Reader must understand what dataset is at the core of the offering.
+
+REFERENCE EXAMPLE (follow this style):
+"IMPECT is a football analytics software company founded in 2014 by Stefan Reinartz, Jens Hegeler, Lukas Keppler, and Matthias Sienz, headquartered in Cologne, Germany. The company develops cloud-based tools and data services for clubs, coaches, scouts and federations, focusing on tactical insight, player performance, opponent analysis, and internal benchmarking using proprietary metrics. One of its signature innovations is the Packing metric, which measures how effectively players move the ball past opponents using passing and positioning, intended to provide higher explanatory power for game success than basic statistics like possession or pass completion. Impect operates a SaaS business model, collecting and owning event data from a large number of matches across many leagues (over 40,000 matches annually in 252 countries for 150+ teams). Its products include a scouting platform, analysis tools, data APIs, and raw event datasets. In 2025, Impect was acquired by Catapult Sports in a deal worth up to EUR78m ($91m), as part of a strategy by Catapult to integrate tactical and scouting analytics into its broader video-, performance- and wearable-technology product suite."
+
+Now write a single-paragraph description for "{company_name}" using ONLY the verified information below. Do NOT invent data.
+
 {combined_context}
 """
-    result = openrouter_chat("openai/gpt-4o-mini", prompt, "Factual Company Description")
-    # Validate and format the description
+    result = openrouter_chat("openai/gpt-4o-mini", prompt, "Company Description Writer v1")
+    # Validate the description
     if not result or len(result.strip()) < 40:
         return "❌ No factual description could be generated."
-    lines = [l.strip() for l in result.split("\n") if l.strip()]
-    if len(lines) < 5:
-        lines += [""] * (5 - len(lines))
-    elif len(lines) > 6:
-        lines = lines[:6]
-    return "\n".join(lines)
+    # Clean up - ensure single paragraph, remove any trailing website mentions
+    result = result.strip()
+    # Remove common trailing patterns about websites
+    import re
+    result = re.sub(r'\s*(For more information|More information|Visit|Learn more)[^.]*\.?\s*$', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'\s*\(?https?://[^\s\)]+\)?\s*\.?\s*$', '', result)
+    return result.strip()
 
 # ============================================================
 # 🔹 Subsidiary Data Generator

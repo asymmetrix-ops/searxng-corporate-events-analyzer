@@ -1,301 +1,145 @@
 # SearXNG Corporate Events Analyzer - Architecture
 
-## System Overview
+## High-Level System
+
+- **Frontend (`templates/index.html`)**: single-page UI for AI vs DB comparison, data entry, and enrichment controls.
+- **Backend (`server.py`)**: FastAPI API that orchestrates Xano lookups, AI extraction, heuristic parsing, optional Scrapfly fetching, and response assembly.
+- **Analyzer (`searxng_analyzer.py`)**: legacy pipeline for search + AI extraction (SerpAPI + OpenRouter) used by `/analyze`.
+- **Data store**: Xano endpoints for companies, events, investors, locations, roles, sectors, business focuses, currencies, and individuals.
+
+## Architecture Diagram (current flow)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              USER INTERFACE                                      │
-│                         (templates/index.html)                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  🔍 Input: Company URL or Name                                          │    │
-│  │  Example: "https://www.ecorth.com/" or "S&P Global"                     │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│                                    │                                             │
-│                                    ▼                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  🚀 Analyze Button → POST /analyze                                       │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              FASTAPI SERVER                                      │
-│                              (server.py)                                         │
-│                                                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │                         POST /analyze                                     │   │
-│  │  Input: { "query": "company_url_or_name" }                               │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-│                                     │                                            │
-│                                     ▼                                            │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                    ┌────────────────┴────────────────┐
-                    ▼                                 ▼
-┌───────────────────────────────┐    ┌───────────────────────────────────────────┐
-│      STEP 1: XANO PRE-CHECK   │    │         STEP 2: AI ANALYSIS               │
-│                               │    │      (searxng_analyzer.py)                │
-│  ┌─────────────────────────┐  │    │                                           │
-│  │ GET /get_company_by_url │  │    │  Runs in parallel with Xano check         │
-│  │ Check if company exists │  │    │                                           │
-│  └───────────┬─────────────┘  │    └───────────────────────────────────────────┘
-│              │                │                      │
-│              ▼                │                      ▼
-│  ┌─────────────────────────┐  │    ┌───────────────────────────────────────────┐
-│  │ Company Found?          │  │    │  2A: COMPANY TYPE DETECTION               │
-│  │                         │  │    │  detect_company_type()                    │
-│  │  YES → Get company_id   │  │    │                                           │
-│  │  NO  → AI-only mode     │  │    │  ┌─────────────────────────────────────┐  │
-│  └───────────┬─────────────┘  │    │  │ Quick SerpAPI searches:             │  │
-│              │                │    │  │ • "{company}" founded startup       │  │
-│              ▼                │    │  │ • "{company}" series funding        │  │
-│  ┌─────────────────────────┐  │    │  │ • "{company}" site:crunchbase.com   │  │
-│  │ If Found:               │  │    │  └─────────────────────────────────────┘  │
-│  │ GET /Get_new_company/   │  │    │                    │                      │
-│  │ GET /Get_investors_     │  │    │                    ▼                      │
-│  │     corporate_events    │  │    │  ┌─────────────────────────────────────┐  │
-│  └─────────────────────────┘  │    │  │ Analyze signals:                    │  │
-└───────────────────────────────┘    │  │                                     │  │
-                                     │  │ STARTUP signals:                    │  │
-                                     │  │ • "seed round", "series A"          │  │
-                                     │  │ • "accelerator", "founded 202X"     │  │
-                                     │  │ • "venture-backed", "startup"       │  │
-                                     │  │                                     │  │
-                                     │  │ ENTERPRISE signals:                 │  │
-                                     │  │ • "fortune 500", "nasdaq:"          │  │
-                                     │  │ • "billion revenue", "established"  │  │
-                                     │  └─────────────────────────────────────┘  │
-                                     │                    │                      │
-                                     │                    ▼                      │
-                                     │  ┌─────────────────────────────────────┐  │
-                                     │  │ Output:                             │  │
-                                     │  │ • is_startup: true/false            │  │
-                                     │  │ • company_type: startup/enterprise  │  │
-                                     │  │ • founded_year: YYYY                │  │
-                                     │  └─────────────────────────────────────┘  │
-                                     └───────────────────────────────────────────┘
-                                                        │
-                    ┌───────────────────────────────────┴───────────────────────┐
-                    │                                                           │
-                    ▼                                                           ▼
-┌───────────────────────────────────────────┐    ┌─────────────────────────────────────────┐
-│  2B: COMPANY OVERVIEW                     │    │  2C: CORPORATE EVENTS                   │
-│  generate_summary()                       │    │  generate_corporate_events()            │
-│                                           │    │                                         │
-│  ┌─────────────────────────────────────┐  │    │  ┌─────────────────────────────────────┐│
-│  │ 1. Try Wikipedia API                │  │    │  │ SELECT QUERY SET based on type:    ││
-│  │    GET wikipedia.org/api/...        │  │    │  │                                    ││
-│  └───────────┬─────────────────────────┘  │    │  │ IF STARTUP:                        ││
-│              │                            │    │  │ • Funding rounds (seed, series)    ││
-│              ▼                            │    │  │ • Grants & awards                  ││
-│  ┌─────────────────────────────────────┐  │    │  │ • Accelerators (YC, Techstars)     ││
-│  │ 2. If no Wikipedia → SerpAPI search │  │    │  │ • Partnerships                     ││
-│  │    "{company}" about company info   │  │    │  │ • TechCrunch, Crunchbase, Sifted   ││
-│  └───────────┬─────────────────────────┘  │    │  │                                    ││
-│              │                            │    │  │ IF ENTERPRISE:                     ││
-│              ▼                            │    │  │ • M&A acquisitions                 ││
-│  ┌─────────────────────────────────────┐  │    │  │ • Divestitures                     ││
-│  │ 3. OpenRouter AI (Perplexity)       │  │    │  │ • PE investments                   ││
-│  │    Extract structured data:         │  │    │  │ • Reuters, Bloomberg, PitchBook   ││
-│  │    • Company name                   │  │    │  └─────────────────────────────────────┘│
-│  │    • City, Country                  │  │    │                    │                   │
-│  │    • Website URL                    │  │    │                    ▼                   │
-│  │    • LinkedIn URL                   │  │    │  ┌─────────────────────────────────────┐│
-│  │    • Description                    │  │    │  │ Run 49+ SerpAPI queries            ││
-│  │    • Year founded                   │  │    │  │ Deduplicate by URL                 ││
-│  │    • CEO name                       │  │    │  │ Collect search results             ││
-│  └─────────────────────────────────────┘  │    │  └─────────────────────────────────────┘│
-└───────────────────────────────────────────┘    │                    │                   │
-                                                 │                    ▼                   │
-                                                 │  ┌─────────────────────────────────────┐│
-                                                 │  │ OpenRouter AI (Claude 3.5 Sonnet)  ││
-                                                 │  │ Extract from search results:       ││
-                                                 │  │                                    ││
-                                                 │  │ For each event:                    ││
-                                                 │  │ • announcement_date                ││
-                                                 │  │ • closed_date                      ││
-                                                 │  │ • event_short (title)              ││
-                                                 │  │ • description                      ││
-                                                 │  │ • deal_type                        ││
-                                                 │  │ • deal_status                      ││
-                                                 │  │ • value_usd                        ││
-                                                 │  │ • source_url                       ││
-                                                 │  │ • counterparties[]                 ││
-                                                 │  │   - company_name                   ││
-                                                 │  │   - type (Acquirer/Target/etc)     ││
-                                                 │  │   - press_release_url              ││
-                                                 │  │   - individuals[]                  ││
-                                                 │  └─────────────────────────────────────┘│
-                                                 │                    │                   │
-                                                 │                    ▼                   │
-                                                 │  ┌─────────────────────────────────────┐│
-                                                 │  │ ENRICHMENT (Optional)              ││
-                                                 │  │ enrich_counterparties_with_        ││
-                                                 │  │ individuals()                      ││
-                                                 │  │                                    ││
-                                                 │  │ For each counterparty:             ││
-                                                 │  │ • Find executives via Perplexity   ││
-                                                 │  │ • Get press release URLs           ││
-                                                 │  │ • Get LinkedIn URLs                ││
-                                                 │  └─────────────────────────────────────┘│
-                                                 └─────────────────────────────────────────┘
-                                                                    │
-                                                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              2D: TOP MANAGEMENT                                          │
-│                              get_top_management()                                        │
-│                                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. SerpAPI search: "{company}" CEO OR "Chief Executive" site:linkedin.com      │    │
-│  │ 2. OpenRouter AI: Extract executives (name, title, LinkedIn)                   │    │
-│  │ 3. Fallback: Try Perplexity if main search fails                               │    │
-│  └─────────────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                    │
-                                                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              STEP 3: MATCHING & COMPARISON                               │
-│                              (server.py)                                                 │
-│                                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐    │
-│  │ Compare AI events vs DB events:                                                 │    │
-│  │                                                                                 │    │
-│  │ For each AI event:                                                              │    │
-│  │   → Extract keywords from event title                                           │    │
-│  │   → Compare with each DB event using Jaccard similarity                         │    │
-│  │   → If similarity > 40% → MATCHED                                               │    │
-│  │   → If no match found → MISSING (gap in database)                               │    │
-│  └─────────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                          │
-│  Output:                                                                                 │
-│  • matched_events: AI events that exist in DB                                           │
-│  • missing_events: AI events NOT in DB (gaps to fill)                                   │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                    │
-                                                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              STEP 4: RESPONSE TO FRONTEND                                │
-│                                                                                          │
-│  JSON Response:                                                                          │
-│  {                                                                                       │
-│    "existing_company": { id: 1234 } or null,                                            │
-│    "db_company": { name, city, country, ... },                                          │
-│    "db_overview": { name, description, ... },                                           │
-│    "ai_overview": { name, city, country, linkedin, description, ... },                  │
-│    "db_events": [ ... events from Xano ... ],                                           │
-│    "ai_events": [ ... events from AI ... ],                                             │
-│    "missing_events": [ ... AI events not in DB ... ],                                   │
-│    "matched_events": [ ... AI events that match DB ... ],                               │
-│    "top_management": [ { name, title, linkedin_url } ]                                  │
-│  }                                                                                       │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                    │
-                                                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              FRONTEND RENDERING                                          │
-│                              (templates/index.html)                                      │
-│                                                                                          │
-│  ┌────────────────────────────────┐    ┌────────────────────────────────┐               │
-│  │     🤖 AI SIDE                 │    │     🗄️ DATABASE SIDE           │               │
-│  ├────────────────────────────────┤    ├────────────────────────────────┤               │
-│  │                                │    │                                │               │
-│  │  AI Company Overview           │    │  DB Company Overview           │               │
-│  │  ┌──────────────────────────┐  │    │  ┌──────────────────────────┐  │               │
-│  │  │ Name: [editable]         │  │    │  │ Name: Ecorth Ltd.        │  │               │
-│  │  │ City: [editable]         │  │    │  │ City: London             │  │               │
-│  │  │ Country: [editable]      │  │    │  │ Country: UK              │  │               │
-│  │  │ Website: [editable]      │  │    │  │ Website: ecorth.com      │  │               │
-│  │  │ LinkedIn: [editable]     │  │    │  │ LinkedIn: ...            │  │               │
-│  │  │ Description: [textarea]  │  │    │  │ Description: ...         │  │               │
-│  │  │                          │  │    │  │                          │  │               │
-│  │  │ [📋 Copy from DB]        │  │    │  └──────────────────────────┘  │               │
-│  │  │ [➕ Create in Database]  │  │    │                                │               │
-│  │  └──────────────────────────┘  │    │                                │               │
-│  │                                │    │                                │               │
-│  │  AI Events (X events)          │    │  DB Events (Y events)          │               │
-│  │  ┌──────────────────────────┐  │    │  ┌──────────────────────────┐  │               │
-│  │  │ 🟢 Matched Event         │  │    │  │ Event from Xano          │  │               │
-│  │  │ 🔴 Missing Event         │  │    │  │ - Counterparties         │  │               │
-│  │  │    [➕ Add to DB]        │  │    │  │ - Dates                   │  │               │
-│  │  │                          │  │    │  │ - Deal type/status       │  │               │
-│  │  │ Counterparties:          │  │    │  └──────────────────────────┘  │               │
-│  │  │ - Company (Role)         │  │    │                                │               │
-│  │  │   - Individual: Name [Add]│  │    │                                │               │
-│  │  └──────────────────────────┘  │    │                                │               │
-│  │                                │    │                                │               │
-│  └────────────────────────────────┘    └────────────────────────────────┘               │
-│                                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │  👔 Top Management                                                                │   │
-│  │  ┌────────────────────────────────────────────────────────────────────────────┐  │   │
-│  │  │ • CEO Name - Chief Executive Officer [LinkedIn]                            │  │   │
-│  │  │   [➕ Add to Database]                                                      │  │   │
-│  │  │ • CFO Name - Chief Financial Officer [LinkedIn]                            │  │   │
-│  │  │   [➕ Add to Database]                                                      │  │   │
-│  │  └────────────────────────────────────────────────────────────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │  📝 API Log                                                                       │   │
-│  │  [timestamp] Starting analysis for: "https://www.ecorth.com/"                    │   │
-│  │  [timestamp] Company type: startup (founded 2017)                                │   │
-│  │  [timestamp] Company not found in DB – AI-only mode.                             │   │
-│  │  [timestamp] AI events: 3, DB events: 0, matched: 0, missing: 3                  │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              FRONTEND (SPA)                             │
+│                         templates/index.html                            │
+│  - Analyze form (URL or name)                                           │
+│  - AI vs DB overview + events + management                              │
+│  - Catalog dropdowns (sectors, roles, business focus, currency)         │
+│  - Buttons: Parse (heuristic), Enrich (LLM), Check DB, Add to DB        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                 │  POST /analyze (query)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            FASTAPI SERVER (server.py)                   │
+│ 1) Xano pre-check: GET /get_company_by_url                              │
+│    └─ If found: GET /Get_new_company/{id} (overview, events, catalogs)  │
+│ 2) AI analysis (searxng_analyzer): SerpAPI + OpenRouter → AI overview   │
+│    and AI events                                                        │
+│ 3) Evidence Enrichment Layer (auto) for AI events with source_url:      │
+│    ├─ fetch_html (Scrapfly if key else requests)                        │
+│    ├─ strip boilerplate; heuristic dates/amount/stage/currency          │
+│    └─ ai_extract_event_from_text (LLM JSON) → merge                     │
+│ 4) Matching: keyword/Jaccard AI vs DB events                            │
+│ 5) Response JSON → frontend                                             │
+└─────────────────────────────────────────────────────────────────────────┘
+                                 │  JSON (existing_company, db/ai data, matches)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              FRONTEND RENDER                            │
+│  - Side-by-side AI vs DB cards                                          │
+│  - Event actions: Parse, Enrich, Check DB (website-only), Add to DB     │
+│  - Overview copy/edit/create; management add; API log                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+External services:
+- Xano (companies, events, investors, locations, sectors, roles, business focuses, currencies, individuals)
+- OpenRouter AI (Claude 3.5 Sonnet, Perplexity, GPT-4o-mini)
+- SerpAPI (search)
+- Scrapfly (HTML fetch, optional)
+- Wikipedia API (overview fallback)
 ```
 
----
+## End-to-End Flow (current)
 
-## External APIs Used
+1) **Input**: User submits company URL or name → `POST /analyze`.
+2) **Xano pre-check**: `GET /get_company_by_url`; if found, fetch full payload via `GET /Get_new_company/{id}` (includes overview, events, investors, locations, roles, sectors, business_focus, currencies).
+3) **AI analysis**: `searxng_analyzer` generates AI overview + AI corporate events (SerpAPI + OpenRouter).
+4) **Evidence Enrichment Layer (auto in /analyze)**:
+   - For AI events with `source_url`, fetch HTML (Scrapfly if `SCRAPFLY_KEY`, else direct GET).
+   - Strip boilerplate marketing text; heuristic parse dates, amounts, currency, stage.
+   - LLM extraction (`ai_extract_event_from_text`) returns minified JSON with title, dates, deal type/status, description, amount (millions), ISO currency, funding stage, counterparties.
+   - Merge heuristic + LLM fields into AI events and return to frontend (not auto-saved).
+5) **Matching**: Keyword/Jaccard compare AI vs DB events; mark matched vs missing.
+6) **Response**: JSON includes `existing_company`, `db_company`, `db_overview`, `db_events`, `ai_overview`, `ai_events` (enriched), `missing_events`, `matched_events`, `top_management`.
+7) **Frontend render**: Side-by-side AI vs DB, per-event cards with add/edit/save controls, catalogs as dropdowns, copy buttons, and enrichment/parse actions.
 
-### 1. SerpAPI (Google Search)
-- **Purpose**: Web search for company information and corporate events
-- **Endpoints**: Google Search API
-- **Rate Limit**: 100 searches/month (free tier)
-- **Used in**: 
-  - `detect_company_type()` - 3 queries
-  - `generate_summary()` - fallback search
-  - `generate_corporate_events()` - 49+ queries
-  - `get_top_management()` - LinkedIn search
+## Evidence Enrichment Layer (details)
 
-### 2. OpenRouter AI
-- **Purpose**: AI-powered data extraction and analysis
-- **Models Used**:
-  - `anthropic/claude-3.5-sonnet` - Corporate events extraction
-  - `perplexity/sonar-pro` - Company info, enrichment
-  - `openai/gpt-4o-mini` - Fallback/cheaper option
-- **Used in**:
-  - `generate_summary()` - Company overview extraction
-  - `generate_corporate_events()` - Event extraction from search results
-  - `enrich_counterparties_with_individuals()` - Executive enrichment
-  - `get_top_management()` - Leadership extraction
+- **Fetch**: `fetch_html(url)` uses Scrapfly POST (url in params + body) when key exists; fallback `requests.get`.
+- **Heuristics**: `extract_first_date` (supports YYYY-MM-DD, dd/mm/yyyy, dd.mm.yyyy), `extract_investment_fields` (amount, currency symbol→ISO, funding stage regexes).
+- **LLM**: `ai_extract_event_from_text(url, text)` with strict minified JSON schema to reduce parse errors.
+- **Batch**: `enrich_ai_events_with_llm(ai_events)` runs during `/analyze` for events with `source_url`.
+- **Manual single enrichment**: `POST /enrich_event` for a specific event card (frontend “🧪 Enrich Event” button).
+- **Note**: Scrapfly/LLM can be disabled by omitting keys; fallback still returns heuristic-only enrichment.
 
-### 3. Wikipedia API
-- **Purpose**: Get company summary and basic info
-- **Endpoint**: `en.wikipedia.org/api/rest_v1/page/summary/{title}`
-- **Used in**: `get_wikipedia_summary()`
+## Frontend Behavior (index.html)
 
-### 4. Xano Database API
-- **Purpose**: Store and retrieve company data
-- **Endpoints**:
-  - `GET /get_company_by_url` - Check if company exists
-  - `GET /Get_new_company/{id}` - Get company details
-  - `GET /Get_investors_corporate_events` - Get company events
-  - `GET /get_location` - Get location ID by city/country
-  - `POST /post_company_overview` - Create new company
-  - `POST /create_corporate_event` - Create new event
-  - `POST /post_individual` - Add individual to database
-    ```json
-    {
-      "name": "John Smith",
-      "bio": "Chief Executive Officer",
-      "linkedin_URL": "https://linkedin.com/in/johnsmith",
-      "locations_id": 123
-    }
-    ```
+- **Catalog dropdowns** (cached per session):
+  - **Sectors**: multi-select with synonym map (e.g., “Environmental Services”→“Environment”).
+  - **Roles**: individuals use multi-select roles + title.
+  - **Business Focus**: dropdown sourced from Xano `business_focuses` (ids like 74=Financial Services, 75=Data & Analytics, ...).
+  - **Currencies**: dropdown for corporate events (ISO codes, mapped to Xano currency_id).
+- **Corporate event cards**:
+  - Fields: description, long description, announcement/closed dates, deal type/status, funding stage, investment amount (m), currency, source URL.
+  - Buttons: “🧠 Parse from source” (heuristic), “🧪 Enrich Event” (LLM+heuristic), “🔍 Check DB” (counterparty).
+  - Add-to-DB payload includes `currency_id`, `funding_stage`, `Amount`, `funding_source`, `investment_amount_m`.
+- **Counterparty DB check**:
+  - Uses only website URL (typed input has priority; otherwise counterparty website; otherwise origin of announcement URL). Looks up via Xano; no LinkedIn fallback.
+- **Overview editing**:
+  - Copy DB→AI, create new company via `post_company_overview`.
+  - Description textarea, editable name/location/website/linkedin.
+- **Management**:
+  - Renders AI/DB executives; add individual via `post_individual` with locations lookup.
+- **Derived DB data safety**:
+  - `runAnalyze` initializes derived DB overview/management/events even if prior cache was empty.
 
----
+## Backend Endpoints (server.py)
+
+- `POST /analyze`: orchestrates Xano pre-check, AI analysis, enrichment, matching, and response assembly.
+- `POST /enrich_event`: single-event enrichment (Scrapfly/direct fetch + LLM + heuristics).
+- `POST /extract_event_meta`: heuristic extraction from provided HTML/text (used by “Parse from source”).
+- `POST /ai_extract_event_from_url`: legacy AI extraction from URL (LLM over fetched HTML).
+- `GET /health`: basic healthcheck.
+
+## Data Mapping & Lookups
+
+- **Locations**: `get_location` Xano lookup; `MAX_LOCATION_ID` constraint removed—any numeric id allowed.
+- **Sectors**: lookup by name with synonym map; multi-select stored as array of IDs.
+- **Business focus**: single select, sourced from Xano list (ids 74–110+).
+- **Roles**: multi-select per individual (title + role id array).
+- **Currencies**: fetched from Xano catalog; stored as `currency_id` in events; UI shows ISO code.
+- **Company fetch**: `GET /Get_new_company/{id}` returns full company object, events, investors, locations, sectors, business focus, linkedin data, employees history.
+
+## External Services
+
+- **SerpAPI**: search queries for company/event discovery (startup vs enterprise query sets).
+- **OpenRouter AI**: multiple models; primary for events (Claude 3.5 Sonnet) and summaries (Perplexity/others).
+- **Scrapfly**: optional HTML fetch with anti-bot support; POST with url in params + body; fallback to direct GET.
+- **Wikipedia API**: summary fallback for overview.
+- **Xano**: system-of-record for companies/events/individuals/catalogs.
+
+## Data Flow (updated)
+
+```
+User Input → /analyze
+   ├─ Xano pre-check (company exists?)
+   │    └─ If found: fetch full company payload (overview, events, catalogs)
+   ├─ AI analysis (SerpAPI + OpenRouter) → AI overview + AI events
+   ├─ Evidence Enrichment Layer on AI events with source_url
+   │    ├─ fetch_html (Scrapfly/direct)
+   │    ├─ strip boilerplate, heuristic dates/amount/stage/currency
+   │    └─ ai_extract_event_from_text (LLM JSON) → merge
+   ├─ Match AI events vs DB events (keyword/Jaccard)
+   └─ Return combined JSON → frontend render (AI vs DB cards, actions)
+```
+
+## UI Rendering Snapshot
+
+- Side-by-side AI vs DB overview (editable AI fields, copy-from-DB, create-in-DB).
+- Events: matched/missing markers, enrichment/parse buttons, currency/funding-stage fields, counterparties with DB check, add-to-DB.
+- Management: AI + DB executives with add-to-DB.
+- API log panel with step-by-step messages.
 
 ## Deal Types Supported
 
@@ -315,21 +159,11 @@
 | Award | Competition win, prize | Startup |
 | Debt financing | Loan/debt financing | Both |
 
----
-
 ## Advisors
 
-Advisors are professional firms that provide advisory services during corporate transactions.
-
-### Advisor Types
-| Type | Description | Examples |
-|------|-------------|----------|
-| Financial Advisor | Investment banks advising on deal terms, valuation, negotiations | Goldman Sachs, Morgan Stanley, Lazard, Evercore, Centerview Partners, PJT Partners |
-| Legal Advisor | Law firms handling legal documentation, regulatory filings, due diligence | Skadden, Sullivan & Cromwell, Kirkland & Ellis, Latham & Watkins, Davis Polk |
-| Due Diligence | Consulting firms performing commercial/operational due diligence | McKinsey, BCG, Bain, Deloitte, EY, KPMG, PwC |
-| Tax Advisor | Tax planning and structuring | Big 4 accounting firms |
-
-### Advisor Data Structure (AI Extraction)
+- Highlighted section per event (yellow). Shown for AI + DB events.
+- Display format: `• Advisor Name (Type) → advised Party [Link]`.
+- AI extraction structure:
 ```json
 {
   "advisor_name": "Goldman Sachs",
@@ -339,137 +173,51 @@ Advisors are professional firms that provide advisory services during corporate 
 }
 ```
 
-### Display
-- Advisors are shown in a yellow-highlighted section within each corporate event
-- Both AI-extracted and DB events display advisors
-- Format: `• Advisor Name (Type) → advised Party [Link]`
-
----
-
-## Startup vs Enterprise Detection
+## Startup vs Enterprise Detection (legacy analyzer)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    COMPANY TYPE DETECTION                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  STARTUP SIGNALS (score +1 each):                               │
-│  • "startup", "founded in 20XX" (2015+)                         │
-│  • "seed round", "series A/B/C"                                 │
-│  • "accelerator", "incubator"                                   │
-│  • "early-stage", "venture-backed"                              │
-│  • "pre-seed", "angel investment"                               │
-│  • "climate tech startup", "fintech startup"                    │
-│  • "scale-up", "growth-stage"                                   │
-│                                                                  │
-│  ENTERPRISE SIGNALS (score +1 each):                            │
-│  • "fortune 500", "nasdaq:", "nyse:"                            │
-│  • "publicly traded", "billion revenue"                         │
-│  • "global leader", "multinational"                             │
-│  • "established in 19XX", "100+ years"                          │
-│  • "s&p 500", "dow jones", "ftse 100"                          │
-│                                                                  │
-│  DECISION:                                                       │
-│  • startup_score > enterprise_score → STARTUP queries           │
-│  • enterprise_score > startup_score → ENTERPRISE queries        │
-│  • Unknown + no M&A history → Default to STARTUP queries        │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+STARTUP signals (+1): startup, founded 20XX, seed/series, accelerator/incubator,
+early-stage, venture-backed, pre-seed/angel, climate/fintech startup, scale-up.
+ENTERPRISE signals (+1): fortune 500, nasdaq/nyse, publicly traded, billion revenue,
+global leader/multinational, established 19XX/100+ years, s&p 500/dow jones/ftse 100.
+Decision: higher score picks query set; unknown defaults to startup queries.
 ```
-
----
 
 ## File Structure
 
 ```
 SearXNG-OpenRouter-30-10-main/
-├── server.py                 # FastAPI backend server
-├── searxng_analyzer.py       # Core analysis functions
-│   ├── detect_company_type()
-│   ├── generate_corporate_events()
-│   ├── generate_summary()
-│   ├── get_top_management()
-│   └── enrich_counterparties_with_individuals()
-├── searxng_db.py            # Supabase database functions
-├── searxng_crawler.py       # Web scraping utilities
+├── server.py                 # FastAPI backend server + enrichment endpoints
+├── searxng_analyzer.py       # Core AI analysis (SerpAPI + OpenRouter)
+├── searxng_db.py             # Supabase (legacy) helpers
+├── searxng_crawler.py        # Web scraping utilities
 ├── templates/
-│   └── index.html           # Frontend UI (Jinja2 + JavaScript)
-├── requirements.txt         # Python dependencies
-├── Dockerfile              # Container configuration
-├── fly.toml                # Fly.io deployment config
-└── .env                    # Environment variables (API keys)
+│   └── index.html            # Frontend UI (Jinja2 + heavy JS)
+├── docs/
+│   └── flow-diagram.txt      # Text diagram of data flow
+├── requirements.txt
+├── Dockerfile
+├── fly.toml
+└── .env                      # API keys/config
 ```
 
----
-
-## Environment Variables Required
+## Environment Variables
 
 ```bash
-# OpenRouter AI (required)
-OPENROUTER_API_KEY=sk-or-...
-
-# SerpAPI for Google Search (required)
-SERPAPI_KEY=...
-
-# Xano Database (required for DB features)
+OPENROUTER_API_KEY=...      # AI extraction/enrichment
+SERPAPI_KEY=...             # Search
 XANO_BASE_URL=https://xdil-abvj-o7rq.e2.xano.io
-
-# Supabase (optional, for legacy features)
+SCRAPFLY_KEY=...            # Optional; enables Scrapfly fetch
+# (Supabase legacy)
 SUPABASE_URL=...
 SUPABASE_KEY=...
 ```
 
----
+## Performance / Behavior Notes
 
-## Data Flow Summary
-
-```
-User Input (URL/Company Name)
-         │
-         ▼
-    ┌────────────┐
-    │ Xano Check │ ──── Company exists? ──── YES ──→ Fetch DB data
-    └────────────┘                │
-         │                        NO
-         │                        │
-         ▼                        ▼
-    ┌────────────┐         ┌─────────────┐
-    │ Detect     │         │ AI-only     │
-    │ Company    │         │ Mode        │
-    │ Type       │         └─────────────┘
-    └────────────┘
-         │
-    ┌────┴────┐
-    │         │
-    ▼         ▼
-STARTUP   ENTERPRISE
-queries   queries
-    │         │
-    └────┬────┘
-         │
-         ▼
-    ┌────────────┐
-    │ SerpAPI    │
-    │ Search     │
-    └────────────┘
-         │
-         ▼
-    ┌────────────┐
-    │ OpenRouter │
-    │ AI Extract │
-    └────────────┘
-         │
-         ▼
-    ┌────────────┐
-    │ Match AI   │
-    │ vs DB      │
-    └────────────┘
-         │
-         ▼
-    ┌────────────┐
-    │ Render UI  │
-    │ Side-by-   │
-    │ Side       │
-    └────────────┘
-```
+- Catalogs cached client-side; fetched once per session when possible.
+- `MAX_LOCATION_ID` removed—accept any numeric location id from Xano.
+- LLM prompt enforces minified JSON to reduce parse errors.
+- Scrapfly can fail on protected pages; fallback GET still runs; enrichment may be partial.
+- Counterparty DB check relies solely on website URL (or origin of announcement URL).
 

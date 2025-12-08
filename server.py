@@ -1,6 +1,9 @@
 import os
 import json
+import re
+from datetime import datetime
 from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -15,9 +18,11 @@ from searxng_analyzer import (
     generate_description,
     get_wikipedia_summary,
     get_top_management,
+    openrouter_chat,
 )
 
 import requests
+from bs4 import BeautifulSoup
 
 
 # ============================================================
@@ -26,6 +31,19 @@ import requests
 load_dotenv()
 
 XANO_BASE_URL = "https://xdil-abvj-o7rq.e2.xano.io"
+SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY", "").strip()
+
+# ============================================================
+# 🔹 FastAPI setup (placed early so routes can use `app`)
+# ============================================================
+app = FastAPI(title="SearXNG – Events UI (No Streamlit)")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
+static_dir = os.path.join(BASE_DIR, "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 # ============================================================
@@ -74,17 +92,478 @@ def get_corporate_events_by_company_id(company_id: int) -> List[dict]:
 
 
 # ============================================================
-# 🔹 FastAPI setup
+# 🔹 Text helpers
 # ============================================================
+def strip_marketing_phrases(text: str) -> str:
+    """
+    Remove boilerplate call-to-action phrases that models sometimes append,
+    like 'for more information visit company website'.
+    """
+    if not text:
+        return text
 
-app = FastAPI(title="SearXNG – Events UI (No Streamlit)")
+    patterns = [
+        r"\s*for more information[^.\n]*[.\n]?",
+        r"\s*for further information[^.\n]*[.\n]?",
+        r"\s*visit (the )?company website[^.\n]*[.\n]?",
+        r"\s*more information can be found on (their )?official website[^.\n]*[.\n]?",
+    ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+    cleaned = text
+    for pat in patterns:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
 
-static_dir = os.path.join(BASE_DIR, "static")
-if os.path.isdir(static_dir):
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+    return cleaned.strip()
+
+
+# ============================================================
+# 🔹 Utilities for lightweight page parsing
+# ============================================================
+DATE_PATTERNS = [
+    "%B %d, %Y",   # June 20, 2024
+    "%b %d, %Y",   # Jun 20, 2024
+    "%Y-%m-%d",    # 2024-06-20
+    "%d/%m/%Y",    # 20/06/2024
+    "%d.%m.%Y",    # 20.06.2024
+]
+
+
+def extract_first_date(text: str) -> str:
+    if not text:
+        return ""
+    # Try ISO-like first
+    iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    if iso_match:
+        return iso_match.group(1)
+
+    # Try "Month DD, YYYY"
+    month_match = re.search(r"\b([A-Z][a-z]+ \d{1,2}, \d{4})\b", text)
+    if month_match:
+        raw = month_match.group(1)
+        for pattern in DATE_PATTERNS:
+            try:
+                dt = datetime.strptime(raw, pattern)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+
+    # Try DD/MM/YYYY or DD.MM.YYYY
+    slash_match = re.search(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b", text)
+    if slash_match:
+        raw = slash_match.group(1)
+        for pattern in DATE_PATTERNS:
+            try:
+                dt = datetime.strptime(raw, pattern)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+
+    return ""
+
+
+def extract_investment_fields(text: str) -> Dict[str, Any]:
+    """
+    Heuristics to extract investment amount (millions), currency, and funding stage from text.
+    """
+    if not text:
+        return {}
+
+    amount_m = None
+    currency = None
+    funding_stage = None
+
+    # Common funding stages
+    stage_patterns = [
+        (r"\bseed\b", "Seed"),
+        (r"\bpre-?seed\b", "Pre-Seed"),
+        (r"\bseries\s*a\b", "Series A"),
+        (r"\bseries\s*b\b", "Series B"),
+        (r"\bseries\s*c\b", "Series C"),
+        (r"\bseries\s*d\b", "Series D"),
+        (r"\bgrowth\b", "Growth"),
+        (r"\blate\s*stage\b", "Late Stage"),
+    ]
+    lower = text.lower()
+    for pat, label in stage_patterns:
+        if re.search(pat, lower):
+            funding_stage = label
+            break
+
+    # Currency and amount
+    # Matches examples: $200 million, €50m, GBP 25 million, 25 million USD, $25.5m
+    amount_regex = re.compile(
+        r"(?P<currency>USD|EUR|GBP|CHF|CAD|AUD|SEK|NOK|DKK|INR|JPY|CNY|HKD|\$|€|£)\s?(?P<amt>\d+(?:[.,]\d+)?)(?:\s?(?P<scale>billion|bn|million|m|mm))",
+        re.IGNORECASE,
+    )
+    for match in amount_regex.finditer(text):
+        cur = match.group("currency")
+        amt = match.group("amt").replace(",", "")
+        scale = match.group("scale") or ""
+        try:
+            amt_val = float(amt)
+            scale_lower = scale.lower()
+            if scale_lower in ("billion", "bn"):
+                amt_val *= 1000.0
+            amount_m = amt_val
+            currency = cur
+            break
+        except Exception:
+            continue
+
+    # Normalize currency symbols
+    symbol_map = {"$": "USD", "€": "EUR", "£": "GBP"}
+    if currency in symbol_map:
+        currency = symbol_map[currency]
+
+    result = {}
+    if amount_m is not None:
+        result["investment_amount_m"] = amount_m
+    if currency:
+        result["investment_currency"] = currency
+    if funding_stage:
+        result["funding_stage"] = funding_stage
+    return result
+
+
+def fetch_html(url: str) -> Optional[str]:
+    """
+    Fetch HTML via direct GET with proper headers.
+    """
+    if not url:
+        print(f"[fetch_html] No URL provided")
+        return None
+    
+    # Standard browser-like headers to avoid bot blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    # Direct GET with proper headers
+    try:
+        print(f"[fetch_html] Fetching: {url[:100]}...")
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        print(f"[fetch_html] Response: {resp.status_code} ({len(resp.text)} chars)")
+        
+        if resp.ok:
+            return resp.text
+        else:
+            print(f"[fetch_html] HTTP error {resp.status_code} for {url}")
+            # Try without some headers as fallback
+            try:
+                resp2 = requests.get(url, timeout=10)
+                if resp2.ok:
+                    return resp2.text
+            except:
+                pass
+    except requests.exceptions.Timeout:
+        print(f"[fetch_html] Timeout for {url}")
+    except requests.exceptions.ConnectionError as e:
+        print(f"[fetch_html] Connection error for {url}: {e}")
+    except Exception as e:
+        print(f"[fetch_html] Error for {url}: {e}")
+    
+    return None
+
+
+def ai_extract_event_from_text(text: str, url: str) -> Dict[str, Any]:
+    """
+    Send page text to LLM to extract structured corporate event fields.
+    """
+    if not text:
+        return {}
+
+    prompt = f"""
+You are an information extractor. Extract ONE corporate event from the given announcement page text.
+Return ONLY minified JSON (no code fences, no trailing text) exactly like:
+{{"title":"","announcement_date":"","closed_date":"","deal_type":"","deal_status":"","long_description":"","investment_amount_m":null,"investment_currency":"","funding_stage":"","investment_amount_source":"","source_url":"","counterparties":[{{"name":"","role":"","website":"","linkedin":""}}]}}
+Rules:
+- Dates: use YYYY-MM-DD when you can; otherwise "".
+- Amount: millions of base currency (e.g., $200 million => 200).
+- Currency: ISO code (USD, EUR, GBP, CHF, etc.). Map $->USD, €->EUR, £->GBP.
+- If unknown, use "" for strings and null for numbers. Keep keys present.
+
+Announcement URL: {url}
+Page text (truncated):
+\"\"\"{text[:8000]}\"\"\"
+"""
+    raw = openrouter_chat("openai/gpt-4o-mini", prompt, "ai-extract-event")
+    if not raw:
+        return {}
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.replace("json", "", 1).strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as e:
+        print(f"[AI extract] JSON parse error: {e} / raw: {raw[:200]}")
+    return {}
+
+
+def enrich_ai_events_with_llm(events: List[dict], max_enrich: int = 5) -> List[dict]:
+    """
+    For each AI event that has a source URL, fetch the page (Scrapfly/direct) and
+    ask the LLM to extract structured fields. Merge into the event.
+    """
+    if not events:
+        return events
+
+    enriched = []
+    count = 0
+    for ev in events:
+        merged = dict(ev)
+        src = (
+            ev.get("Source URL")
+            or ev.get("source_url")
+            or ev.get("press_release_url")
+            or ev.get("announcement_url")
+            or ""
+        ).strip()
+
+        if src and count < max_enrich:
+            count += 1
+            try:
+                html = fetch_html(src, force_scrapfly=True)
+                if html:
+                    soup = BeautifulSoup(html, "html.parser")
+                    text = soup.get_text(" ", strip=True)
+                    ai = ai_extract_event_from_text(text, src)
+                    if ai:
+                        # Merge only if fields exist; prefer existing values
+                        merged.setdefault("source_url", src)
+                        merged.setdefault("Source URL", src)
+                        for k in [
+                            "title",
+                            "announcement_date",
+                            "closed_date",
+                            "deal_type",
+                            "deal_status",
+                            "long_description",
+                            "investment_amount_m",
+                            "investment_currency",
+                            "funding_stage",
+                            "investment_amount_source",
+                            "source_url",
+                        ]:
+                            v = ai.get(k)
+                            if v not in [None, ""]:
+                                # map title -> Event (short)
+                                if k == "title":
+                                    merged["Event (short)"] = merged.get("Event (short)", v) or v
+                                    merged["event_short"] = merged.get("event_short", v) or v
+                                else:
+                                    merged[k] = merged.get(k) or v
+                        # Counterparties could be merged later into UI; keep as payload
+                        if ai.get("counterparties"):
+                            merged["ai_counterparties"] = ai["counterparties"]
+            except Exception as e:
+                print(f"[AI enrich] failed for {src}: {e}")
+
+        enriched.append(merged)
+
+    return enriched
+
+
+def ai_enrich_single_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enrich a single event with evidence extraction.
+    """
+    source_url = (
+        event.get("source_url")
+        or event.get("Source URL")
+        or event.get("press_release_url")
+        or ""
+    ).strip()
+    title = event.get("title") or event.get("Event (short)") or event.get("event_short") or ""
+    company = event.get("company") or event.get("target_company") or ""
+    counterparties = event.get("counterparties") or []
+    if isinstance(counterparties, list):
+        cp_names = counterparties
+    else:
+        cp_names = []
+
+    if not source_url:
+        return {"error": "Missing source_url"}
+
+    html = fetch_html(source_url)
+    if not html:
+        return {"error": "Fetch failed"}
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    prompt = f"""
+You are an evidence extractor for a corporate event. Use only the provided page text.
+Return STRICT one-line JSON (no code fences) with keys:
+{{
+ "title": "",
+ "announcement_date": "",
+ "deal_type": "",
+ "deal_status": "",
+ "long_description": "",
+ "amount": null,
+ "currency": "",
+ "amount_status": "",
+ "amount_confidence": 0.0,
+ "amount_source_type": "",
+ "amount_source_url": "",
+ "stage": "",
+ "stage_status": "",
+ "parties": [{{"name":"","role":""}}],
+ "evidence_links": [],
+ "evidence_summary": "",
+ "enrichment_version": 1
+}}
+Rules:
+- Dates: YYYY-MM-DD when possible else "".
+- amount: millions (base currency). If undisclosed/not mentioned, set null and set amount_status accordingly.
+- amount_status: one of ["disclosed","undisclosed","not_mentioned"].
+- amount_confidence: 0..1; higher when explicitly stated.
+- amount_source_type: e.g., "company_pr","news","regulatory","unknown".
+- stage_status: "disclosed","undisclosed","not_mentioned".
+- parties: include target/investor/partner roles if evident.
+- evidence_links: up to 3 URLs found in page (absolute URLs).
+- Use empty strings for unknown strings; null for unknown numbers.
+
+Context:
+- Event title hint: {title}
+- Company: {company}
+- Counterparties: {", ".join(cp_names)}
+- Source URL: {source_url}
+
+Page text (truncated):
+\"\"\"{text[:9000]}\"\"\"
+"""
+
+    raw = openrouter_chat("openai/gpt-4o-mini", prompt, "ai-enrich-event")
+    if not raw:
+        return {"error": "LLM returned empty"}
+
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.replace("json", "", 1).strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            parsed.setdefault("enrichment_version", 1)
+            return parsed
+    except Exception as e:
+        print(f"[AI enrich] JSON parse error: {e} / raw: {raw[:200]}")
+        return {"error": "LLM parse error", "raw": raw[:200]}
+
+    return {"error": "Unexpected LLM format"}
+
+
+@app.post("/extract_event_meta", response_class=JSONResponse)
+async def extract_event_meta(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Fetch a page and try to extract a reasonable title, first date found, and long text.
+    Body: { "url": "https://example.com/press-release" }
+    """
+    url = (payload or {}).get("url", "").strip()
+    if not url:
+        print(f"[extract_event_meta] Missing URL in payload")
+        return JSONResponse({"error": "Missing url"}, status_code=400)
+
+    print(f"[extract_event_meta] Processing: {url}")
+    try:
+        html = fetch_html(url)
+        if not html:
+            print(f"[extract_event_meta] Fetch returned no HTML for: {url}")
+            return JSONResponse({"error": f"Could not fetch page: {url[:50]}..."}, status_code=400)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Title preference: h1 > title tag
+        title = ""
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            title = h1.get_text(" ", strip=True)
+        elif soup.title and soup.title.get_text(strip=True):
+            title = soup.title.get_text(" ", strip=True)
+        else:
+            og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "title"})
+            if og_title and og_title.get("content"):
+                title = og_title["content"].strip()
+            else:
+                h2 = soup.find("h2")
+                if h2 and h2.get_text(strip=True):
+                    title = h2.get_text(" ", strip=True)
+
+        # Collect text for date search
+        body_text = soup.get_text(" ", strip=True)
+        date_iso = extract_first_date(body_text)
+        inv_fields = extract_investment_fields(body_text)
+
+        # Long description: take first meaningful paragraphs
+        long_desc = ""
+        paras = soup.find_all("p")
+        collected = []
+        for p in paras:
+            txt = p.get_text(" ", strip=True)
+            if txt and len(txt) > 40:
+                collected.append(txt)
+            if len(" ".join(collected)) > 600:
+                break
+        if collected:
+            long_desc = "\n\n".join(collected)
+
+        return JSONResponse(
+            {
+                "title": title,
+                "announcement_date": date_iso,
+                "long_description": long_desc,
+                **inv_fields,
+            }
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/ai_extract_event_from_url", response_class=JSONResponse)
+async def ai_extract_event_from_url(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Fetch page (direct GET) and ask LLM to extract corporate event fields.
+    Body: { "url": "..." }
+    """
+    url = (payload or {}).get("url", "").strip()
+    if not url:
+        return JSONResponse({"error": "Missing url"}, status_code=400)
+
+    try:
+        html = fetch_html(url)
+        if not html:
+            return JSONResponse({"error": "Fetch failed"}, status_code=400)
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        ai_data = ai_extract_event_from_text(text, url)
+        return JSONResponse(ai_data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/enrich_event", response_class=JSONResponse)
+async def enrich_event(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Enrich a single corporate event with evidence extraction (Scrapfly if available + LLM).
+    Body: { "event": { ... } }
+    """
+    ev = (payload or {}).get("event") or {}
+    if not ev:
+        return JSONResponse({"error": "Missing event"}, status_code=400)
+    try:
+        enriched = ai_enrich_single_event(ev)
+        if "error" in enriched:
+            return JSONResponse(enriched, status_code=400)
+        return JSONResponse({"enriched_event": enriched})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ============================================================
@@ -254,9 +733,14 @@ async def refresh_db(payload: Dict[str, Any]) -> JSONResponse:
     # 3) DB management roles (key people from Xano)
     if db_company:
         try:
-            company_info = db_company.get("Company", db_company)
-            # Current management roles - fix typo: should be "Management_Roles_current" not "Managmant_Roles_current"
-            mgmt_current = company_info.get("Management_Roles_current") or company_info.get("Managmant_Roles_current") or []
+            # Check both root level (correct) and Company level (fallback) for management roles
+            mgmt_current = (
+                db_company.get("Managmant_Roles_current") or 
+                db_company.get("Management_Roles_current") or
+                db_company.get("Company", {}).get("Managmant_Roles_current") or
+                db_company.get("Company", {}).get("Management_Roles_current") or
+                []
+            )
             for role in mgmt_current:
                 # Extract job titles from job_titles_id array
                 job_titles = []
@@ -374,10 +858,76 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         "linkedin": "",
         "description": "",
     }
+    
+    # ========================================
+    # 🚀 PARALLEL AI TASKS - Run in parallel to save time
+    # ========================================
+    print(f"[AI] Starting parallel AI tasks for {query}...")
+    
+    # Helper functions for parallel execution
+    def task_overview():
+        """Generate company overview (summary + description)"""
+        try:
+            wiki_text = get_wikipedia_summary(query)
+            summary_md = generate_summary(query, text=wiki_text)
+            description_raw = generate_description(query, text=wiki_text, company_details=summary_md)
+            description = strip_marketing_phrases(description_raw)
+            return {"summary_md": summary_md, "description": description, "wiki_text": wiki_text}
+        except Exception as e:
+            print(f"[AI] Overview task error: {e}")
+            return {"summary_md": "", "description": "", "wiki_text": ""}
+    
+    def task_events():
+        """Generate corporate events"""
+        try:
+            return generate_corporate_events(query, max_events=20) or []
+        except Exception as e:
+            print(f"[AI] Events task error: {e}")
+            return []
+    
+    def task_management():
+        """Get top management"""
+        try:
+            mgmt_list, mgmt_text = get_top_management(query)
+            if mgmt_list and isinstance(mgmt_list, list):
+                return mgmt_list
+            return []
+        except Exception as e:
+            print(f"[AI] Management task error: {e}")
+            return []
+    
+    # Run all AI tasks in parallel
+    overview_result = {"summary_md": "", "description": "", "wiki_text": ""}
+    ai_events = []
+    top_management = []
+    
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_overview = executor.submit(task_overview)
+        future_events = executor.submit(task_events)
+        future_mgmt = executor.submit(task_management)
+        
+        # Collect results as they complete
+        for future in as_completed([future_overview, future_events, future_mgmt]):
+            try:
+                if future == future_overview:
+                    overview_result = future.result()
+                    print(f"[AI] ✅ Overview completed")
+                elif future == future_events:
+                    ai_events = future.result()
+                    print(f"[AI] ✅ Events completed ({len(ai_events)} found)")
+                elif future == future_mgmt:
+                    top_management = future.result()
+                    print(f"[AI] ✅ Management completed ({len(top_management)} found)")
+            except Exception as e:
+                print(f"[AI] Parallel task error: {e}")
+    
+    print(f"[AI] All parallel tasks completed")
+    
+    # Extract results from parallel execution
+    summary_md = overview_result.get("summary_md", "")
+    description = overview_result.get("description", "")
+    
     try:
-        wiki_text = get_wikipedia_summary(query)
-        summary_md = generate_summary(query, text=wiki_text)
-        description = generate_description(query, text=wiki_text, company_details=summary_md)
         
         print(f"[AI] Summary generated:\n{summary_md[:500]}...")
 
@@ -727,13 +1277,7 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         import traceback
         traceback.print_exc()
 
-    # 3) AI events (full capacity again – use richer query set in analyzer)
-    try:
-        # Allow analyzer to return up to 20 deals (its default)
-        ai_events = generate_corporate_events(query, max_events=20) or []
-    except Exception as e:
-        print(f"[AI] generate_corporate_events error: {e}")
-        ai_events = []
+    # 3) AI events - already fetched in parallel above
 
     # 4) Simple matching (same as Streamlit gap analysis, simplified)
     def normalize_text(text: str) -> str:
@@ -786,24 +1330,21 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
     else:
         missing_events = ai_events
 
-    # 4.5) Fetch Top Management
-    top_management = []
-    try:
-        print(f"[AI] Fetching top management for {query}...")
-        mgmt_list, mgmt_text = get_top_management(query)
-        if mgmt_list and isinstance(mgmt_list, list):
-            top_management = mgmt_list
-            print(f"[AI] Found {len(top_management)} executives")
-    except Exception as e:
-        print(f"[AI] get_top_management error: {e}")
+    # 4.5) Top Management - already fetched in parallel above
 
     # 5) DB management roles (key people from Xano)
+    # Note: Management roles are at ROOT level of db_company, not inside "Company"
     db_management = []
     if db_company:
         try:
-            company_info = db_company.get("Company", db_company)
-            # Current management roles - fix typo: should be "Management_Roles_current" not "Managmant_Roles_current"
-            mgmt_current = company_info.get("Management_Roles_current") or company_info.get("Managmant_Roles_current") or []
+            # Check both root level (correct) and Company level (fallback)
+            mgmt_current = (
+                db_company.get("Managmant_Roles_current") or 
+                db_company.get("Management_Roles_current") or
+                db_company.get("Company", {}).get("Managmant_Roles_current") or
+                db_company.get("Company", {}).get("Management_Roles_current") or
+                []
+            )
             for role in mgmt_current:
                 # Extract job titles from job_titles_id array
                 job_titles = []
@@ -826,8 +1367,14 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                     "individuals_id": role.get("individuals_id", 0),
                     "role_id": role.get("id", 0),
                 })
-            # Past management roles - fix typo: should be "Management_Roles_past" not "Managmant_Roles_past"
-            mgmt_past = company_info.get("Management_Roles_past") or company_info.get("Managmant_Roles_past") or []
+            # Past management roles - check root level first (correct), then Company level (fallback)
+            mgmt_past = (
+                db_company.get("Managmant_Roles_past") or 
+                db_company.get("Management_Roles_past") or
+                db_company.get("Company", {}).get("Managmant_Roles_past") or
+                db_company.get("Company", {}).get("Management_Roles_past") or
+                []
+            )
             for role in mgmt_past:
                 # Extract job titles from job_titles_id array
                 job_titles = []
