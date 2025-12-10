@@ -370,6 +370,98 @@ def serpapi_parallel_search(queries: list, api_key: str, num_results: int = 10) 
 # ============================================================
 # 🔹 Date Parsing & Validation
 # ============================================================
+def parse_date_flexible(date_str: str):
+    """
+    Parses a date string into a datetime object using multiple formats.
+    Returns None if parsing fails.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    
+    date_str = date_str.strip()
+    
+    # Common date formats to try
+    formats = [
+        "%Y-%m-%d",           # 2024-03-12
+        "%B %d, %Y",          # March 12, 2024
+        "%b %d, %Y",          # Mar 12, 2024
+        "%d %B %Y",           # 12 March 2024
+        "%d %b %Y",           # 12 Mar 2024
+        "%m/%d/%Y",           # 03/12/2024
+        "%d/%m/%Y",           # 12/03/2024
+        "%Y/%m/%d",           # 2024/03/12
+        "%B %Y",              # March 2024
+        "%b %Y",              # Mar 2024
+        "%Y",                 # 2024
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str.split("T")[0], fmt)
+        except:
+            continue
+    return None
+
+
+def validate_and_fix_event_dates(events: list) -> list:
+    """
+    Validates and fixes date logic issues in events:
+    1. Announcement date cannot be in the future
+    2. Closed date must be >= announcement date (if both exist)
+    3. If dates are swapped, fix them
+    """
+    from datetime import datetime
+    
+    today = datetime.now()
+    
+    for event in events:
+        ann_str = event.get("Announcement Date", "") or ""
+        closed_str = event.get("Closed Date", "") or ""
+        
+        ann_date = parse_date_flexible(ann_str)
+        closed_date = parse_date_flexible(closed_str)
+        
+        fixed = False
+        
+        # Rule 1: Announcement date cannot be in the future
+        if ann_date and ann_date > today:
+            print(f"   ⚠️ Future announcement date detected: {ann_str} - clearing")
+            event["Announcement Date"] = ""
+            ann_date = None
+            fixed = True
+        
+        # Rule 2: Closed date cannot be in the future
+        if closed_date and closed_date > today:
+            print(f"   ⚠️ Future closed date detected: {closed_str} - clearing")
+            event["Closed Date"] = ""
+            closed_date = None
+            fixed = True
+        
+        # Rule 3: If both dates exist, closed must be >= announcement
+        if ann_date and closed_date:
+            if closed_date < ann_date:
+                # Dates are swapped - fix them
+                print(f"   🔄 Swapped dates detected: Ann={ann_str}, Closed={closed_str} - fixing")
+                event["Announcement Date"] = closed_str
+                event["Closed Date"] = ann_str
+                fixed = True
+        
+        # Rule 4: If only closed date and no announcement, that's suspicious for "announced" events
+        # (Often the AI confuses article date with closed date)
+        if closed_date and not ann_date and event.get("Deal Status") != "Completed":
+            # Move closed_date to announcement_date if status isn't "Completed"
+            print(f"   🔄 Only closed date for non-completed deal - moving to announcement: {closed_str}")
+            event["Announcement Date"] = closed_str
+            event["Closed Date"] = ""
+            fixed = True
+        
+        if fixed:
+            event_short = event.get("Event (short)", "")[:50]
+            print(f"      → Fixed dates for: {event_short}...")
+    
+    return events
+
+
 def parse_date(date_str):
     """
     Parses a date string into a datetime object.
@@ -510,6 +602,68 @@ def search_linkedin_startpage(query: str) -> str:
         return ""
 
 
+def search_company_linkedin_startpage(query: str, clean_name: str = "", domain_hint: str = "") -> str:
+    """
+    Fallback: find a COMPANY LinkedIn page using Startpage (Google results proxy).
+    Looks for linkedin.com/company/ slugs and returns a normalized URL.
+    """
+    try:
+        import urllib.parse
+
+        encoded_query = urllib.parse.quote_plus(query)
+        search_url = f"https://www.startpage.com/sp/search?query={encoded_query}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+
+        response = requests.get(search_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            return ""
+
+        matches = re.findall(
+            r"linkedin\.com/(?:company|school)/([a-zA-Z0-9_-]+)",
+            response.text,
+            re.I,
+        )
+
+        if not matches:
+            return ""
+
+        name_words = set(clean_name.lower().split()) if clean_name else set()
+        domain_hint_clean = domain_hint.replace(".", "").replace("-", "").lower()
+        best_url = ""
+
+        seen = set()
+        for slug in matches:
+            slug_lower = slug.lower()
+            if slug_lower in seen:
+                continue
+            seen.add(slug_lower)
+
+            # Skip obvious non-company slugs
+            if slug_lower in {"company", "jobs", "pulse", "learning", "about"}:
+                continue
+
+            slug_words = set(slug_lower.replace("-", " ").replace("_", " ").split())
+            score = 0
+            if domain_hint_clean and domain_hint_clean in slug_lower.replace("-", ""):
+                score += 2
+            if name_words and len(name_words & slug_words) >= 1:
+                score += 1
+
+            normalized = f"https://www.linkedin.com/company/{slug_lower.strip('/')}/"
+            # Prefer a scored match; otherwise keep the first plausible URL
+            if score > 0:
+                return normalized
+            if not best_url:
+                best_url = normalized
+
+        return best_url
+    except Exception as e:
+        print(f"⚠️ Startpage company search error: {e}")
+        return ""
+
+
 def search_linkedin_profile(name: str, company_name: str, position: str = "") -> str:
     """
     Searches for a person's LinkedIn profile URL using REAL web search (Startpage).
@@ -597,6 +751,215 @@ def search_linkedin_profile_serpapi(name: str, company_name: str, position: str 
     return ""
 
 
+def search_company_website(company_name: str) -> str:
+    """
+    Search for a company's official website URL using SerpAPI.
+    Uses multiple query strategies for accuracy.
+    
+    Args:
+        company_name: The company name to search for
+        
+    Returns:
+        Company website URL if found, empty string otherwise
+    """
+    if not company_name or not SERPAPI_KEY:
+        return ""
+    
+    # Clean company name
+    clean_name = company_name.strip()
+    for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
+                   ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
+        if clean_name.endswith(suffix):
+            clean_name = clean_name[:-len(suffix)].strip()
+    
+    # Search queries ordered by specificity
+    search_queries = [
+        f'"{clean_name}" official website',
+        f'{clean_name} company website',
+        f'"{company_name}"',
+    ]
+    
+    for query in search_queries:
+        try:
+            params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+            search = GoogleSearch(params)
+            result = search.get_dict()
+            
+            if "error" in result:
+                print(f"   ⚠️ SerpAPI website search error: {result['error']}")
+                continue
+            
+            results = result.get("organic_results", [])
+            
+            for r in results:
+                link = r.get("link", "")
+                title = r.get("title", "").lower()
+                snippet = r.get("snippet", "").lower()
+                
+                # Skip social media, directories, news sites
+                skip_domains = ['linkedin.com', 'facebook.com', 'twitter.com', 'x.com', 
+                               'crunchbase.com', 'bloomberg.com', 'reuters.com', 'wikipedia.org',
+                               'zoominfo.com', 'dnb.com', 'glassdoor.com', 'indeed.com',
+                               'yelp.com', 'yellowpages.com', 'bbb.org', 'manta.com']
+                if any(domain in link.lower() for domain in skip_domains):
+                    continue
+                
+                # Check if company name appears in title or domain
+                name_lower = clean_name.lower()
+                name_words = set(name_lower.split())
+                
+                # Extract domain from URL
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(link)
+                    domain = parsed.netloc.lower().replace('www.', '')
+                    domain_name = domain.split('.')[0] if '.' in domain else domain
+                except:
+                    domain = ""
+                    domain_name = ""
+                
+                # Match criteria: name in title, or name words in domain
+                name_in_title = name_lower in title or any(word in title for word in name_words if len(word) > 3)
+                name_in_domain = any(word in domain_name for word in name_words if len(word) > 3)
+                
+                if name_in_title or name_in_domain:
+                    # Normalize URL
+                    if not link.startswith('http'):
+                        link = f"https://{link}"
+                    print(f"   🌐 Found website for {company_name}: {link}")
+                    return link
+                    
+        except Exception as e:
+            print(f"   ⚠️ SerpAPI website search error: {e}")
+            continue
+    
+    return ""
+
+
+def search_company_linkedin(company_name: str, website_url: str = "") -> str:
+    """
+    Search for a COMPANY's LinkedIn page using multiple queries via SerpAPI.
+    More accurate than AI guessing - uses real search results.
+    
+    Args:
+        company_name: The company name to search for
+        website_url: Optional company website to help narrow results
+        
+    Returns:
+        LinkedIn company URL if found, empty string otherwise
+    """
+    if not company_name and not website_url:
+        return ""
+    
+    serpapi_available = bool(SERPAPI_KEY)
+
+    # Clean company name - remove common suffixes for better matching
+    clean_name = (company_name or "").strip()
+    for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
+                   ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
+        if clean_name.endswith(suffix):
+            clean_name = clean_name[:-len(suffix)].strip()
+    
+    # Extract domain from website for additional matching
+    domain_hint = ""
+    url_for_domain = website_url or ""
+    # If the company name itself is a URL, use it to extract domain
+    if not url_for_domain and clean_name.startswith("http"):
+        url_for_domain = clean_name
+    if url_for_domain:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url_for_domain)
+            domain = parsed.netloc.replace("www.", "")
+            domain = domain.split('.')[0] if '.' in domain else domain
+            if domain and len(domain) > 2:
+                domain_hint = domain
+        except:
+            pass
+    
+    # Multiple search strategies - ordered by expected accuracy (SerpAPI first)
+    serpapi_queries = [
+        f'"{clean_name}" site:linkedin.com/company/',
+        f'"{clean_name}" {domain_hint} site:linkedin.com/company/' if domain_hint else None,
+        f'{clean_name} linkedin company page',
+        f'"{company_name}" linkedin',
+    ]
+    serpapi_queries = [q for q in serpapi_queries if q and serpapi_available]
+    
+    found_urls = []
+    
+    for query in serpapi_queries:
+        try:
+            params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+            search = GoogleSearch(params)
+            result = search.get_dict()
+            
+            if "error" in result:
+                print(f"   ⚠️ SerpAPI company LinkedIn search error: {result['error']}")
+                continue
+            
+            results = result.get("organic_results", [])
+            for r in results:
+                link = r.get("link", "")
+                title = r.get("title", "").lower()
+                
+                if "linkedin.com/company/" not in link:
+                    continue
+                
+                match = re.search(r'linkedin\.com/company/([a-zA-Z0-9_-]+)', link)
+                if not match:
+                    continue
+                
+                company_slug = match.group(1).lower()
+                
+                if company_slug in ['company', 'jobs', 'pulse', 'learning', 'about']:
+                    continue
+                
+                clean_name_lower = clean_name.lower()
+                name_words = set(clean_name_lower.split())
+                slug_words = set(company_slug.replace('-', ' ').replace('_', ' ').split())
+                
+                name_in_title = clean_name_lower in title
+                name_in_slug = any(word in company_slug for word in name_words if len(word) > 2)
+                slug_matches_name = len(name_words & slug_words) >= 1
+                
+                if name_in_title or name_in_slug or slug_matches_name:
+                    normalized_url = f"https://www.linkedin.com/company/{company_slug}/"
+                    if normalized_url not in found_urls:
+                        found_urls.append(normalized_url)
+                        print(f"   🔗 Found LinkedIn for {company_name}: {normalized_url}")
+                        return normalized_url
+                        
+        except Exception as e:
+            print(f"   ⚠️ SerpAPI company search error: {e}")
+            continue
+    
+    # Fallback: real web search (Startpage) using domain + linkedin as suggested
+    fallback_queries = []
+    if domain_hint:
+        fallback_queries.extend([
+            f"{domain_hint} linkedin",
+            f"{domain_hint} linkedin company",
+            f"{domain_hint}.com linkedin",
+        ])
+    if clean_name:
+        fallback_queries.append(f"{clean_name} linkedin")
+    if company_name:
+        fallback_queries.append(f"{company_name} linkedin")
+    
+    for query in fallback_queries:
+        url = search_company_linkedin_startpage(query, clean_name=clean_name, domain_hint=domain_hint)
+        if url:
+            print(f"   🔗 Startpage LinkedIn for {company_name}: {url}")
+            return url
+    
+    # If we found any URLs but none were high confidence, return the first one
+    if found_urls:
+        return found_urls[0]
+    
+    return ""
+
+
 def get_top_management(company_name, text=""):
     """
     Robustly extracts top management (CEO, CFO, etc.) from Wikipedia, LinkedIn, Crunchbase, or AI models.
@@ -658,7 +1021,19 @@ For EACH executive, provide:
 - position: Official title
   - status: "Current" or "Past"
 - location: City, State/Country (if known, else "")
-- current_employee_url: Full URL to the company's webpage that features/mentions this executive (e.g., https://company.com/team/john-smith, https://company.com/leadership, https://company.com/about/team). This is a page on the company's website, NOT LinkedIn. If not found, use empty string "".
+- current_employee_url: A DEDICATED page URL on the company's website for THIS SPECIFIC INDIVIDUAL. 
+  VALID examples (person's name in the URL):
+    - https://www.evercore.com/team/ed-banks/
+    - https://www.vsacapital.com/vsa-capital-team/andrew-raca
+    - https://company.com/people/john-smith
+    - https://company.com/leadership/jane-doe
+  INVALID (DO NOT USE - these are generic pages):
+    - https://company.com/about
+    - https://company.com/about-us  
+    - https://company.com/team (without person name)
+    - https://company.com/leadership (without person name)
+    - https://company.com/ (homepage)
+  If no dedicated individual page exists, use empty string "".
 - bio: Professional executive summary (3-5 sentences) in THIS EXACT STYLE:
 
 EXAMPLE BIO STYLE:
@@ -717,7 +1092,7 @@ For each person provide:
 - position: Official title
 - status: "Current"
 - location: Where they are based
-- current_employee_url: Full URL to company webpage featuring this executive (or "")
+- current_employee_url: ONLY a dedicated individual page URL (e.g., /team/john-smith, /people/jane-doe). Use "" if no dedicated page exists. Do NOT use generic pages like /about, /team, /leadership, or homepage.
 - bio: Brief professional background (1-2 sentences)
 
 Context: {text[:5000]}
@@ -757,6 +1132,80 @@ Return JSON array only:
     # =====================================================
     # 5️⃣ Clean & Deduplicate
     # =====================================================
+    
+    def is_valid_individual_page_url(url: str, person_name: str) -> bool:
+        """
+        Check if URL is a dedicated individual page (not a generic page).
+        Valid: URLs that contain the person's name or a slug derived from it.
+        Invalid: Generic pages like /about, /team, /leadership, homepage.
+        """
+        if not url or not url.startswith("http"):
+            return False
+        
+        url_lower = url.lower()
+        
+        # Extract URL path (remove domain)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = parsed.path.lower().rstrip('/')
+        except:
+            path = url_lower.split('/')[-1] if '/' in url_lower else ''
+        
+        # Generic page patterns to reject
+        generic_patterns = [
+            '/about', '/about-us', '/aboutus', '/about_us',
+            '/team', '/our-team', '/the-team', '/teams',
+            '/leadership', '/leadership-team', '/leaders',
+            '/management', '/management-team', '/executive-team',
+            '/executives', '/board', '/board-of-directors',
+            '/people', '/staff', '/company', '/corporate',
+        ]
+        
+        # Check if path is ONLY a generic pattern (no individual identifier after)
+        path_parts = path.split('/')
+        # Filter empty parts
+        path_parts = [p for p in path_parts if p]
+        
+        if not path_parts:
+            # Homepage
+            return False
+        
+        # If URL ends with just a generic term, reject it
+        # e.g., /about, /team, /leadership (without individual name)
+        if len(path_parts) == 1 and any(path_parts[0] == g.strip('/') for g in generic_patterns):
+            return False
+        
+        # If last path part is generic (without specific person), reject
+        last_part = path_parts[-1] if path_parts else ''
+        if last_part in ['about', 'about-us', 'team', 'our-team', 'leadership', 
+                         'management', 'people', 'staff', 'executives', 'board']:
+            return False
+        
+        # Check if person name (or slug) appears in URL
+        # Create name variants for matching
+        name_parts = person_name.lower().split()
+        first_name = name_parts[0] if name_parts else ''
+        last_name = name_parts[-1] if len(name_parts) > 1 else ''
+        name_slug = '-'.join(name_parts)  # john-smith
+        name_slug_underscore = '_'.join(name_parts)  # john_smith
+        
+        # Check if any name variant appears in URL
+        if first_name and last_name:
+            if last_name in url_lower or name_slug in url_lower or name_slug_underscore in url_lower:
+                return True
+            # Also check for variations like first-last or last-first
+            if f"{first_name}-{last_name}" in url_lower or f"{last_name}-{first_name}" in url_lower:
+                return True
+        
+        # If URL has more than 2 path parts and last part looks like a name slug (contains dash)
+        # e.g., /team/john-smith or /people/jane-doe
+        if len(path_parts) >= 2 and '-' in last_part and len(last_part) > 3:
+            return True
+        
+        # Default: reject if we can't confirm it's individual-specific
+        return False
+    
     clean_data = []
     seen = set()
     for m in management_results:
@@ -770,6 +1219,11 @@ Return JSON array only:
         
         if not name or not position:
             continue
+        
+        # Validate that current_employee_url is a dedicated individual page
+        if current_employee_url and not is_valid_individual_page_url(current_employee_url, name):
+            print(f"   ⚠️ Rejecting generic URL for {name}: {current_employee_url}")
+            current_employee_url = ""
         
         key = (name.lower(), position.lower())
         if key not in seen:
@@ -962,6 +1416,88 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
         except Exception as e:
             print(f"      ⚠️ Enrichment failed for '{event_short[:30]}...': {e}")
             continue
+    
+    # =====================================================
+    # Post-process: Find Website URLs and verify LinkedIn URLs
+    # AI often hallucinates URLs, so we verify/find with SerpAPI
+    # =====================================================
+    print(f"\n🔍 Finding counterparty website & LinkedIn URLs via search...")
+    for event in events:
+        counterparties = event.get("counterparties", [])
+        for cp in counterparties:
+            cp_name = cp.get("company_name", "")
+            cp_website = cp.get("company_website", "") or cp.get("company_url", "") or cp.get("website", "")
+            existing_linkedin = cp.get("company_linkedin_url", "")
+            
+            if not cp_name:
+                continue
+            
+            # ==========================================
+            # 1) Find Website URL if missing
+            # ==========================================
+            if not cp_website:
+                print(f"   → Searching website for: {cp_name}...")
+                found_website = search_company_website(cp_name)
+                if found_website:
+                    cp["company_website"] = found_website
+                    cp["company_url"] = found_website
+                    cp["website"] = found_website
+                    cp_website = found_website  # Use for LinkedIn search below
+                else:
+                    print(f"   ⚠️ No website found for {cp_name}")
+            
+            # ==========================================
+            # 2) Find/Verify LinkedIn URL
+            # ==========================================
+            needs_linkedin_search = False
+            if not existing_linkedin:
+                needs_linkedin_search = True
+            elif existing_linkedin:
+                # Check if the URL looks like it might be AI-generated (generic pattern)
+                # e.g., "linkedin.com/company/company-name" when name is "Company Name Inc."
+                slug = existing_linkedin.split('/company/')[-1].rstrip('/').lower() if '/company/' in existing_linkedin else ""
+                name_slug = cp_name.lower().replace(' ', '-').replace(',', '').replace('.', '').replace("'", '')
+                # If slug is suspiciously similar to a direct name conversion, verify it
+                if slug and (slug == name_slug or slug.replace('-', '') == name_slug.replace('-', '')):
+                    needs_linkedin_search = True
+            
+            if needs_linkedin_search:
+                print(f"   → Searching LinkedIn for: {cp_name}...")
+                real_linkedin = search_company_linkedin(cp_name, cp_website)
+                if real_linkedin:
+                    if existing_linkedin and existing_linkedin != real_linkedin:
+                        print(f"   ✅ Corrected LinkedIn: {existing_linkedin} → {real_linkedin}")
+                    else:
+                        print(f"   ✅ Found LinkedIn: {real_linkedin}")
+                    cp["company_linkedin_url"] = real_linkedin
+                elif not existing_linkedin:
+                    print(f"   ⚠️ No LinkedIn found for {cp_name}")
+            
+            # ==========================================
+            # 3) Find LinkedIn URLs for individuals in this counterparty
+            # ==========================================
+            individuals = cp.get("individuals", [])
+            if individuals:
+                print(f"   👤 Searching LinkedIn for {len(individuals)} individuals at {cp_name}...")
+                for ind in individuals:
+                    ind_name = ind.get("name", "")
+                    ind_title = ind.get("title", "")
+                    existing_ind_linkedin = ind.get("linkedin_url", "")
+                    
+                    if not ind_name:
+                        continue
+                    
+                    # Skip if already has a valid LinkedIn URL
+                    if existing_ind_linkedin and "linkedin.com/in/" in existing_ind_linkedin:
+                        continue
+                    
+                    # Search for this person's LinkedIn profile
+                    person_linkedin = search_linkedin_profile(ind_name, cp_name, ind_title)
+                    if person_linkedin:
+                        ind["linkedin_url"] = person_linkedin
+                        print(f"      ✅ Found LinkedIn for {ind_name}: {person_linkedin}")
+                    else:
+                        print(f"      ⚠️ No LinkedIn found for {ind_name}")
     
     return events
 
@@ -1606,6 +2142,10 @@ JSON:'''
         # SECOND PASS: Enrich counterparties with individuals using Perplexity
         print(f"   → Enriching counterparties with individuals...")
         result = enrich_counterparties_with_individuals(result, company_name)
+        
+        # Validate and fix date logic issues
+        print(f"\n📅 Validating event dates...")
+        result = validate_and_fix_event_dates(result)
         
         # Log counterparty summary
         total_counterparties = sum(len(e.get("counterparties", [])) for e in result)

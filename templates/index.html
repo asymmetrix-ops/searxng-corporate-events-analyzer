@@ -454,6 +454,19 @@
             <span id="xanoStatusText"></span>
           </div>
         </div>
+        <!-- Quick DB render by company ID (testing) -->
+        <div class="input-row" style="margin-top: 10px;">
+          <span class="chip">Test</span>
+          <input
+            id="testCompanyIdInput"
+            type="number"
+            placeholder="Enter company ID to render DB data"
+            style="max-width: 240px"
+          />
+          <button id="testDbRenderBtn" class="secondary" style="min-width: 160px;">
+            Render DB (ID)
+          </button>
+        </div>
       </section>
 
       <!-- Company Overview -->
@@ -584,6 +597,8 @@
       const mgmtMetaEl = document.getElementById("mgmtMeta");
       const dbManagementEl = document.getElementById("dbManagement");
       const dbMgmtMetaEl = document.getElementById("dbMgmtMeta");
+      const testDbRenderBtn = document.getElementById("testDbRenderBtn");
+      const testCompanyIdInput = document.getElementById("testCompanyIdInput");
 
       const XANO_BASE = "{{ xano_base_url }}";
 
@@ -928,6 +943,52 @@
             btn.style.display = "inline-block";
           }
         });
+      }
+
+      // Helper: Create an "open in new tab" button for URL fields
+      function createOpenBtn(inputOrGetter, label = "link") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.title = `Open ${label} in new tab`;
+        btn.textContent = "↗";
+        btn.style.padding = "2px 6px";
+        btn.style.fontSize = "10px";
+        btn.style.borderRadius = "4px";
+        btn.style.border = "1px solid rgba(148, 163, 184, 0.4)";
+        btn.style.background = "rgba(15, 23, 42, 0.8)";
+        btn.style.color = "#e5e7eb";
+        btn.style.cursor = "pointer";
+        btn.style.marginLeft = "4px";
+        btn.style.transition = "all 0.15s ease";
+        
+        btn.onmouseover = () => {
+          btn.style.background = "rgba(99, 102, 241, 0.2)";
+          btn.style.borderColor = "rgba(99, 102, 241, 0.5)";
+          btn.style.color = "#c7d2fe";
+        };
+        btn.onmouseout = () => {
+          btn.style.background = "rgba(15, 23, 42, 0.8)";
+          btn.style.borderColor = "rgba(148, 163, 184, 0.4)";
+          btn.style.color = "#e5e7eb";
+        };
+        btn.onclick = () => {
+          // inputOrGetter can be an input element, an ID string, or a function that returns the URL
+          let url = "";
+          if (typeof inputOrGetter === "function") {
+            url = inputOrGetter();
+          } else if (typeof inputOrGetter === "string") {
+            const el = document.getElementById(inputOrGetter);
+            url = el ? el.value.trim() : "";
+          } else if (inputOrGetter && inputOrGetter.value !== undefined) {
+            url = inputOrGetter.value.trim();
+          }
+          
+          if (url) {
+            const finalUrl = url.startsWith("http://") || url.startsWith("https://") ? url : `https://${url}`;
+            window.open(finalUrl, "_blank", "noopener,noreferrer");
+          }
+        };
+        return btn;
       }
 
       // Helper: Create a save button for a field (only for existing companies)
@@ -1283,6 +1344,8 @@
             btn.style.display = "none";
           }
         });
+        // Also show individual save buttons
+        showIndividualSaveButtons();
       }
       
       // Function to update Xano status badge
@@ -1679,7 +1742,16 @@
       }
 
       // Create new counterparty API function
-      async function createCounterpartyInDb(corporateEventId, companyName, counterpartyTypeId, button, pressReleaseUrl = "", websiteUrl = "") {
+      // companyIdOverride (optional) = explicit counterparty company_id from DB if we already know it
+      async function createCounterpartyInDb(
+        corporateEventId,
+        companyName,
+        counterpartyTypeId,
+        button,
+        pressReleaseUrl = "",
+        websiteUrl = "",
+        companyIdOverride = null
+      ) {
         button.disabled = true;
         const originalText = button.textContent;
         button.textContent = "⏳";
@@ -1687,16 +1759,19 @@
         log(`Creating counterparty "${companyName}" for event ${corporateEventId}...`, "warn");
         
         try {
-          // Use the company ID from the current company being analyzed
-          const companyId = window._companyId || 0;
+          // Use explicit counterparty company_id if provided (from check_counterpaty),
+          // otherwise 0 so Xano can create/link a new company from company_name.
+          const companyId = companyIdOverride || 0;
           
           if (!companyId) {
-            log("⚠️ Warning: No company_id available. Make sure company exists in DB first.", "warn");
+            log("ℹ️ No existing counterparty company_id – Xano will create/resolve company from name", "info");
+          } else {
+            log(`ℹ️ Using existing counterparty company_id: ${companyId}`, "info");
           }
           
           const payload = {
             corporate_event_id: corporateEventId,
-            company_id: companyId,  // Use the current company ID
+            company_id: companyId,  // Counterparty's company ID (if known)
             counterparty_type_id: counterpartyTypeId || 17,  // Default to "Target"
             press_release_url: pressReleaseUrl || "",
             company_url: websiteUrl || "",
@@ -1707,7 +1782,6 @@
           // Clean payload: convert 0 and "" to null
           const cleanedPayload = cleanPayloadKeepRequired(payload, ['corporate_event_id', 'company_name']);
           
-          log(`Using company_id: ${companyId} (window._companyId: ${window._companyId})`, "info");
           log(`POST ${XANO_BASE}/api:8Bv5PK4I/create_counterparty`, "info");
           log(`Payload (cleaned): ${JSON.stringify(cleanedPayload)}`, "info");
           
@@ -2049,6 +2123,47 @@
       }
 
       /**
+       * Strip common company suffixes for cleaner display
+       */
+      function cleanCompanyName(name) {
+        if (!name) return name;
+        // Suffixes to remove (case-insensitive, with optional punctuation)
+        const suffixes = [
+          /,?\s*Inc\.?$/i,
+          /,?\s*Incorporated$/i,
+          /,?\s*Corp\.?$/i,
+          /,?\s*Corporation$/i,
+          /,?\s*Ltd\.?$/i,
+          /,?\s*Limited$/i,
+          /,?\s*LLC$/i,
+          /,?\s*L\.L\.C\.?$/i,
+          /,?\s*LLP$/i,
+          /,?\s*L\.L\.P\.?$/i,
+          /,?\s*PLC$/i,
+          /,?\s*P\.L\.C\.?$/i,
+          /,?\s*Co\.?$/i,
+          /,?\s*Company$/i,
+          /,?\s*& Co\.?$/i,
+          /,?\s*S\.A\.?$/i,
+          /,?\s*SA$/i,
+          /,?\s*N\.V\.?$/i,
+          /,?\s*NV$/i,
+          /,?\s*GmbH$/i,
+          /,?\s*AG$/i,
+          /,?\s*SE$/i,
+          /,?\s*B\.V\.?$/i,
+          /,?\s*BV$/i,
+          /,?\s*Pty\.?\s*Ltd\.?$/i,
+          /,?\s*Pte\.?\s*Ltd\.?$/i,
+        ];
+        let cleaned = name.trim();
+        for (const suffix of suffixes) {
+          cleaned = cleaned.replace(suffix, '');
+        }
+        return cleaned.trim();
+      }
+
+      /**
        * Clean payload before sending to API:
        * - Convert 0 to null (for numeric fields)
        * - Convert "" to null (for string fields)
@@ -2125,17 +2240,262 @@
         window._dbOverviewData = null;
       }
 
-      function renderAIOverview(data) {
-        aiOverviewEl.innerHTML = "";
-        // Store AI overview data for later use (e.g., in createCompanyInDb)
-        window._aiOverviewData = data;
-        if (!data) {
-          aiOverviewEl.innerHTML =
-            '<div class="empty-state">No AI overview available.</div>';
-          aiOverviewMeta.textContent = "No data";
+      // Fetch richer DB overview from Xano company_overview endpoint (new API)
+      // Normalize a year value that can be number, string, JSON string, or object {id, year}
+      function normalizeYear(val) {
+        if (!val && val !== 0) return "";
+        // Already a string year
+        if (typeof val === "string") {
+          // Try to parse JSON if it looks like an object string
+          const trimmed = val.trim();
+          if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              return normalizeYear(parsed);
+            } catch {
+              // fall through to numeric parse below
+            }
+          }
+          const num = parseInt(trimmed, 10);
+          if (!Number.isNaN(num) && num > 1800 && num < 3000) return String(num);
+          return trimmed; // return raw if not numeric
+        }
+        // Number year
+        if (typeof val === "number") {
+          if (val > 1800 && val < 3000) return String(val);
+          return "";
+        }
+        // Object with year/id
+        if (typeof val === "object") {
+          const maybeYear = val.year || val.Year || val.value || "";
+          if (maybeYear) return normalizeYear(maybeYear);
+          if (typeof val.id !== "undefined") return normalizeYear(val.id);
+        }
+        return "";
+      }
+
+      async function fetchDbOverviewFromApi(companyId) {
+        if (!companyId) return null;
+        try {
+          const url = `https://xdil-abvj-o7rq.e2.xano.io/api:8Bv5PK4I/company_overview?company_id=${companyId}`;
+          const res = await fetch(url);
+          if (!res.ok) {
+            log(`⚠️ company_overview API error: ${res.status}`, "warn");
+            return null;
+          }
+          const json = await res.json();
+          if (!Array.isArray(json) || !json.length) return null;
+          const row = json[0] || {};
+
+          const parseMaybeJson = (val) => {
+            if (!val || typeof val !== "string") return val;
+            try {
+              return JSON.parse(val);
+            } catch {
+              return val;
+            }
+          };
+
+          const bf = parseMaybeJson(row.business_focus) || [];
+          const sectors = parseMaybeJson(row.sectors) || [];
+          const ownershipObj = parseMaybeJson(row.ownership_type) || row.ownership_type || "";
+          const yearObj = parseMaybeJson(row.year_founded) || row.year_founded || "";
+
+          const ownershipVal =
+            typeof ownershipObj === "object" ? (ownershipObj.name || "") : ownershipObj || "";
+
+          const yearVal = normalizeYear(yearObj);
+
+          return {
+            name: row.name || "",
+            city: row.city || "",
+            country: row.country || "",
+            state_province: row.state_province || "",
+            primary_business_focus: Array.isArray(bf) && bf.length ? (bf[0].name || bf[0].business_focus || "") : "",
+            primary_business_focus_id: Array.isArray(bf) && bf.length ? (bf[0].id || 0) : 0,
+            business_focuses: Array.isArray(bf) ? bf : [],
+            sectors: Array.isArray(sectors) ? sectors : [],
+            ownership: ownershipVal,
+            year_founded: yearVal,
+            webpage_monitored: row.press_page_url || "",
+            website: row.website_url || "",
+            linkedin: row.linkedin_url || "",
+            description: row.description || "",
+          };
+        } catch (err) {
+          log(`⚠️ company_overview fetch failed: ${err.message}`, "warn");
+          return null;
+        }
+      }
+
+      // Fetch individuals/management from Xano company_individuals endpoint
+      async function fetchDbIndividualsFromApi(companyId) {
+        if (!companyId) return null;
+        try {
+          const url = `https://xdil-abvj-o7rq.e2.xano.io/api:8Bv5PK4I/company_individuals?company_id=${companyId}`;
+          const res = await fetch(url);
+          if (!res.ok) {
+            log(`⚠️ company_individuals API error: ${res.status}`, "warn");
+            return null;
+          }
+          const json = await res.json();
+          if (!Array.isArray(json) || !json.length) return [];
+
+          const parseMaybeJson = (val) => {
+            if (!val || typeof val !== "string") return val;
+            try {
+              return JSON.parse(val);
+            } catch {
+              return val;
+            }
+          };
+
+          return json.map((row) => {
+            const jobTitles = parseMaybeJson(row.job_titles) || [];
+            const location = parseMaybeJson(row.location) || {};
+            return {
+              Individual_text: row.name || "",
+              name: row.name || "",
+              position: (jobTitles[0] && (jobTitles[0].title || jobTitles[0].job_title)) || "",
+              job_titles_id: jobTitles.map((jt) => ({
+                job_title: jt.title || jt.job_title || "",
+                id: jt.id || 0,
+              })),
+              Status: row.status || "Current",
+              linkedin_url: row.linkedin_url || "",
+              current_employee_url: row.current_employer_url || "",
+              individuals_id: row.individual_id || 0,
+              role_id: row.role_id || 0,
+              location: location.city || location.country ? `${location.city || ""}${location.city && location.country ? ", " : ""}${location.country || ""}` : "",
+              bio: row.bio || "",
+            };
+          });
+        } catch (err) {
+          log(`⚠️ company_individuals fetch failed: ${err.message}`, "warn");
+          return null;
+        }
+      }
+
+      // Fetch events from Xano company_events endpoint
+      async function fetchDbEventsFromApi(companyId) {
+        if (!companyId) return null;
+        try {
+          const url = `https://xdil-abvj-o7rq.e2.xano.io/api:8Bv5PK4I/company_events?company_id=${companyId}`;
+          const res = await fetch(url);
+          if (!res.ok) {
+            log(`⚠️ company_events API error: ${res.status}`, "warn");
+            return null;
+          }
+          const json = await res.json();
+          if (!Array.isArray(json) || !json.length) return [];
+
+          const parseMaybeJson = (val) => {
+            if (!val || typeof val !== "string") return val;
+            try {
+              return JSON.parse(val);
+            } catch {
+              return val;
+            }
+          };
+
+          return json.map((ev) => {
+            const investment = parseMaybeJson(ev.investment_data) || {};
+            const evData = parseMaybeJson(ev.ev_data) || {};
+            const dealTerms = parseMaybeJson(ev.deal_terms_data) || {};
+            const cps = parseMaybeJson(ev.counterparties) || [];
+
+            // Map counterparties to expected shape (other_counterparties bucket)
+            const mappedCps = (Array.isArray(cps) ? cps : []).map((cp) => ({
+              name: cp.company_name || "",
+              counterparty_status: cp.type || "",
+              url: cp.website || "",
+              company_url: cp.website || "",
+              website: cp.website || "",
+              counterparty_announcement_url: cp.announcement_url || "",
+              linkedin_url: cp.linkedin_url || "",
+              individuals: (cp.individuals || []).map((ind) => ({
+                name: ind.name || "",
+                job_title: (ind.job_titles && ind.job_titles[0]) || "",
+                title: (ind.job_titles && ind.job_titles[0]) || "",
+                linkedin_url: ind.linkedin_url || "",
+              })),
+            }));
+
+            return {
+              id: ev.event_id || ev.id || 0,
+              announcement_date: ev.announcement_date || "",
+              closed_date: ev.closed_date || "",
+              deal_type: ev.deal_type || "",
+              deal_status: ev.deal_status || "",
+              description: ev.description || "",
+              long_description: ev.long_description || "",
+              ev_display: evData.enterprise_value_m || "",
+              investment_display: investment.investment_amount_m || "",
+              investment_currency: investment.currency_id || "",
+              investment_stage: investment.Funding_stage || "",
+              investment_amount_source: investment.investment_amount_source || "",
+              other_counterparties: mappedCps,
+            };
+          });
+        } catch (err) {
+          log(`⚠️ company_events fetch failed: ${err.message}`, "warn");
+          return null;
+        }
+      }
+
+      // Testing helper: render DB sections by company ID without AI run
+      async function testRenderDbById() {
+        const idVal = (testCompanyIdInput?.value || "").trim();
+        const companyId = parseInt(idVal, 10);
+        if (!companyId) {
+          alert("Enter a valid company ID.");
           return;
         }
-        aiOverviewMeta.textContent = "Editable";
+        log(`🧪 Rendering DB by ID ${companyId} (test mode)`, "info");
+        setStatus("Loading DB (test)…", "info");
+        dbMetaEl.textContent = "Loading…";
+
+        window._dbCompanyId = companyId;
+        window._companyId = companyId;
+
+        const [overview, management, events] = await Promise.all([
+          fetchDbOverviewFromApi(companyId),
+          fetchDbIndividualsFromApi(companyId),
+          fetchDbEventsFromApi(companyId),
+        ]);
+
+        renderDBOverview(overview || null);
+        renderDBManagement(management || []);
+        renderDBEvents(events || []);
+
+        dbMetaEl.textContent = `Company ID ${companyId} (test)`;
+        setStatus("Done", "ok");
+      }
+
+      function renderOverviewCommon({
+        data,
+        targetEl,
+        metaEl,
+        mode = "ai", // "ai" | "db"
+      }) {
+        targetEl.innerHTML = "";
+        const isAI = mode === "ai";
+
+        if (!data) {
+          targetEl.innerHTML =
+            '<div class="empty-state">No overview available.</div>';
+          metaEl.textContent = "No data";
+          return;
+        }
+
+        // AI-side state
+        if (isAI) {
+          window._aiOverviewData = data;
+          metaEl.textContent = "Editable";
+        } else {
+          window._dbOverviewData = data;
+          metaEl.textContent = "Loaded from Xano";
+        }
 
         const card = document.createElement("div");
         card.className = "event-card";
@@ -2149,7 +2509,7 @@
         const nameInput = document.createElement("input");
         nameInput.type = "text";
         nameInput.id = "ai_name";
-        nameInput.value = data.name || "";
+        nameInput.value = cleanCompanyName(data.name) || "";
         nameInput.placeholder = "Company name";
         nameInput.style.flex = "1";
         nameInput.style.padding = "5px 8px";
@@ -2160,8 +2520,10 @@
         nameInput.style.fontSize = "13px";
 
         rowName.appendChild(nameInput);
-        rowName.appendChild(createCopyBtn("ai_name", "name", "Name"));
-        rowName.appendChild(createSaveBtn("ai_name", "name", "Name"));
+        if (isAI) {
+          rowName.appendChild(createCopyBtn("ai_name", "name", "Name"));
+          rowName.appendChild(createSaveBtn("ai_name", "name", "Name"));
+        }
 
         const rowLoc = document.createElement("div");
         rowLoc.style.display = "flex";
@@ -2195,9 +2557,9 @@
         countryInput.style.fontSize = "11px";
 
         rowLoc.appendChild(cityInput);
-        rowLoc.appendChild(createCopyBtn("ai_city", "city", "City"));
+        if (isAI) rowLoc.appendChild(createCopyBtn("ai_city", "city", "City"));
         rowLoc.appendChild(countryInput);
-        rowLoc.appendChild(createCopyBtn("ai_country", "country", "Country"));
+        if (isAI) rowLoc.appendChild(createCopyBtn("ai_country", "country", "Country"));
         
         // Single save button for location (looks up location_id first)
         const saveLocBtn = document.createElement("button");
@@ -2213,89 +2575,91 @@
         saveLocBtn.style.cursor = "pointer";
         saveLocBtn.style.marginLeft = "8px";
         saveLocBtn.style.transition = "all 0.15s ease";
-        saveLocBtn.style.display = "none";
+        saveLocBtn.style.display = isAI ? "none" : "none";
         saveLocBtn.className = "save-to-db-btn";
         
-        saveLocBtn.onmouseover = () => {
-          saveLocBtn.style.background = "rgba(16, 185, 129, 0.25)";
-          saveLocBtn.style.borderColor = "rgba(16, 185, 129, 0.5)";
-        };
-        saveLocBtn.onmouseout = () => {
-          saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
-          saveLocBtn.style.borderColor = "rgba(16, 185, 129, 0.3)";
-        };
-        
-        saveLocBtn.onclick = async () => {
-          if (!window._dbCompanyId) {
-            log("No company ID - cannot save", "err");
-            return;
-          }
+        if (isAI) {
+          saveLocBtn.onmouseover = () => {
+            saveLocBtn.style.background = "rgba(16, 185, 129, 0.25)";
+            saveLocBtn.style.borderColor = "rgba(16, 185, 129, 0.5)";
+          };
+          saveLocBtn.onmouseout = () => {
+            saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
+            saveLocBtn.style.borderColor = "rgba(16, 185, 129, 0.3)";
+          };
           
-          const city = cityInput.value.trim();
-          const country = countryInput.value.trim();
-          
-          if (!city && !country) {
-            log("No city or country to save", "warn");
-            return;
-          }
-          
-          saveLocBtn.innerHTML = "⏳";
-          saveLocBtn.disabled = true;
-          
-          try {
-            // Step 1: Lookup location_id using global function
-            const locationId = await window.lookupLocation(city, country);
+          saveLocBtn.onclick = async () => {
+            if (!window._dbCompanyId) {
+              log("No company ID - cannot save", "err");
+              return;
+            }
             
-            // Step 2: Save locations_id to company
-            const response = await fetch(
-              `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
-              {
-                method: "PATCH",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  new_company_id: window._dbCompanyId,
-                  updates: {
-                    locations_id: locationId
-                  }
-                })
-              }
-            );
+            const city = cityInput.value.trim();
+            const country = countryInput.value.trim();
             
-            const result = await response.json();
+            if (!city && !country) {
+              log("No city or country to save", "warn");
+              return;
+            }
             
-            if (response.ok && result.success) {
-              saveLocBtn.innerHTML = "✅";
-              saveLocBtn.style.background = "rgba(16, 185, 129, 0.3)";
-              log(`✅ Saved location (ID: ${locationId}): ${city}, ${country}`, "ok");
+            saveLocBtn.innerHTML = "⏳";
+            saveLocBtn.disabled = true;
+            
+            try {
+              // Step 1: Lookup location_id using global function
+              const locationId = await window.lookupLocation(city, country);
               
-              setTimeout(() => {
-                saveLocBtn.innerHTML = "💾 Save Location";
-                saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                saveLocBtn.disabled = false;
-              }, 2000);
-            } else {
+              // Step 2: Save locations_id to company
+              const response = await fetch(
+                `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    new_company_id: window._dbCompanyId,
+                    updates: {
+                      locations_id: locationId
+                    }
+                  })
+                }
+              );
+              
+              const result = await response.json();
+              
+              if (response.ok && result.success) {
+                saveLocBtn.innerHTML = "✅";
+                saveLocBtn.style.background = "rgba(16, 185, 129, 0.3)";
+                log(`✅ Saved location (ID: ${locationId}): ${city}, ${country}`, "ok");
+                
+                setTimeout(() => {
+                  saveLocBtn.innerHTML = "💾 Save Location";
+                  saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveLocBtn.disabled = false;
+                }, 2000);
+              } else {
+                saveLocBtn.innerHTML = "❌";
+                saveLocBtn.style.background = "rgba(239, 68, 68, 0.2)";
+                log(`❌ Failed to save location: ${result.message || "Unknown error"}`, "err");
+                setTimeout(() => {
+                  saveLocBtn.innerHTML = "💾 Save Location";
+                  saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveLocBtn.disabled = false;
+                }, 2000);
+              }
+            } catch (err) {
               saveLocBtn.innerHTML = "❌";
               saveLocBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              log(`❌ Failed to save location: ${result.message || "Unknown error"}`, "err");
+              log(`❌ Error saving location: ${err.message}`, "err");
               setTimeout(() => {
                 saveLocBtn.innerHTML = "💾 Save Location";
                 saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
                 saveLocBtn.disabled = false;
               }, 2000);
             }
-          } catch (err) {
-            saveLocBtn.innerHTML = "❌";
-            saveLocBtn.style.background = "rgba(239, 68, 68, 0.2)";
-            log(`❌ Error saving location: ${err.message}`, "err");
-            setTimeout(() => {
-              saveLocBtn.innerHTML = "💾 Save Location";
-              saveLocBtn.style.background = "rgba(16, 185, 129, 0.1)";
-              saveLocBtn.disabled = false;
-            }, 2000);
-          }
-        };
-        
-        rowLoc.appendChild(saveLocBtn);
+          };
+          
+          rowLoc.appendChild(saveLocBtn);
+        }
 
         // Business Focus row (multiple dropdowns like sectors)
         const rowBusinessFocus = document.createElement("div");
@@ -2343,6 +2707,10 @@
         businessFocusHeader.appendChild(businessFocusLabel);
         businessFocusHeader.appendChild(addBusinessFocusBtn);
         businessFocusHeader.appendChild(saveBusinessFocusBtn);
+        if (!isAI) {
+          addBusinessFocusBtn.style.display = "none";
+          saveBusinessFocusBtn.style.display = "none";
+        }
         rowBusinessFocus.appendChild(businessFocusHeader);
 
         const businessFocusContainer = document.createElement("div");
@@ -2408,7 +2776,11 @@
           };
 
           row.appendChild(select);
-          row.appendChild(removeBtn);
+          if (isAI) {
+            row.appendChild(removeBtn);
+          } else {
+            removeBtn.style.display = "none";
+          }
           businessFocusContainer.appendChild(row);
         };
 
@@ -2441,91 +2813,93 @@
           }
         };
 
-        addBusinessFocusBtn.onclick = async () => {
-          const options = await fetchBusinessFocusOptions();
-          createBusinessFocusSelectRow(options, "", "");
-        };
+        if (isAI) {
+          addBusinessFocusBtn.onclick = async () => {
+            const options = await fetchBusinessFocusOptions();
+            createBusinessFocusSelectRow(options, "", "");
+          };
 
-        saveBusinessFocusBtn.onclick = async () => {
-          if (!window._dbCompanyId) {
-            log("No company ID - cannot save business focuses", "err");
-            return;
-          }
-
-          saveBusinessFocusBtn.innerHTML = "⏳";
-          saveBusinessFocusBtn.disabled = true;
-
-          try {
-            const selects = Array.from(businessFocusContainer.querySelectorAll("select.business-focus-select"));
-            const focusSet = new Set();
-
-            for (const sel of selects) {
-              const val = parseInt(sel.value, 10);
-              if (!isNaN(val) && val > 0) {
-                focusSet.add(val);
-              }
-            }
-
-            const focusIds = Array.from(focusSet);
-            if (focusIds.length === 0) {
-              log("❌ No business focus selected to save", "err");
-              saveBusinessFocusBtn.innerHTML = "❌";
-              saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              setTimeout(() => {
-                saveBusinessFocusBtn.innerHTML = "💾 Save";
-                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                saveBusinessFocusBtn.disabled = false;
-              }, 1600);
+          saveBusinessFocusBtn.onclick = async () => {
+            if (!window._dbCompanyId) {
+              log("No company ID - cannot save business focuses", "err");
               return;
             }
 
-            log(`Saving primary_business_focus_id: [${focusIds.join(", ")}]`, "info");
+            saveBusinessFocusBtn.innerHTML = "⏳";
+            saveBusinessFocusBtn.disabled = true;
 
-            const response = await fetch(
-              `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
-              {
-                method: "PATCH",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  new_company_id: window._dbCompanyId,
-                  updates: { primary_business_focus_id: focusIds },
-                }),
+            try {
+              const selects = Array.from(businessFocusContainer.querySelectorAll("select.business-focus-select"));
+              const focusSet = new Set();
+
+              for (const sel of selects) {
+                const val = parseInt(sel.value, 10);
+                if (!isNaN(val) && val > 0) {
+                  focusSet.add(val);
+                }
               }
-            );
 
-            const result = await response.json();
+              const focusIds = Array.from(focusSet);
+              if (focusIds.length === 0) {
+                log("❌ No business focus selected to save", "err");
+                saveBusinessFocusBtn.innerHTML = "❌";
+                saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
+                setTimeout(() => {
+                  saveBusinessFocusBtn.innerHTML = "💾 Save";
+                  saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveBusinessFocusBtn.disabled = false;
+                }, 1600);
+                return;
+              }
 
-            if (response.ok && result.success) {
-              saveBusinessFocusBtn.innerHTML = "✅";
-              saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.3)";
-              log(`✅ Saved ${focusIds.length} business focus(es) to DB`, "ok");
-              await refreshXanoData();
-              setTimeout(() => {
-                saveBusinessFocusBtn.innerHTML = "💾 Save";
-                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                saveBusinessFocusBtn.disabled = false;
-              }, 1800);
-            } else {
+              log(`Saving primary_business_focus_id: [${focusIds.join(", ")}]`, "info");
+
+              const response = await fetch(
+                `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    new_company_id: window._dbCompanyId,
+                    updates: { primary_business_focus_id: focusIds },
+                  }),
+                }
+              );
+
+              const result = await response.json();
+
+              if (response.ok && result.success) {
+                saveBusinessFocusBtn.innerHTML = "✅";
+                saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.3)";
+                log(`✅ Saved ${focusIds.length} business focus(es) to DB`, "ok");
+                await refreshXanoData();
+                setTimeout(() => {
+                  saveBusinessFocusBtn.innerHTML = "💾 Save";
+                  saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveBusinessFocusBtn.disabled = false;
+                }, 1800);
+              } else {
+                saveBusinessFocusBtn.innerHTML = "❌";
+                saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
+                log(`❌ Failed to save business focuses: ${result.message || "Unknown error"}`, "err");
+                setTimeout(() => {
+                  saveBusinessFocusBtn.innerHTML = "💾 Save";
+                  saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveBusinessFocusBtn.disabled = false;
+                }, 1800);
+              }
+            } catch (err) {
               saveBusinessFocusBtn.innerHTML = "❌";
               saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              log(`❌ Failed to save business focuses: ${result.message || "Unknown error"}`, "err");
+              log(`❌ Error saving business focuses: ${err.message}`, "err");
               setTimeout(() => {
                 saveBusinessFocusBtn.innerHTML = "💾 Save";
                 saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
                 saveBusinessFocusBtn.disabled = false;
               }, 1800);
             }
-          } catch (err) {
-            saveBusinessFocusBtn.innerHTML = "❌";
-            saveBusinessFocusBtn.style.background = "rgba(239, 68, 68, 0.2)";
-            log(`❌ Error saving business focuses: ${err.message}`, "err");
-            setTimeout(() => {
-              saveBusinessFocusBtn.innerHTML = "💾 Save";
-              saveBusinessFocusBtn.style.background = "rgba(16, 185, 129, 0.1)";
-              saveBusinessFocusBtn.disabled = false;
-            }, 1800);
-          }
-        };
+          };
+        }
 
         populateBusinessFocuses();
 
@@ -2586,6 +2960,10 @@
 
         sectorsHeader.appendChild(addSectorBtn);
         sectorsHeader.appendChild(saveSectorsBtn);
+        if (!isAI) {
+          addSectorBtn.style.display = "none";
+          saveSectorsBtn.style.display = "none";
+        }
         rowSectors.appendChild(sectorsHeader);
 
         const sectorsContainer = document.createElement("div");
@@ -2652,7 +3030,11 @@
           };
 
           row.appendChild(select);
-          row.appendChild(removeBtn);
+          if (isAI) {
+            row.appendChild(removeBtn);
+          } else {
+            removeBtn.style.display = "none";
+          }
           sectorsContainer.appendChild(row);
         };
 
@@ -2683,97 +3065,99 @@
           }
         };
 
-        addSectorBtn.onclick = async () => {
-          const options = await fetchSectorOptions();
-          createSectorSelectRow(options, "", "");
-        };
+        if (isAI) {
+          addSectorBtn.onclick = async () => {
+            const options = await fetchSectorOptions();
+            createSectorSelectRow(options, "", "");
+          };
 
-        saveSectorsBtn.onclick = async () => {
-          if (!window._dbCompanyId) {
-            log("No company ID - cannot save sectors", "err");
-            return;
-          }
-
-          saveSectorsBtn.innerHTML = "⏳";
-          saveSectorsBtn.disabled = true;
-
-          try {
-            const selects = Array.from(sectorsContainer.querySelectorAll("select.sector-select"));
-            const sectorSet = new Set();
-
-            for (const sel of selects) {
-              const val = parseInt(sel.value, 10);
-              if (!isNaN(val)) {
-                sectorSet.add(val);
-              } else if (sel.dataset.fallbackName) {
-                const lookedUp = await lookupSectorIdByName(sel.dataset.fallbackName);
-                if (lookedUp) {
-                  sectorSet.add(lookedUp);
-                  sel.value = lookedUp;
-                }
-              }
-            }
-
-            const sectorIds = Array.from(sectorSet);
-            if (sectorIds.length === 0) {
-              log("❌ No sector selected to save", "err");
-              saveSectorsBtn.innerHTML = "❌";
-              saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              setTimeout(() => {
-                saveSectorsBtn.innerHTML = "💾 Save Sectors";
-                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                saveSectorsBtn.disabled = false;
-              }, 1600);
+          saveSectorsBtn.onclick = async () => {
+            if (!window._dbCompanyId) {
+              log("No company ID - cannot save sectors", "err");
               return;
             }
 
-            log(`Saving sectors_id: [${sectorIds.join(", ")}]`, "info");
+            saveSectorsBtn.innerHTML = "⏳";
+            saveSectorsBtn.disabled = true;
 
-            const response = await fetch(
-              `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
-              {
-                method: "PATCH",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  new_company_id: window._dbCompanyId,
-                  updates: { sectors_id: sectorIds },
-                }),
+            try {
+              const selects = Array.from(sectorsContainer.querySelectorAll("select.sector-select"));
+              const sectorSet = new Set();
+
+              for (const sel of selects) {
+                const val = parseInt(sel.value, 10);
+                if (!isNaN(val)) {
+                  sectorSet.add(val);
+                } else if (sel.dataset.fallbackName) {
+                  const lookedUp = await lookupSectorIdByName(sel.dataset.fallbackName);
+                  if (lookedUp) {
+                    sectorSet.add(lookedUp);
+                    sel.value = lookedUp;
+                  }
+                }
               }
-            );
 
-            const result = await response.json();
+              const sectorIds = Array.from(sectorSet);
+              if (sectorIds.length === 0) {
+                log("❌ No sector selected to save", "err");
+                saveSectorsBtn.innerHTML = "❌";
+                saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
+                setTimeout(() => {
+                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
+                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveSectorsBtn.disabled = false;
+                }, 1600);
+                return;
+              }
 
-            if (response.ok && result.success) {
-              saveSectorsBtn.innerHTML = "✅";
-              saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.3)";
-              log(`✅ Saved ${sectorIds.length} sectors to DB`, "ok");
-              await refreshXanoData();
-              setTimeout(() => {
-                saveSectorsBtn.innerHTML = "💾 Save Sectors";
-                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-                saveSectorsBtn.disabled = false;
-              }, 1800);
-            } else {
+              log(`Saving sectors_id: [${sectorIds.join(", ")}]`, "info");
+
+              const response = await fetch(
+                `${XANO_BASE}/api:8Bv5PK4I/edit_company/${window._dbCompanyId}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    new_company_id: window._dbCompanyId,
+                    updates: { sectors_id: sectorIds },
+                  }),
+                }
+              );
+
+              const result = await response.json();
+
+              if (response.ok && result.success) {
+                saveSectorsBtn.innerHTML = "✅";
+                saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.3)";
+                log(`✅ Saved ${sectorIds.length} sectors to DB`, "ok");
+                await refreshXanoData();
+                setTimeout(() => {
+                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
+                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveSectorsBtn.disabled = false;
+                }, 1800);
+              } else {
+                saveSectorsBtn.innerHTML = "❌";
+                saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
+                log(`❌ Failed to save sectors: ${result.message || "Unknown error"}`, "err");
+                setTimeout(() => {
+                  saveSectorsBtn.innerHTML = "💾 Save Sectors";
+                  saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
+                  saveSectorsBtn.disabled = false;
+                }, 1800);
+              }
+            } catch (err) {
               saveSectorsBtn.innerHTML = "❌";
               saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-              log(`❌ Failed to save sectors: ${result.message || "Unknown error"}`, "err");
+              log(`❌ Error saving sectors: ${err.message}`, "err");
               setTimeout(() => {
                 saveSectorsBtn.innerHTML = "💾 Save Sectors";
                 saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
                 saveSectorsBtn.disabled = false;
               }, 1800);
             }
-          } catch (err) {
-            saveSectorsBtn.innerHTML = "❌";
-            saveSectorsBtn.style.background = "rgba(239, 68, 68, 0.2)";
-            log(`❌ Error saving sectors: ${err.message}`, "err");
-            setTimeout(() => {
-              saveSectorsBtn.innerHTML = "💾 Save Sectors";
-              saveSectorsBtn.style.background = "rgba(16, 185, 129, 0.1)";
-              saveSectorsBtn.disabled = false;
-            }, 1800);
-          }
-        };
+          };
+        }
 
         populateSectors();
 
@@ -2819,11 +3203,20 @@
           const option = document.createElement("option");
           option.value = ot;
           option.textContent = ot || "-- Select Ownership --";
-          if (ot.toLowerCase() === (data.ownership || "").toLowerCase()) {
+          if (ot && ot.toLowerCase() === (data.ownership || "").toLowerCase()) {
             option.selected = true;
           }
           ownershipSelect.appendChild(option);
         });
+
+        // If no predefined option matched, add a custom option so value shows up (DB side)
+        if (data.ownership && !ownershipSelect.value) {
+          const customOpt = document.createElement("option");
+          customOpt.value = data.ownership;
+          customOpt.textContent = data.ownership;
+          ownershipSelect.appendChild(customOpt);
+          ownershipSelect.value = data.ownership;
+        }
 
         rowOwnership.appendChild(ownershipLabel);
         rowOwnership.appendChild(ownershipSelect);
@@ -2847,7 +3240,7 @@
         yearInput.type = "text";
         yearInput.id = "ai_year_founded";
         yearInput.placeholder = "Year";
-        yearInput.value = data.year_founded || "";
+        yearInput.value = normalizeYear(data.year_founded);
         yearInput.style.width = "70px";
         yearInput.style.padding = "3px 7px";
         yearInput.style.borderRadius = "999px";
@@ -2892,6 +3285,25 @@
         rowPressPage.appendChild(pressPageInput);
         rowPressPage.appendChild(createCopyBtn("ai_webpage_monitored", "webpage_monitored", "Press Page"));
         rowPressPage.appendChild(createSaveBtn("ai_webpage_monitored", "webpage_monitored", "Press Page"));
+        // Open-in-new-tab icon for Press Page
+        const pressOpenBtn = document.createElement("button");
+        pressOpenBtn.textContent = "↗";
+        pressOpenBtn.title = "Open Press Page in new tab";
+        pressOpenBtn.style.padding = "2px 6px";
+        pressOpenBtn.style.fontSize = "10px";
+        pressOpenBtn.style.borderRadius = "999px";
+        pressOpenBtn.style.border = "1px solid rgba(148, 163, 184, 0.4)";
+        pressOpenBtn.style.background = "rgba(15, 23, 42, 0.8)";
+        pressOpenBtn.style.color = "#e5e7eb";
+        pressOpenBtn.style.cursor = "pointer";
+        pressOpenBtn.onclick = () => {
+          const url = pressPageInput.value.trim();
+          if (url) {
+            const finalUrl = url.startsWith("http://") || url.startsWith("https://") ? url : `https://${url}`;
+            window.open(finalUrl, "_blank", "noopener,noreferrer");
+          }
+        };
+        rowPressPage.appendChild(pressOpenBtn);
 
         const rowLinks = document.createElement("div");
         rowLinks.style.display = "flex";
@@ -2927,9 +3339,48 @@
         rowLinks.appendChild(websiteInput);
         rowLinks.appendChild(createCopyBtn("ai_website", "website", "Website"));
         rowLinks.appendChild(createSaveBtn("ai_website", "website", "Website"));
+        // Open-in-new-tab icon for Website URL
+        const websiteOpenBtn = document.createElement("button");
+        websiteOpenBtn.textContent = "↗";
+        websiteOpenBtn.title = "Open Website in new tab";
+        websiteOpenBtn.style.padding = "2px 6px";
+        websiteOpenBtn.style.fontSize = "10px";
+        websiteOpenBtn.style.borderRadius = "999px";
+        websiteOpenBtn.style.border = "1px solid rgba(148, 163, 184, 0.4)";
+        websiteOpenBtn.style.background = "rgba(15, 23, 42, 0.8)";
+        websiteOpenBtn.style.color = "#e5e7eb";
+        websiteOpenBtn.style.cursor = "pointer";
+        websiteOpenBtn.onclick = () => {
+          const url = websiteInput.value.trim();
+          if (url) {
+            const finalUrl = url.startsWith("http://") || url.startsWith("https://") ? url : `https://${url}`;
+            window.open(finalUrl, "_blank", "noopener,noreferrer");
+          }
+        };
+        rowLinks.appendChild(websiteOpenBtn);
+
         rowLinks.appendChild(linkedinInput);
         rowLinks.appendChild(createCopyBtn("ai_linkedin", "linkedin", "LinkedIn"));
         rowLinks.appendChild(createSaveBtn("ai_linkedin", "linkedin", "LinkedIn"));
+        // Open-in-new-tab icon for LinkedIn URL
+        const linkedinOpenBtn = document.createElement("button");
+        linkedinOpenBtn.textContent = "↗";
+        linkedinOpenBtn.title = "Open LinkedIn in new tab";
+        linkedinOpenBtn.style.padding = "2px 6px";
+        linkedinOpenBtn.style.fontSize = "10px";
+        linkedinOpenBtn.style.borderRadius = "999px";
+        linkedinOpenBtn.style.border = "1px solid rgba(148, 163, 184, 0.4)";
+        linkedinOpenBtn.style.background = "rgba(15, 23, 42, 0.8)";
+        linkedinOpenBtn.style.color = "#e5e7eb";
+        linkedinOpenBtn.style.cursor = "pointer";
+        linkedinOpenBtn.onclick = () => {
+          const url = linkedinInput.value.trim();
+          if (url) {
+            const finalUrl = url.startsWith("http://") || url.startsWith("https://") ? url : `https://${url}`;
+            window.open(finalUrl, "_blank", "noopener,noreferrer");
+          }
+        };
+        rowLinks.appendChild(linkedinOpenBtn);
 
         const desc = document.createElement("textarea");
         desc.id = "ai_description";
@@ -3038,7 +3489,29 @@
         card.appendChild(copyFromDbContainer);
         card.appendChild(createInDbContainer);
 
-        aiOverviewEl.appendChild(card);
+        if (!isAI) {
+          // Read-only: disable inputs/selects/textareas and hide action buttons
+          card.querySelectorAll("input, select, textarea").forEach((el) => {
+            el.readOnly = true;
+            el.disabled = true;
+            el.style.pointerEvents = "none";
+            el.style.opacity = "0.9";
+          });
+          card.querySelectorAll("button").forEach((btn) => {
+            const text = (btn.textContent || "").trim();
+            const title = (btn.title || "").toLowerCase();
+            const isOpen = text === "↗" || title.includes("open");
+            if (!isOpen) {
+              btn.style.display = "none";
+            }
+          });
+          const copyContainer = card.querySelector("#copyFromDbContainer");
+          if (copyContainer) copyContainer.style.display = "none";
+          const createContainer = card.querySelector("#createInDbContainer");
+          if (createContainer) createContainer.style.display = "none";
+        }
+
+        targetEl.appendChild(card);
       }
 
       function renderDBOverview(data) {
@@ -3076,7 +3549,7 @@
         rowName.style.gap = "4px";
 
         const nameDisplay = document.createElement("div");
-        nameDisplay.textContent = data.name || "Unknown company";
+        nameDisplay.textContent = cleanCompanyName(data.name) || "Unknown company";
         nameDisplay.style.flex = "1";
         nameDisplay.style.padding = "5px 8px";
         nameDisplay.style.borderRadius = "8px";
@@ -3086,8 +3559,75 @@
         nameDisplay.style.fontSize = "13px";
         nameDisplay.style.cursor = "default";
 
+        // Add "Open in new tab" button for company name
+        if (data.company_id) {
+          const openNameBtn = document.createElement("button");
+          openNameBtn.textContent = "↗";
+          openNameBtn.title = "Open dynamic company page";
+          openNameBtn.style.padding = "4px 8px";
+          openNameBtn.style.fontSize = "12px";
+          openNameBtn.style.borderRadius = "6px";
+          openNameBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          openNameBtn.style.background = "rgba(99, 102, 241, 0.1)";
+          openNameBtn.style.color = "#c7d2fe";
+          openNameBtn.style.cursor = "pointer";
+          openNameBtn.onclick = () => {
+            const dynamicUrl = `https://www.asymmetrixintelligence.com/company/${data.company_id}`;
+            window.open(dynamicUrl, '_blank');
+          };
+          rowName.appendChild(openNameBtn);
+        }
+
         rowName.appendChild(nameDisplay);
         card.appendChild(rowName);
+
+        // Dynamic Company Page link row
+        if (data.company_id) {
+          const rowDynamicLink = document.createElement("div");
+          rowDynamicLink.style.display = "flex";
+          rowDynamicLink.style.alignItems = "center";
+          rowDynamicLink.style.gap = "8px";
+          rowDynamicLink.style.marginTop = "8px";
+          rowDynamicLink.style.padding = "8px 12px";
+          rowDynamicLink.style.borderRadius = "8px";
+          rowDynamicLink.style.background = "rgba(99, 102, 241, 0.08)";
+          rowDynamicLink.style.border = "1px solid rgba(99, 102, 241, 0.2)";
+
+          const linkIcon = document.createElement("span");
+          linkIcon.textContent = "🌐";
+          linkIcon.style.fontSize = "14px";
+
+          const dynamicPageLink = document.createElement("a");
+          dynamicPageLink.href = `https://www.asymmetrixintelligence.com/company/${data.company_id}`;
+          dynamicPageLink.target = "_blank";
+          dynamicPageLink.textContent = "View Dynamic Company Page";
+          dynamicPageLink.style.color = "#a5b4fc";
+          dynamicPageLink.style.fontSize = "12px";
+          dynamicPageLink.style.fontWeight = "500";
+          dynamicPageLink.style.textDecoration = "none";
+          dynamicPageLink.onmouseover = () => {
+            dynamicPageLink.style.textDecoration = "underline";
+            dynamicPageLink.style.color = "#c7d2fe";
+          };
+          dynamicPageLink.onmouseout = () => {
+            dynamicPageLink.style.textDecoration = "none";
+            dynamicPageLink.style.color = "#a5b4fc";
+          };
+
+          const companyIdBadge = document.createElement("span");
+          companyIdBadge.textContent = `ID: ${data.company_id}`;
+          companyIdBadge.style.marginLeft = "auto";
+          companyIdBadge.style.padding = "2px 8px";
+          companyIdBadge.style.fontSize = "10px";
+          companyIdBadge.style.borderRadius = "4px";
+          companyIdBadge.style.background = "rgba(99, 102, 241, 0.15)";
+          companyIdBadge.style.color = "#c7d2fe";
+
+          rowDynamicLink.appendChild(linkIcon);
+          rowDynamicLink.appendChild(dynamicPageLink);
+          rowDynamicLink.appendChild(companyIdBadge);
+          card.appendChild(rowDynamicLink);
+        }
 
         // Location row (read-only, matches AI side layout)
         const rowLoc = document.createElement("div");
@@ -3274,7 +3814,7 @@
         yearLabel.style.minWidth = "55px";
 
         const yearDisplay = document.createElement("div");
-        yearDisplay.textContent = data.year_founded || "";
+        yearDisplay.textContent = normalizeYear(data.year_founded) || "";
         yearDisplay.style.width = "70px";
         yearDisplay.style.padding = "3px 7px";
         yearDisplay.style.borderRadius = "999px";
@@ -3416,6 +3956,26 @@
         dbOverviewEl.appendChild(card);
       }
 
+      // Override: use shared renderer for DB overview (read-only clone of AI UI)
+      function renderAIOverview(data) {
+        renderOverviewCommon({
+          data,
+          targetEl: aiOverviewEl,
+          metaEl: aiOverviewMeta,
+          mode: "ai",
+        });
+        showSaveButtons();
+      }
+
+      function renderDBOverview(data) {
+        renderOverviewCommon({
+          data,
+          targetEl: dbOverviewEl,
+          metaEl: dbOverviewMeta,
+          mode: "db",
+        });
+      }
+
       function renderTopManagement(executives) {
         topManagementEl.innerHTML = "";
         if (!executives || !executives.length) {
@@ -3523,27 +4083,103 @@
             infoSection.appendChild(bio);
           }
 
-          if (execLinkedIn) {
-            const link = document.createElement("a");
-            link.href = execLinkedIn;
-            link.target = "_blank";
-            link.className = "source-link";
-            link.style.display = "inline-block";
-            link.style.marginBottom = "8px";
-            link.textContent = "🔗 LinkedIn Profile";
-            infoSection.appendChild(link);
-          }
+          // LinkedIn URL row with visible input and open button
+          const liRow = document.createElement("div");
+          liRow.style.display = "flex";
+          liRow.style.alignItems = "center";
+          liRow.style.gap = "6px";
+          liRow.style.marginBottom = "8px";
 
-          if (execEmployeeUrl) {
-            const link = document.createElement("a");
-            link.href = execEmployeeUrl;
-            link.target = "_blank";
-            link.className = "source-link";
-            link.style.display = "inline-block";
-            link.style.marginBottom = "8px";
-            link.textContent = "🌐 Company Profile";
-            infoSection.appendChild(link);
-          }
+          const liLbl = document.createElement("span");
+          liLbl.textContent = "🔗 LinkedIn:";
+          liLbl.style.fontSize = "10px";
+          liLbl.style.color = "#9ca3af";
+          liLbl.style.minWidth = "70px";
+
+          const liDisplay = document.createElement("input");
+          liDisplay.type = "text";
+          liDisplay.value = execLinkedIn || "";
+          liDisplay.placeholder = "No LinkedIn URL";
+          liDisplay.readOnly = true;
+          liDisplay.style.flex = "1";
+          liDisplay.style.padding = "4px 8px";
+          liDisplay.style.borderRadius = "6px";
+          liDisplay.style.border = "1px solid #1f2937";
+          liDisplay.style.background = "#020617";
+          liDisplay.style.color = execLinkedIn ? "#e5e7eb" : "#6b7280";
+          liDisplay.style.fontSize = "10px";
+          liDisplay.style.cursor = "default";
+
+          const liOpenBtn = document.createElement("button");
+          liOpenBtn.textContent = "↗";
+          liOpenBtn.title = "Open LinkedIn profile in new tab";
+          liOpenBtn.style.padding = "4px 8px";
+          liOpenBtn.style.fontSize = "12px";
+          liOpenBtn.style.borderRadius = "6px";
+          liOpenBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          liOpenBtn.style.background = execLinkedIn ? "rgba(99, 102, 241, 0.1)" : "rgba(99, 102, 241, 0.05)";
+          liOpenBtn.style.color = execLinkedIn ? "#c7d2fe" : "#6b7280";
+          liOpenBtn.style.cursor = execLinkedIn ? "pointer" : "not-allowed";
+          liOpenBtn.disabled = !execLinkedIn;
+          liOpenBtn.onclick = () => {
+            if (execLinkedIn) {
+              window.open(execLinkedIn, '_blank');
+            }
+          };
+
+          liRow.appendChild(liLbl);
+          liRow.appendChild(liDisplay);
+          liRow.appendChild(liOpenBtn);
+          infoSection.appendChild(liRow);
+
+          // Company Profile URL row with visible input and open button
+          const cpRow = document.createElement("div");
+          cpRow.style.display = "flex";
+          cpRow.style.alignItems = "center";
+          cpRow.style.gap = "6px";
+          cpRow.style.marginBottom = "8px";
+
+          const cpLbl = document.createElement("span");
+          cpLbl.textContent = "🌐 Profile:";
+          cpLbl.style.fontSize = "10px";
+          cpLbl.style.color = "#9ca3af";
+          cpLbl.style.minWidth = "70px";
+
+          const cpDisplay = document.createElement("input");
+          cpDisplay.type = "text";
+          cpDisplay.value = execEmployeeUrl || "";
+          cpDisplay.placeholder = "No company profile URL";
+          cpDisplay.readOnly = true;
+          cpDisplay.style.flex = "1";
+          cpDisplay.style.padding = "4px 8px";
+          cpDisplay.style.borderRadius = "6px";
+          cpDisplay.style.border = "1px solid #1f2937";
+          cpDisplay.style.background = "#020617";
+          cpDisplay.style.color = execEmployeeUrl ? "#e5e7eb" : "#6b7280";
+          cpDisplay.style.fontSize = "10px";
+          cpDisplay.style.cursor = "default";
+
+          const cpOpenBtn = document.createElement("button");
+          cpOpenBtn.textContent = "↗";
+          cpOpenBtn.title = "Open company profile page in new tab";
+          cpOpenBtn.style.padding = "4px 8px";
+          cpOpenBtn.style.fontSize = "12px";
+          cpOpenBtn.style.borderRadius = "6px";
+          cpOpenBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          cpOpenBtn.style.background = execEmployeeUrl ? "rgba(99, 102, 241, 0.1)" : "rgba(99, 102, 241, 0.05)";
+          cpOpenBtn.style.color = execEmployeeUrl ? "#c7d2fe" : "#6b7280";
+          cpOpenBtn.style.cursor = execEmployeeUrl ? "pointer" : "not-allowed";
+          cpOpenBtn.disabled = !execEmployeeUrl;
+          cpOpenBtn.onclick = () => {
+            if (execEmployeeUrl) {
+              window.open(execEmployeeUrl, '_blank');
+            }
+          };
+
+          cpRow.appendChild(cpLbl);
+          cpRow.appendChild(cpDisplay);
+          cpRow.appendChild(cpOpenBtn);
+          infoSection.appendChild(cpRow);
 
           card.appendChild(infoSection);
 
@@ -3908,6 +4544,7 @@
           const linkedinInputRow = document.createElement("div");
           linkedinInputRow.style.display = "flex";
           linkedinInputRow.style.alignItems = "center";
+          linkedinInputRow.style.gap = "4px";
           const linkedinInput = document.createElement("input");
           linkedinInput.type = "url";
           linkedinInput.className = "form-input";
@@ -3916,6 +4553,7 @@
           linkedinInput.placeholder = "https://linkedin.com/in/...";
           linkedinInput.style.flex = "1";
           linkedinInputRow.appendChild(linkedinInput);
+          linkedinInputRow.appendChild(createOpenBtn(linkedinInput, "LinkedIn"));
           linkedinInputRow.appendChild(createIndividualFieldSaveBtn("LinkedIn URL", () => linkedinInput.value.trim(), "linkedin_url"));
           linkedinGroup.appendChild(linkedinLabel);
           linkedinGroup.appendChild(linkedinInputRow);
@@ -3930,6 +4568,7 @@
           const employeeUrlInputRow = document.createElement("div");
           employeeUrlInputRow.style.display = "flex";
           employeeUrlInputRow.style.alignItems = "center";
+          employeeUrlInputRow.style.gap = "4px";
           const employeeUrlInput = document.createElement("input");
           employeeUrlInput.type = "url";
           employeeUrlInput.className = "form-input";
@@ -3938,6 +4577,7 @@
           employeeUrlInput.placeholder = "https://company.com/team/name";
           employeeUrlInput.style.flex = "1";
           employeeUrlInputRow.appendChild(employeeUrlInput);
+          employeeUrlInputRow.appendChild(createOpenBtn(employeeUrlInput, "Profile"));
           employeeUrlInputRow.appendChild(createIndividualFieldSaveBtn("Company Profile URL", () => employeeUrlInput.value.trim(), "current_employee_url"));
           employeeUrlGroup.appendChild(employeeUrlLabel);
           employeeUrlGroup.appendChild(employeeUrlInputRow);
@@ -4104,6 +4744,582 @@
 
         dbManagementEl.appendChild(grid);
       }
+
+      // Shared management renderer (AI layout cloned; DB read-only)
+      function renderManagementCommonAligned(executives, targetEl, metaEl, mode = "ai") {
+        targetEl.innerHTML = "";
+        const isAI = mode === "ai";
+
+        if (!executives || !executives.length) {
+          targetEl.innerHTML =
+            '<div class="empty-state">No top management data found.</div>';
+          metaEl.textContent = "0 executives";
+          return;
+        }
+
+        // Store executives for later access
+        if (isAI) {
+          window._aiExecutives = executives;
+        } else {
+          window._dbExecutives = executives;
+        }
+
+        metaEl.textContent = `${executives.length} executive${executives.length > 1 ? "s" : ""}`;
+
+        const grid = document.createElement("div");
+        grid.style.display = "grid";
+        grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(320px, 1fr))";
+        grid.style.gap = "14px";
+
+        executives.forEach((exec, idx) => {
+          const card = document.createElement("div");
+          card.className = "event-card";
+          card.style.padding = "16px";
+          card.dataset.execIdx = idx;
+          // Store role_id and individual_id if present (for DB individuals)
+          if (exec.role_id) card.dataset.roleId = exec.role_id;
+          if (exec.individual_id) card.dataset.individualId = exec.individual_id;
+
+          const execName = exec.name || exec.Individual_text || "Unknown";
+          const execPosition = exec.position || exec.title || "";
+          const execStatus = exec.status || exec.Status || "Current";
+          const execLocation = exec.location || "";
+          const execBio = exec.bio || "";
+          const execLinkedIn = exec.linkedin_url || "";
+          const execEmployeeUrl = exec.current_employee_url || exec.current_employer_url || "";
+
+          const header = document.createElement("div");
+          header.style.display = "flex";
+          header.style.justifyContent = "space-between";
+          header.style.alignItems = "flex-start";
+          header.style.marginBottom = "12px";
+
+          const headerLeft = document.createElement("div");
+          headerLeft.style.flex = "1";
+          
+          // Name row with input for AI
+          if (isAI) {
+            const nameRow = document.createElement("div");
+            nameRow.style.display = "flex";
+            nameRow.style.alignItems = "center";
+            nameRow.style.gap = "4px";
+            nameRow.style.marginBottom = "6px";
+            
+            const nameInput = document.createElement("input");
+            nameInput.type = "text";
+            nameInput.value = execName;
+            nameInput.placeholder = "Name";
+            nameInput.id = `${mode}_exec_${idx}_name`;
+            nameInput.style.fontSize = "15px";
+            nameInput.style.fontWeight = "600";
+            nameInput.style.color = "#e5e7eb";
+            nameInput.style.background = "#020617";
+            nameInput.style.border = "1px solid #1f2937";
+            nameInput.style.borderRadius = "6px";
+            nameInput.style.padding = "4px 8px";
+            nameInput.style.flex = "1";
+            nameRow.appendChild(nameInput);
+            
+            // Save button for name (individual save)
+            const nameSaveBtn = createIndividualSaveBtn(idx, "name", "Name");
+            nameRow.appendChild(nameSaveBtn);
+            
+            headerLeft.appendChild(nameRow);
+          } else {
+            const nameDisplay = document.createElement("div");
+            nameDisplay.className = "event-title";
+            nameDisplay.style.fontSize = "15px";
+            nameDisplay.style.marginBottom = "4px";
+            nameDisplay.textContent = execName;
+            headerLeft.appendChild(nameDisplay);
+          }
+
+          // Position/Title row
+          if (isAI) {
+            const posRow = document.createElement("div");
+            posRow.style.display = "flex";
+            posRow.style.alignItems = "center";
+            posRow.style.gap = "4px";
+            
+            const positionInput = document.createElement("input");
+            positionInput.type = "text";
+            positionInput.value = execPosition || "";
+            positionInput.placeholder = "Title / Role";
+            positionInput.style.fontSize = "12px";
+            positionInput.style.color = "#a5b4fc";
+            positionInput.style.background = "#020617";
+            positionInput.style.border = "1px solid #1f2937";
+            positionInput.style.borderRadius = "6px";
+            positionInput.style.padding = "4px 8px";
+            positionInput.style.flex = "1";
+            positionInput.id = `${mode}_exec_${idx}_position`;
+            posRow.appendChild(positionInput);
+            
+            // Save button for position
+            const posSaveBtn = createIndividualSaveBtn(idx, "position", "Position");
+            posRow.appendChild(posSaveBtn);
+            
+            headerLeft.appendChild(posRow);
+          } else {
+            const positionDisplay = document.createElement("div");
+            positionDisplay.style.fontSize = "12px";
+            positionDisplay.style.color = "#a5b4fc";
+            positionDisplay.textContent = execPosition;
+            headerLeft.appendChild(positionDisplay);
+          }
+          header.appendChild(headerLeft);
+
+          const headerRight = document.createElement("div");
+          headerRight.style.display = "flex";
+          headerRight.style.flexDirection = "column";
+          headerRight.style.alignItems = "flex-end";
+          headerRight.style.gap = "6px";
+
+          if (isAI) {
+            const statusRow = document.createElement("div");
+            statusRow.style.display = "flex";
+            statusRow.style.alignItems = "center";
+            statusRow.style.gap = "4px";
+            
+            const statusSelect = document.createElement("select");
+            statusSelect.id = `${mode}_exec_${idx}_status`;
+            statusSelect.style.fontSize = "10px";
+            statusSelect.style.padding = "3px 10px";
+            statusSelect.style.borderRadius = "999px";
+            statusSelect.style.background = "#020617";
+            statusSelect.style.color = "#e5e7eb";
+            statusSelect.style.border = "1px solid #1f2937";
+            ["Current", "Past"].forEach((opt) => {
+              const o = document.createElement("option");
+              o.value = opt;
+              o.textContent = opt;
+              if (opt.toLowerCase() === (execStatus || "current").toLowerCase()) o.selected = true;
+              statusSelect.appendChild(o);
+            });
+            statusRow.appendChild(statusSelect);
+            
+            // Save button for status
+            const statusSaveBtn = createIndividualSaveBtn(idx, "status", "Status");
+            statusRow.appendChild(statusSaveBtn);
+            
+            headerRight.appendChild(statusRow);
+          } else {
+            const statusBadge = document.createElement("span");
+            statusBadge.style.fontSize = "10px";
+            statusBadge.style.padding = "3px 10px";
+            statusBadge.style.borderRadius = "999px";
+            statusBadge.style.whiteSpace = "nowrap";
+            if ((execStatus || "").toLowerCase() === "current") {
+              statusBadge.style.background = "rgba(16, 185, 129, 0.15)";
+              statusBadge.style.color = "#6ee7b7";
+              statusBadge.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+            } else {
+              statusBadge.style.background = "rgba(156, 163, 175, 0.15)";
+              statusBadge.style.color = "#9ca3af";
+              statusBadge.style.border = "1px solid rgba(156, 163, 175, 0.3)";
+            }
+            statusBadge.textContent = execStatus || "Current";
+            headerRight.appendChild(statusBadge);
+          }
+
+          header.appendChild(headerRight);
+          card.appendChild(header);
+
+          const infoSection = document.createElement("div");
+          infoSection.id = `${mode}_exec_${idx}_info`;
+
+          // Location
+          if (isAI) {
+            const locRow = document.createElement("div");
+            locRow.style.display = "flex";
+            locRow.style.alignItems = "center";
+            locRow.style.gap = "4px";
+            locRow.style.marginBottom = "8px";
+            
+            const locInput = document.createElement("input");
+            locInput.type = "text";
+            locInput.id = `${mode}_exec_${idx}_location`;
+            locInput.value = execLocation || "";
+            locInput.placeholder = "Location (City, Country)";
+            locInput.style.fontSize = "11px";
+            locInput.style.color = "#e5e7eb";
+            locInput.style.background = "#020617";
+            locInput.style.border = "1px solid #1f2937";
+            locInput.style.borderRadius = "6px";
+            locInput.style.padding = "6px 8px";
+            locInput.style.flex = "1";
+            locRow.appendChild(locInput);
+            
+            // Save button for location
+            const locSaveBtn = createIndividualSaveBtn(idx, "location", "Location");
+            locRow.appendChild(locSaveBtn);
+            
+            infoSection.appendChild(locRow);
+          } else if (execLocation) {
+            const loc = document.createElement("div");
+            loc.style.fontSize = "11px";
+            loc.style.color = "#9ca3af";
+            loc.style.marginBottom = "8px";
+            loc.textContent = "📍 " + execLocation;
+            infoSection.appendChild(loc);
+          }
+
+          // Bio
+          if (isAI) {
+            const bioRow = document.createElement("div");
+            bioRow.style.display = "flex";
+            bioRow.style.flexDirection = "column";
+            bioRow.style.gap = "4px";
+            bioRow.style.marginBottom = "8px";
+            
+            const bio = document.createElement("textarea");
+            bio.id = `${mode}_exec_${idx}_bio`;
+            bio.value = execBio || "";
+            bio.placeholder = "Bio / Description";
+            bio.style.fontSize = "11px";
+            bio.style.color = "#e5e7eb";
+            bio.style.background = "#020617";
+            bio.style.border = "1px solid #1f2937";
+            bio.style.borderRadius = "6px";
+            bio.style.padding = "8px";
+            bio.style.lineHeight = "1.5";
+            bio.style.minHeight = "80px";
+            bio.style.resize = "vertical";
+            bio.style.width = "100%";
+            bioRow.appendChild(bio);
+            
+            // Save button row for bio
+            const bioSaveBtnRow = document.createElement("div");
+            bioSaveBtnRow.style.display = "flex";
+            bioSaveBtnRow.style.justifyContent = "flex-end";
+            const bioSaveBtn = createIndividualSaveBtn(idx, "bio", "Bio");
+            bioSaveBtnRow.appendChild(bioSaveBtn);
+            bioRow.appendChild(bioSaveBtnRow);
+            
+            infoSection.appendChild(bioRow);
+          } else if (execBio) {
+            const bio = document.createElement("div");
+            bio.style.fontSize = "11px";
+            bio.style.color = "#d1d5db";
+            bio.style.lineHeight = "1.5";
+            bio.style.marginBottom = "8px";
+            bio.style.padding = "8px";
+            bio.style.background = "rgba(31, 41, 55, 0.3)";
+            bio.style.borderRadius = "6px";
+            bio.textContent = execBio;
+            infoSection.appendChild(bio);
+          }
+
+          const liRow = document.createElement("div");
+          liRow.style.display = "flex";
+          liRow.style.alignItems = "center";
+          liRow.style.gap = "6px";
+          liRow.style.marginBottom = "8px";
+
+          const liLbl = document.createElement("span");
+          liLbl.textContent = "🔗 LinkedIn:";
+          liLbl.style.fontSize = "10px";
+          liLbl.style.color = "#9ca3af";
+          liLbl.style.minWidth = "70px";
+
+          const liDisplay = document.createElement("input");
+          liDisplay.type = "text";
+          liDisplay.id = `${mode}_exec_${idx}_linkedin`;
+          liDisplay.value = execLinkedIn || "";
+          liDisplay.placeholder = "LinkedIn URL";
+          liDisplay.readOnly = !isAI;
+          liDisplay.style.flex = "1";
+          liDisplay.style.padding = "4px 8px";
+          liDisplay.style.borderRadius = "6px";
+          liDisplay.style.border = "1px solid #1f2937";
+          liDisplay.style.background = "#020617";
+          liDisplay.style.color = execLinkedIn ? "#e5e7eb" : "#6b7280";
+          liDisplay.style.fontSize = "10px";
+          if (!isAI) liDisplay.style.cursor = "default";
+
+          const liOpenBtn = document.createElement("button");
+          liOpenBtn.textContent = "↗";
+          liOpenBtn.title = "Open LinkedIn profile";
+          liOpenBtn.style.padding = "4px 8px";
+          liOpenBtn.style.fontSize = "12px";
+          liOpenBtn.style.borderRadius = "6px";
+          liOpenBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          liOpenBtn.style.background = execLinkedIn ? "rgba(99, 102, 241, 0.1)" : "rgba(99, 102, 241, 0.05)";
+          liOpenBtn.style.color = execLinkedIn ? "#c7d2fe" : "#6b7280";
+          liOpenBtn.style.cursor = execLinkedIn ? "pointer" : "not-allowed";
+          liOpenBtn.disabled = !execLinkedIn;
+          liOpenBtn.onclick = () => {
+            const url = document.getElementById(`${mode}_exec_${idx}_linkedin`)?.value || execLinkedIn;
+            if (url) window.open(url, "_blank");
+          };
+
+          liRow.appendChild(liLbl);
+          liRow.appendChild(liDisplay);
+          liRow.appendChild(liOpenBtn);
+          
+          if (isAI) {
+            const liSaveBtn = createIndividualSaveBtn(idx, "linkedin_url", "LinkedIn");
+            liRow.appendChild(liSaveBtn);
+          }
+          
+          infoSection.appendChild(liRow);
+
+          const cpRow = document.createElement("div");
+          cpRow.style.display = "flex";
+          cpRow.style.alignItems = "center";
+          cpRow.style.gap = "6px";
+          cpRow.style.marginBottom = "8px";
+
+          const cpLbl = document.createElement("span");
+          cpLbl.textContent = "🌐 Profile:";
+          cpLbl.style.fontSize = "10px";
+          cpLbl.style.color = "#9ca3af";
+          cpLbl.style.minWidth = "70px";
+
+          const cpDisplay = document.createElement("input");
+          cpDisplay.type = "text";
+          cpDisplay.id = `${mode}_exec_${idx}_profile`;
+          cpDisplay.value = execEmployeeUrl || "";
+          cpDisplay.placeholder = "Company profile URL";
+          cpDisplay.readOnly = !isAI;
+          cpDisplay.style.flex = "1";
+          cpDisplay.style.padding = "4px 8px";
+          cpDisplay.style.borderRadius = "6px";
+          cpDisplay.style.border = "1px solid #1f2937";
+          cpDisplay.style.background = "#020617";
+          cpDisplay.style.color = execEmployeeUrl ? "#e5e7eb" : "#6b7280";
+          cpDisplay.style.fontSize = "10px";
+          if (!isAI) cpDisplay.style.cursor = "default";
+
+          const cpOpenBtn = document.createElement("button");
+          cpOpenBtn.textContent = "↗";
+          cpOpenBtn.title = "Open company profile page";
+          cpOpenBtn.style.padding = "4px 8px";
+          cpOpenBtn.style.fontSize = "12px";
+          cpOpenBtn.style.borderRadius = "6px";
+          cpOpenBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
+          cpOpenBtn.style.background = execEmployeeUrl ? "rgba(99, 102, 241, 0.1)" : "rgba(99, 102, 241, 0.05)";
+          cpOpenBtn.style.color = execEmployeeUrl ? "#c7d2fe" : "#6b7280";
+          cpOpenBtn.style.cursor = execEmployeeUrl ? "pointer" : "not-allowed";
+          cpOpenBtn.disabled = !execEmployeeUrl;
+          cpOpenBtn.onclick = () => {
+            const url = document.getElementById(`${mode}_exec_${idx}_profile`)?.value || execEmployeeUrl;
+            if (url) window.open(url, "_blank");
+          };
+
+          cpRow.appendChild(cpLbl);
+          cpRow.appendChild(cpDisplay);
+          cpRow.appendChild(cpOpenBtn);
+          
+          if (isAI) {
+            const cpSaveBtn = createIndividualSaveBtn(idx, "current_employer_url", "Profile URL");
+            cpRow.appendChild(cpSaveBtn);
+          }
+          
+          infoSection.appendChild(cpRow);
+
+          // If DB mode, lock down to read-only/open-only
+          if (!isAI) {
+            infoSection.querySelectorAll("input, textarea").forEach((el) => {
+              el.readOnly = true;
+              el.disabled = true;
+              el.style.pointerEvents = "none";
+              el.style.opacity = "0.9";
+            });
+            infoSection.querySelectorAll("button").forEach((btn) => {
+              const t = (btn.textContent || "").trim();
+              const title = (btn.title || "").toLowerCase();
+              const isOpen = t === "↗" || title.includes("open");
+              if (!isOpen) {
+                btn.style.display = "none";
+              }
+            });
+          }
+
+          card.appendChild(infoSection);
+          grid.appendChild(card);
+        });
+
+        targetEl.appendChild(grid);
+        
+        // Show/hide individual save buttons based on DB company
+        if (isAI) {
+          showIndividualSaveButtons();
+        }
+      }
+      
+      // Create save button for individual fields
+      function createIndividualSaveBtn(execIdx, fieldName, label) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.title = `Save ${label} to DB`;
+        btn.innerHTML = "💾";
+        btn.style.padding = "2px 6px";
+        btn.style.fontSize = "10px";
+        btn.style.borderRadius = "4px";
+        btn.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+        btn.style.background = "rgba(16, 185, 129, 0.1)";
+        btn.style.color = "#6ee7b7";
+        btn.style.cursor = "pointer";
+        btn.style.marginLeft = "4px";
+        btn.style.transition = "all 0.15s ease";
+        btn.style.display = "none"; // Hidden until company exists in DB
+        btn.className = "save-individual-btn";
+        btn.dataset.execIdx = execIdx;
+        btn.dataset.field = fieldName;
+        
+        btn.onmouseover = () => {
+          btn.style.background = "rgba(16, 185, 129, 0.25)";
+          btn.style.borderColor = "rgba(16, 185, 129, 0.5)";
+        };
+        btn.onmouseout = () => {
+          btn.style.background = "rgba(16, 185, 129, 0.1)";
+          btn.style.borderColor = "rgba(16, 185, 129, 0.3)";
+        };
+        
+        btn.onclick = async () => {
+          await saveIndividualField(execIdx, fieldName, label, btn);
+        };
+        
+        return btn;
+      }
+      
+      // Show individual save buttons when company exists in DB
+      function showIndividualSaveButtons() {
+        document.querySelectorAll(".save-individual-btn").forEach(btn => {
+          if (window._dbCompanyId) {
+            btn.style.display = "inline-block";
+          } else {
+            btn.style.display = "none";
+          }
+        });
+      }
+      
+      // Save individual field to DB
+      async function saveIndividualField(execIdx, fieldName, label, btn) {
+        if (!window._dbCompanyId) {
+          log("No company ID - cannot save individual", "err");
+          return;
+        }
+        
+        // Get the DB executive data (if exists) to get role_id
+        const dbExecs = window._dbExecutives || [];
+        const aiExecs = window._aiExecutives || [];
+        
+        // Try to match AI exec with DB exec by name
+        const aiExec = aiExecs[execIdx];
+        if (!aiExec) {
+          log("No AI executive data found at index " + execIdx, "err");
+          return;
+        }
+        
+        // Find matching DB exec by name
+        const aiName = (aiExec.name || aiExec.Individual_text || "").toLowerCase().trim();
+        const dbExec = dbExecs.find(d => {
+          const dbName = (d.name || "").toLowerCase().trim();
+          return dbName === aiName;
+        });
+        
+        if (!dbExec || !dbExec.role_id) {
+          log(`⚠️ Individual "${aiExec.name}" not found in DB or missing role_id - cannot patch`, "warn");
+          btn.innerHTML = "❌";
+          btn.style.background = "rgba(239, 68, 68, 0.2)";
+          setTimeout(() => {
+            btn.innerHTML = "💾";
+            btn.style.background = "rgba(16, 185, 129, 0.1)";
+          }, 2000);
+          return;
+        }
+        
+        const roleId = dbExec.role_id;
+        const individualId = dbExec.individual_id;
+        
+        // Get field value from input
+        let inputId = `ai_exec_${execIdx}_`;
+        if (fieldName === "linkedin_url") inputId += "linkedin";
+        else if (fieldName === "current_employer_url") inputId += "profile";
+        else inputId += fieldName;
+        
+        const input = document.getElementById(inputId);
+        if (!input) {
+          log(`Input not found: ${inputId}`, "err");
+          return;
+        }
+        
+        const value = input.tagName === "SELECT" ? input.value : input.value.trim();
+        
+        btn.innerHTML = "⏳";
+        btn.disabled = true;
+        
+        try {
+          // Build updates for the role/individual endpoint
+          // Note: The actual endpoint will depend on your Xano API structure
+          // This is a placeholder - you'll need to provide the correct endpoint
+          const updates = {};
+          updates[fieldName] = value;
+          
+          log(`🔄 Saving ${label} for ${aiExec.name} (role_id: ${roleId})...`, "info");
+          
+          // Try to PATCH the individual role
+          // You may need to adjust this endpoint based on your Xano API
+          const response = await fetch(
+            `${XANO_BASE}/api:8Bv5PK4I/edit_role/${roleId}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                role_id: roleId,
+                individual_id: individualId,
+                updates: updates
+              })
+            }
+          );
+          
+          if (response.ok) {
+            const result = await response.json();
+            btn.innerHTML = "✅";
+            btn.style.background = "rgba(16, 185, 129, 0.3)";
+            log(`✅ Saved ${label}: ${value}`, "ok");
+            
+            // Refresh DB data
+            await refreshXanoData();
+            
+            setTimeout(() => {
+              btn.innerHTML = "💾";
+              btn.style.background = "rgba(16, 185, 129, 0.1)";
+              btn.disabled = false;
+            }, 2000);
+          } else {
+            const errorText = await response.text();
+            btn.innerHTML = "❌";
+            btn.style.background = "rgba(239, 68, 68, 0.2)";
+            log(`❌ Failed to save ${label}: ${errorText}`, "err");
+            setTimeout(() => {
+              btn.innerHTML = "💾";
+              btn.style.background = "rgba(16, 185, 129, 0.1)";
+              btn.disabled = false;
+            }, 2000);
+          }
+        } catch (err) {
+          btn.innerHTML = "❌";
+          btn.style.background = "rgba(239, 68, 68, 0.2)";
+          log(`❌ Error saving ${label}: ${err.message}`, "err");
+          setTimeout(() => {
+            btn.innerHTML = "💾";
+            btn.style.background = "rgba(16, 185, 129, 0.1)";
+            btn.disabled = false;
+          }, 2000);
+        }
+      }
+
+      // Override with aligned renderer
+      renderTopManagement = (executives) => {
+        renderManagementCommonAligned(executives, topManagementEl, mgmtMetaEl, "ai");
+      };
+
+      renderDBManagement = (executives) => {
+        renderManagementCommonAligned(executives, dbManagementEl, dbMgmtMetaEl, "db");
+      };
 
       function renderAIEvents(events, missing) {
         aiEventsEl.innerHTML = "";
@@ -4443,82 +5659,116 @@
           sourceInput.id = `ev_${idx}_source`;
           sourceInput.value = source;
 
-          const parseBtn = document.createElement("button");
-          parseBtn.textContent = "🧠 Parse from source";
-          parseBtn.title = "Fetch page and extract title/date/description";
-          parseBtn.style.marginLeft = "8px";
-          parseBtn.style.padding = "4px 10px";
-          parseBtn.style.fontSize = "10px";
-          parseBtn.style.borderRadius = "6px";
-          parseBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
-          parseBtn.style.background = "rgba(99, 102, 241, 0.1)";
-          parseBtn.style.color = "#c7d2fe";
-          parseBtn.style.cursor = "pointer";
+          // Smart Enrich button - parses source URL first, then searches web if data incomplete
+          const smartEnrichBtn = document.createElement("button");
+          smartEnrichBtn.textContent = "🧠 Smart Enrich";
+          smartEnrichBtn.title = "Parse source URL, then search web if data is incomplete";
+          smartEnrichBtn.style.padding = "4px 10px";
+          smartEnrichBtn.style.fontSize = "10px";
+          smartEnrichBtn.style.borderRadius = "6px";
+          smartEnrichBtn.style.border = "1px solid rgba(99, 102, 241, 0.5)";
+          smartEnrichBtn.style.background = "linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(168, 85, 247, 0.2))";
+          smartEnrichBtn.style.color = "#c7d2fe";
+          smartEnrichBtn.style.cursor = "pointer";
+          smartEnrichBtn.style.fontWeight = "500";
 
-          parseBtn.onclick = async () => {
+          smartEnrichBtn.onclick = async () => {
             const urlToParse = sourceInput.value.trim();
             if (!urlToParse) {
-              log("⚠️ No source URL to parse", "warn");
+              log("⚠️ No source URL to enrich", "warn");
               return;
             }
-            parseBtn.disabled = true;
-            parseBtn.textContent = "⏳ Parsing…";
+            smartEnrichBtn.disabled = true;
+            smartEnrichBtn.textContent = "⏳ Parsing source...";
+            
             try {
-              const res = await fetch("/extract_event_meta", {
+              const counterparties = (ev.counterparties || []).map(cp => cleanCompanyName(cp.company_name || cp.name || cp.company || "")).filter(Boolean);
+              const body = {
+                url: urlToParse,
+                event: {
+                  title: titleInput ? titleInput.value : shortTitle,
+                  company: document.getElementById("ai_name")?.value || "",
+                  counterparties,
+                  announcement_date: annInput?.value || annDate || null,
+                  deal_type: typeSelect?.value || type || ""
+                }
+              };
+              
+              const res = await fetch("/smart_enrich_event", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: urlToParse, use_scrapfly: true }),
+                body: JSON.stringify(body),
               });
               const data = await res.json();
+              
               if (!res.ok || data.error) {
-                log(`⚠️ Parse failed: ${data.error || res.status}`, "warn");
+                log(`⚠️ Enrich failed: ${data.error || res.status}`, "warn");
               } else {
-                if (data.title && titleInput) {
-                  titleInput.value = data.title;
-                  log(`✅ Parsed title: ${data.title}`, "ok");
+                const enr = data.enriched_event || {};
+                let fieldsUpdated = 0;
+                
+                // Title
+                if (enr.title && titleInput) {
+                  titleInput.value = enr.title;
+                  fieldsUpdated++;
                 }
-                if (data.announcement_date && annInput) {
-                  annInput.value = data.announcement_date;
-                  log(`✅ Parsed date: ${data.announcement_date}`, "ok");
+                
+                // Date
+                if (enr.announcement_date && annInput) {
+                  annInput.value = parseToDateValue(enr.announcement_date);
+                  fieldsUpdated++;
                 }
-                const longDescEl = document.getElementById(`ev_${idx}_longdesc`);
-                if (data.long_description) {
-                  if (longDescEl) {
-                    longDescEl.value = data.long_description;
-                  }
-                  log(`✅ Parsed description (${data.long_description.length} chars)`, "ok");
+                
+                // Deal type & status
+                if (enr.deal_type && typeSelect) typeSelect.value = enr.deal_type;
+                if (enr.deal_status && statusSelect) statusSelect.value = enr.deal_status;
+                
+                // Amount (check both field names)
+                const amountVal = enr.amount ?? enr.investment_amount_m;
+                if (typeof amountVal !== "undefined" && amountVal !== null && amountVal !== "" && amountInput) {
+                  amountInput.value = amountVal;
+                  fieldsUpdated++;
                 }
-                if (typeof data.investment_amount_m !== "undefined" && amountInput) {
-                  amountInput.value = data.investment_amount_m;
-                  log(`✅ Parsed amount (m): ${data.investment_amount_m}`, "ok");
-                }
-                if (data.investment_currency && currencySelect) {
+                
+                // Currency
+                const currencyVal = enr.currency || enr.investment_currency;
+                if (currencyVal && currencySelect) {
                   const match = [...currencySelect.options].find(
                     (o) =>
-                      (o.dataset.code && o.dataset.code.toUpperCase() === data.investment_currency.toUpperCase()) ||
-                      (o.textContent && o.textContent.toUpperCase() === data.investment_currency.toUpperCase())
+                      (o.dataset.code && o.dataset.code.toUpperCase() === currencyVal.toUpperCase()) ||
+                      (o.textContent && o.textContent.toUpperCase() === currencyVal.toUpperCase())
                   );
                   if (match) {
                     currencySelect.value = match.value;
                   }
-                  log(`✅ Parsed currency: ${data.investment_currency}`, "ok");
                 }
-                if (data.funding_stage && stageInput) {
-                  stageInput.value = data.funding_stage;
-                  log(`✅ Parsed stage: ${data.funding_stage}`, "ok");
+                
+                // Stage
+                const stageVal = enr.stage || enr.funding_stage;
+                if (stageVal && stageInput) stageInput.value = stageVal;
+                
+                // Amount source URL
+                if (enr.amount_source_url && sourceInputInvestment) {
+                  sourceInputInvestment.value = enr.amount_source_url;
+                } else if (!sourceInputInvestment?.value?.trim()) {
+                  // Default to source URL if no specific amount source
+                  if (sourceInputInvestment) sourceInputInvestment.value = urlToParse;
                 }
-                if (data.long_description && sourceInputInvestment) {
-                  // If amount source empty, default to the URL we parsed
-                  if (!sourceInputInvestment.value.trim()) {
-                    sourceInputInvestment.value = urlToParse;
-                  }
+                
+                // Long description
+                const longDescEl = document.getElementById(`ev_${idx}_longdesc`);
+                if (enr.long_description && longDescEl) {
+                  longDescEl.value = enr.long_description;
+                  fieldsUpdated++;
                 }
+                
+                log(`✅ Smart enrich complete (${fieldsUpdated} fields updated)`, "ok");
               }
             } catch (err) {
-              log(`⚠️ Parse error: ${err.message}`, "warn");
+              log(`⚠️ Enrich error: ${err.message}`, "warn");
             } finally {
-              parseBtn.disabled = false;
-              parseBtn.textContent = "🧠 Parse from source";
+              smartEnrichBtn.disabled = false;
+              smartEnrichBtn.textContent = "🧠 Smart Enrich";
             }
           };
 
@@ -4526,83 +5776,12 @@
           const sourceRow = document.createElement("div");
           sourceRow.style.display = "flex";
           sourceRow.style.alignItems = "center";
+          sourceRow.style.gap = "4px";
+          sourceInput.style.flex = "1";
           sourceRow.appendChild(sourceInput);
-          sourceRow.appendChild(parseBtn);
+          sourceRow.appendChild(createOpenBtn(sourceInput, "Source"));
+          sourceRow.appendChild(smartEnrichBtn);
           sourceGroup.appendChild(sourceRow);
-
-          // Enrich Event button (calls /enrich_event)
-          const enrichBtn = document.createElement("button");
-          enrichBtn.textContent = "🧪 Enrich Event";
-          enrichBtn.title = "Gather external evidence and populate fields (no DB save)";
-          enrichBtn.style.marginTop = "6px";
-          enrichBtn.style.padding = "6px 10px";
-          enrichBtn.style.fontSize = "11px";
-          enrichBtn.style.borderRadius = "6px";
-          enrichBtn.style.border = "1px solid rgba(99, 102, 241, 0.4)";
-          enrichBtn.style.background = "rgba(99, 102, 241, 0.12)";
-          enrichBtn.style.color = "#c7d2fe";
-          enrichBtn.style.cursor = "pointer";
-
-          enrichBtn.onclick = async () => {
-            const urlToParse = sourceInput.value.trim();
-            if (!urlToParse) {
-              log("⚠️ No source URL to enrich", "warn");
-              return;
-            }
-            enrichBtn.disabled = true;
-            enrichBtn.textContent = "⏳ Enriching…";
-            try {
-              const counterparties = (ev.counterparties || []).map(cp => cp.company_name || cp.name || cp.company || "").filter(Boolean);
-              const body = {
-                event: {
-                  title: titleInput ? titleInput.value : shortTitle,
-                  company: document.getElementById("ai_name")?.value || "",
-                  counterparties,
-                  source_url: urlToParse,
-                  announcement_date: annInput?.value || annDate || null,
-                  deal_type: typeSelect?.value || type || ""
-                }
-              };
-              const res = await fetch("/enrich_event", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-              });
-              const data = await res.json();
-              if (!res.ok || data.error) {
-                log(`⚠️ Enrich failed: ${data.error || res.status}`, "warn");
-              } else {
-                const enr = data.enriched_event || {};
-                if (enr.title && titleInput) titleInput.value = enr.title;
-                if (enr.announcement_date && annInput) annInput.value = parseToDateValue(enr.announcement_date);
-                if (enr.deal_type && typeSelect) typeSelect.value = enr.deal_type;
-                if (enr.deal_status && statusSelect) statusSelect.value = enr.deal_status;
-                if (typeof enr.amount !== "undefined" && amountInput) amountInput.value = enr.amount ?? "";
-                if (enr.currency && currencySelect) {
-                  const match = [...currencySelect.options].find(
-                    (o) =>
-                      (o.dataset.code && o.dataset.code.toUpperCase() === enr.currency.toUpperCase()) ||
-                      (o.textContent && o.textContent.toUpperCase() === enr.currency.toUpperCase())
-                  );
-                  if (match) {
-                    currencySelect.value = match.value;
-                  }
-                }
-                if (enr.stage && stageInput) stageInput.value = enr.stage;
-                if (enr.amount_source_url && sourceInputInvestment) sourceInputInvestment.value = enr.amount_source_url;
-                const longDescEl = document.getElementById(`ev_${idx}_longdesc`);
-                if (enr.long_description && longDescEl) longDescEl.value = enr.long_description;
-                log("✅ Enrichment populated fields (not saved to DB)", "ok");
-              }
-            } catch (err) {
-              log(`⚠️ Enrich error: ${err.message}`, "warn");
-            } finally {
-              enrichBtn.disabled = false;
-              enrichBtn.textContent = "🧪 Enrich Event";
-            }
-          };
-
-          sourceGroup.appendChild(enrichBtn);
 
           left.appendChild(titleLabel);
           left.appendChild(titleGroup);
@@ -4720,8 +5899,15 @@
           sourceInputInvestment.value = invSource || "";
           sourceInputInvestment.placeholder = "Source link for investment amount";
           sourceInputInvestment.id = `ev_${idx}_inv_source`;
+          sourceInputInvestment.style.flex = "1";
+          const sourceInvRow = document.createElement("div");
+          sourceInvRow.style.display = "flex";
+          sourceInvRow.style.alignItems = "center";
+          sourceInvRow.style.gap = "4px";
+          sourceInvRow.appendChild(sourceInputInvestment);
+          sourceInvRow.appendChild(createOpenBtn(sourceInputInvestment, "Amount Source"));
           sourceGroupInvestment.appendChild(sourceLabelInvestment);
-          sourceGroupInvestment.appendChild(sourceInputInvestment);
+          sourceGroupInvestment.appendChild(sourceInvRow);
           invGroup.appendChild(sourceGroupInvestment);
 
           // Save investment details (only when matched)
@@ -4962,7 +6148,7 @@
 
             cps.forEach((cp, cpIdx) => {
               const cpId = cp.id || cp.counterparty_id || null;
-              const name = cp.company_name || "Unknown";
+              const name = cleanCompanyName(cp.company_name) || "Unknown";
               const role = cp.role || cp.role_description || cp.type || "Counterparty";
               const typeId = cp.type_id || 0;
               const link = cp.company_linkedin_url || "";
@@ -5069,7 +6255,16 @@
                   }
                   
                   addCpBtn.textContent = "⏳ Creating counterparty...";
-                  const result = await createCounterpartyInDb(eventId, name, typeId || 17, addCpBtn, press, website);
+                  // If we already discovered this counterparty's company in DB, pass its company_id
+                  const result = await createCounterpartyInDb(
+                    eventId,
+                    name,
+                    typeId || 17,
+                    addCpBtn,
+                    press,
+                    website,
+                    existingCompanyId || null
+                  );
                   if (result && (result.id || result.counterparty_id)) {
                     const newCpId = result.id || result.counterparty_id;
                     // Update the card's dataset with the new counterparty ID
@@ -5101,6 +6296,68 @@
               checkBtn.style.cursor = "pointer";
               checkBtn.style.transition = "all 0.15s ease";
               headerBtns.appendChild(checkBtn);
+
+              // Enrich button – opens new tab with search UI for this company's website
+              const enrichBtn = document.createElement("button");
+              enrichBtn.textContent = "✨ Enrich";
+              enrichBtn.title = "Open enrichment for this company (requires website URL)";
+              enrichBtn.style.padding = "4px 10px";
+              enrichBtn.style.fontSize = "10px";
+              enrichBtn.style.borderRadius = "6px";
+              enrichBtn.style.border = "1px solid rgba(16, 185, 129, 0.5)";
+              enrichBtn.style.background = "rgba(16, 185, 129, 0.1)";
+              enrichBtn.style.color = "#6ee7b7";
+              enrichBtn.style.cursor = "pointer";
+              enrichBtn.style.transition = "all 0.15s ease";
+              // Hidden by default; shown when lookup confirms it's not in DB
+              enrichBtn.style.display = "none";
+              
+              // Helper to get current website URL
+              const getWebsiteUrl = () => {
+                const websiteInput = document.getElementById(`cp_${idx}_${cpIdx}_website`);
+                return (websiteInput && websiteInput.value.trim()) || website || "";
+              };
+              
+              // Update Enrich button state based on website availability
+              const updateEnrichBtnState = () => {
+                const currentWebsite = getWebsiteUrl();
+                if (currentWebsite && enrichBtn.style.display !== "none") {
+                  enrichBtn.disabled = false;
+                  enrichBtn.textContent = "✨ Enrich";
+                  enrichBtn.title = `Open enrichment with: ${currentWebsite}`;
+                  enrichBtn.style.opacity = "1";
+                  enrichBtn.style.cursor = "pointer";
+                } else if (!currentWebsite && enrichBtn.style.display !== "none") {
+                  enrichBtn.disabled = true;
+                  enrichBtn.textContent = "✨ Need Website";
+                  enrichBtn.title = "Enter company website URL first to enable enrichment";
+                  enrichBtn.style.opacity = "0.5";
+                  enrichBtn.style.cursor = "not-allowed";
+                }
+              };
+              
+              enrichBtn.onclick = () => {
+                const currentWebsite = getWebsiteUrl();
+                
+                if (!currentWebsite) {
+                  log("⚠️ Enter website URL in the edit section to enable enrichment", "warn");
+                  return;
+                }
+
+                const baseUrl = `${window.location.origin}${window.location.pathname}`;
+                const enrichUrl = `${baseUrl}?query=${encodeURIComponent(currentWebsite)}`;
+                log(`🚀 Opening enrichment for: ${currentWebsite}`, "info");
+                window.open(enrichUrl, "_blank");
+              };
+              headerBtns.appendChild(enrichBtn);
+              
+              // Watch for website input changes to update enrich button state
+              setTimeout(() => {
+                const websiteInput = document.getElementById(`cp_${idx}_${cpIdx}_website`);
+                if (websiteInput) {
+                  websiteInput.addEventListener("input", updateEnrichBtnState);
+                }
+              }, 100);
 
               headerBtns.appendChild(expandBtn);
               header.appendChild(headerBtns);
@@ -5181,7 +6438,7 @@
                     }
                   }
                   
-                  // Update badge based on result
+                  // Update badge & Enrich button based on result
                   if (foundId) {
                     existsInDb = true;
                     existingCompanyId = foundId;
@@ -5189,6 +6446,8 @@
                     badge.style.background = "rgba(16, 185, 129, 0.15)";
                     badge.style.color = "#10b981";
                     badge.style.border = "1px solid rgba(16, 185, 129, 0.3)";
+                    // Hide enrich when the company already exists in DB
+                    enrichBtn.style.display = "none";
                   } else {
                     existsInDb = false;
                     badge.textContent = "Not in DB";
@@ -5196,6 +6455,10 @@
                     badge.style.color = "#fca5a5";
                     badge.style.border = "1px solid rgba(239, 68, 68, 0.3)";
                     log(`⚠️ Counterparty "${companyName}" not found in DB`, "warn");
+                    // Show enrich button so user can run enrichment for this new company
+                    enrichBtn.style.display = "inline-flex";
+                    // Update state based on whether we have a website URL
+                    updateEnrichBtnState();
                   }
                 } catch (err) {
                   existsInDb = false;
@@ -5313,8 +6576,15 @@
               websiteInput.value = website;
               websiteInput.placeholder = "https://company.com";
               websiteInput.id = `cp_${idx}_${cpIdx}_website`;
+              websiteInput.style.flex = "1";
+              const websiteInputRow = document.createElement("div");
+              websiteInputRow.style.display = "flex";
+              websiteInputRow.style.alignItems = "center";
+              websiteInputRow.style.gap = "4px";
+              websiteInputRow.appendChild(websiteInput);
+              websiteInputRow.appendChild(createOpenBtn(websiteInput, "Website"));
               websiteGroup.appendChild(websiteLabel);
-              websiteGroup.appendChild(websiteInput);
+              websiteGroup.appendChild(websiteInputRow);
               details.appendChild(websiteGroup);
               // Keep reference for lookup/resets
               websiteInputRef = websiteInput;
@@ -5337,8 +6607,15 @@
               pressInput.value = press;
               pressInput.placeholder = "https://company.com/press/announcement...";
               pressInput.id = `cp_${idx}_${cpIdx}_press`;
+              pressInput.style.flex = "1";
+              const pressInputRow = document.createElement("div");
+              pressInputRow.style.display = "flex";
+              pressInputRow.style.alignItems = "center";
+              pressInputRow.style.gap = "4px";
+              pressInputRow.appendChild(pressInput);
+              pressInputRow.appendChild(createOpenBtn(pressInput, "Press Release"));
               pressGroup.appendChild(pressLabel);
-              pressGroup.appendChild(pressInput);
+              pressGroup.appendChild(pressInputRow);
               details.appendChild(pressGroup);
 
               // Save/Create buttons for counterparty
@@ -5427,7 +6704,16 @@
                   createBtn.textContent = "⏳ Creating...";
                   
                   const cpWebsite = document.getElementById(`bulk_cp_${i}_website`)?.value.trim() || "";
-                  const result = await createCounterpartyInDb(eventId, cpName, cpTypeId, createBtn, cpPressUrl, cpWebsite);
+                  // No prior lookup here – let Xano create/resolve company from name/URL
+                  const result = await createCounterpartyInDb(
+                    eventId,
+                    cpName,
+                    cpTypeId,
+                    createBtn,
+                    cpPressUrl,
+                    cpWebsite,
+                    null
+                  );
                   
                   if (result && (result.id || result.counterparty_id)) {
                     const newCpId = result.id || result.counterparty_id;
@@ -5538,15 +6824,8 @@
                   // Helper to get current LinkedIn value
                   const getCurrentLinkedIn = () => linkedinInput.value.trim() || personLinkedIn;
                   
-                  if (personLinkedIn) {
-                    const linkedinLink = document.createElement("a");
-                    linkedinLink.href = personLinkedIn;
-                    linkedinLink.target = "_blank";
-                    linkedinLink.className = "source-link";
-                    linkedinLink.style.fontSize = "10px";
-                    linkedinLink.textContent = "Open";
-                    linkedinRow.appendChild(linkedinLink);
-                  }
+                  // Open button for LinkedIn (uses current input value)
+                  linkedinRow.appendChild(createOpenBtn(linkedinInput, "LinkedIn"));
                   
                   // Button container (in top row)
                   const btnGroup = document.createElement("div");
@@ -5818,8 +7097,15 @@
               urlInput.id = `adv_${idx}_${advIdx}_url`;
               urlInput.value = advUrl;
               urlInput.placeholder = "https://company.com/press/...";
+              urlInput.style.flex = "1";
+              const urlInputRow = document.createElement("div");
+              urlInputRow.style.display = "flex";
+              urlInputRow.style.alignItems = "center";
+              urlInputRow.style.gap = "4px";
+              urlInputRow.appendChild(urlInput);
+              urlInputRow.appendChild(createOpenBtn(urlInput, "Announcement"));
               urlGroup.appendChild(urlLabel);
-              urlGroup.appendChild(urlInput);
+              urlGroup.appendChild(urlInputRow);
               details.appendChild(urlGroup);
 
               // Save button (if advisor exists in DB)
@@ -5950,7 +7236,7 @@
           // Add target first if exists
           if (target && target.name) {
             cpData.push({
-              name: target.name,
+              name: cleanCompanyName(target.name),
               role: "Target",
               url: target.url || "",
               announcement_url: target.counterparty_announcement_url || "",
@@ -5963,7 +7249,7 @@
               const arr = ev[key] || [];
             arr.forEach((cp) => {
               cpData.push({
-                name: cp.name || "Unknown",
+                name: cleanCompanyName(cp.name) || "Unknown",
                 role: cp.counterparty_status || cp.role || key.replace("_", " "),
               url: cp.url || cp.company_url || cp.website || "",
                   announcement_url: cp.counterparty_announcement_url || "",
@@ -6150,8 +7436,15 @@
               urlInput.id = `db_adv_${advIdx}_url`;
               urlInput.value = advUrl;
               urlInput.placeholder = "https://company.com/press/...";
+              urlInput.style.flex = "1";
+              const urlInputRow = document.createElement("div");
+              urlInputRow.style.display = "flex";
+              urlInputRow.style.alignItems = "center";
+              urlInputRow.style.gap = "4px";
+              urlInputRow.appendChild(urlInput);
+              urlInputRow.appendChild(createOpenBtn(urlInput, "Announcement"));
               urlGroup.appendChild(urlLabel);
-              urlGroup.appendChild(urlInput);
+              urlGroup.appendChild(urlInputRow);
               details.appendChild(urlGroup);
 
               // Save button (if advisor exists in DB)
@@ -7002,6 +8295,22 @@
             }
           }
 
+          // Override/augment DB overview + individuals with new APIs if companyId exists
+          if (companyId) {
+            const apiOverview = await fetchDbOverviewFromApi(companyId);
+            if (apiOverview) {
+              derived_db_overview = { ...(derived_db_overview || {}), ...apiOverview };
+            }
+            const apiIndividuals = await fetchDbIndividualsFromApi(companyId);
+            if (apiIndividuals && Array.isArray(apiIndividuals)) {
+              derived_db_management = apiIndividuals;
+            }
+            const apiEvents = await fetchDbEventsFromApi(companyId);
+            if (apiEvents && Array.isArray(apiEvents)) {
+              derived_db_events = apiEvents;
+            }
+          }
+
           // Update the prominent Xano status badge
           if (existing_company) {
             updateXanoStatus(existing_company, db_company);
@@ -7015,6 +8324,7 @@
 
           // Re-render ONLY DB sections with fresh data (don't touch AI sections)
           if (derived_db_overview) {
+            console.log("[DEBUG] derived_db_overview.year_founded =", derived_db_overview.year_founded);
             renderDBOverview(derived_db_overview);
           }
           if (derived_db_management) {
@@ -7036,32 +8346,77 @@
       // Helper function to extract db_overview from company data
       function extractDBOverviewFromCompany(companyInfo) {
         try {
-          const name = companyInfo.name || "";
-          const loc = companyInfo._locations || {};
+          // Support both shapes:
+          // - full db_company object (has .Company, .new_sectors_data, etc.)
+          // - plain Company object
+          const root = companyInfo || {};
+          const company = root.Company || root;
+
+          const company_id = company.id || 0;  // Extract company ID for dynamic page link
+          const name = company.name || "";
+          const loc = company._locations || {};
           const city = loc.City || "";
           const country = loc.Country || "";
-          const ownership_block = companyInfo._ownership_type || {};
+          const ownership_block = company._ownership_type || {};
           const ownership = ownership_block.ownership || "";
-          const linkedin_block = companyInfo.linkedin_data || {};
+          const linkedin_block = company.linkedin_data || {};
           const linkedin = linkedin_block.LinkedIn_URL || "";
-          const website = companyInfo.url || "";
-          const desc = companyInfo.description || "";
+          const website = company.url || "";
+          const desc = company.description || "";
 
           // Year founded - check _years.Year first (proper structure), fallback to year_founded
-          const years_block = companyInfo._years || {};
+          const years_block = company._years || {};
           let year_founded = "";
           if (years_block && years_block.Year) {
             year_founded = String(years_block.Year);
           } else {
-            // Fallback to direct year_founded field (but ignore if it's just a reference ID like 10)
-            const year_founded_raw = companyInfo.year_founded;
-            if (year_founded_raw && typeof year_founded_raw === 'number' && year_founded_raw > 1000) {
+            // Fallback to direct year_founded field
+            let year_founded_raw = company.year_founded;
+            
+            // Parse JSON string if needed (e.g., "{\"id\" : 13, \"year\" : \"2012\"}")
+            if (typeof year_founded_raw === 'string') {
+              try {
+                const parsed = JSON.parse(year_founded_raw);
+                if (parsed && typeof parsed === 'object') {
+                  // Extract year from parsed object
+                  year_founded = parsed.year || parsed.Year || "";
+                  if (!year_founded && parsed.id) {
+                    // Only use id if it looks like a year
+                    const idNum = parseInt(parsed.id, 10);
+                    if (!Number.isNaN(idNum) && idNum > 1800 && idNum < 3000) {
+                      year_founded = String(idNum);
+                    }
+                  }
+                } else {
+                  // It was a string that parsed to non-object (like a number string)
+                  const num = parseInt(parsed, 10);
+                  if (!Number.isNaN(num) && num > 1800 && num < 3000) {
+                    year_founded = String(num);
+                  }
+                }
+              } catch {
+                // Not valid JSON, check if it's a year string directly
+                const num = parseInt(year_founded_raw, 10);
+                if (!Number.isNaN(num) && num > 1800 && num < 3000) {
+                  year_founded = String(num);
+                }
+              }
+            } else if (typeof year_founded_raw === 'number' && year_founded_raw > 1800 && year_founded_raw < 3000) {
               year_founded = String(year_founded_raw);
+            } else if (typeof year_founded_raw === 'object' && year_founded_raw !== null) {
+              // Already an object
+              year_founded = year_founded_raw.year || year_founded_raw.Year || "";
+              if (!year_founded && year_founded_raw.id) {
+                const idNum = parseInt(year_founded_raw.id, 10);
+                if (!Number.isNaN(idNum) && idNum > 1800 && idNum < 3000) {
+                  year_founded = String(idNum);
+                }
+              }
             }
           }
 
           // Primary business focus
-          const business_focus_block = companyInfo.primary_business_focus_id || companyInfo._primary_business_focus || {};
+          const business_focus_block = company.primary_business_focus_id || company._primary_business_focus || {};
           let primary_business_focus = "";
           let primary_business_focus_id = 0;
           if (typeof business_focus_block === 'object' && business_focus_block !== null) {
@@ -7071,29 +8426,30 @@
 
           // Sectors
           const sectors = [];
-          const new_sectors_data = companyInfo.new_sectors_data || [];
+          // Prefer root-level new_sectors_data (as in Xano response), fallback to company-level
+          const new_sectors_data = root.new_sectors_data || company.new_sectors_data || [];
           if (Array.isArray(new_sectors_data) && new_sectors_data.length > 0) {
             try {
               const sectors_payload = new_sectors_data[0].sectors_payload;
               if (sectors_payload) {
                 const parsed_sectors = JSON.parse(sectors_payload);
                 // Add primary sectors
-                (parsed_sectors.primary_sectors || []).forEach(s => {
-                  if (s.sector_name) {
+                (parsed_sectors.primary_sectors || []).forEach((s) => {
+                  if (s && s.sector_name) {
                     sectors.push({
                       sector: s.sector_name,
                       id: s.id || 0,
-                      importance: "Primary"
+                      importance: "Primary",
                     });
                   }
                 });
                 // Add secondary sectors
-                (parsed_sectors.secondary_sectors || []).forEach(s => {
-                  if (s.sector_name) {
+                (parsed_sectors.secondary_sectors || []).forEach((s) => {
+                  if (s && s.sector_name) {
                     sectors.push({
                       sector: s.sector_name,
                       id: s.id || 0,
-                      importance: "Secondary"
+                      importance: "Secondary",
                     });
                   }
                 });
@@ -7103,10 +8459,39 @@
             }
           }
 
+          // Fallback to sectors_id / _sectors / sectors if new_sectors_data is empty
+          if (!sectors.length) {
+            const sectors_data =
+              company.sectors_id ||
+              company._sectors ||
+              company.sectors ||
+              [];
+            if (Array.isArray(sectors_data)) {
+              sectors_data.forEach((s) => {
+                if (s && typeof s === "object") {
+                  const sector_name =
+                    s.sector_name || s.sector || s.name || "";
+                  const importance =
+                    s.Sector_importance || s.importance || "";
+                  if (sector_name && sector_name.trim()) {
+                    sectors.push({
+                      sector: sector_name,
+                      id: s.id || 0,
+                      importance,
+                    });
+                  }
+                } else if (typeof s === "string" && s.trim()) {
+                  sectors.push({ sector: s });
+                }
+              });
+            }
+          }
+
           // Webpage monitored (press/news page URL)
           const webpage_monitored = companyInfo.webpage_monitored || companyInfo.press_page_url || "";
 
           return {
+            company_id,
             name,
             city,
             country,
@@ -7358,6 +8743,20 @@
               }`,
               "ok"
             );
+
+            // Override/augment DB overview with new company_overview API
+            const apiOverview = await fetchDbOverviewFromApi(existing_company.id);
+            if (apiOverview) {
+              derived_db_overview = { ...(derived_db_overview || {}), ...apiOverview };
+            }
+            const apiIndividuals = await fetchDbIndividualsFromApi(existing_company.id);
+            if (apiIndividuals && Array.isArray(apiIndividuals)) {
+              derived_db_management = apiIndividuals;
+            }
+            const apiEvents = await fetchDbEventsFromApi(existing_company.id);
+            if (apiEvents && Array.isArray(apiEvents)) {
+              derived_db_events = apiEvents;
+            }
           } else {
             window._dbCompanyId = null;  // Clear company ID
             window._companyId = null;    // Clear for individual creation
@@ -7366,6 +8765,7 @@
           }
 
           renderAIOverview(ai_overview || null);
+          console.log("[DEBUG] Main render - derived_db_overview.year_founded =", derived_db_overview?.year_founded);
           renderDBOverview(derived_db_overview || null);
           renderTopManagement(json.top_management || []);
           renderDBManagement(derived_db_management || []);
@@ -7398,6 +8798,10 @@
           runAnalyze();
         }
       });
+
+      if (testDbRenderBtn) {
+        testDbRenderBtn.addEventListener("click", testRenderDbById);
+      }
 
       // Check for URL query parameter and auto-fill search
       // This enables the "Enrich" button to open new tab with pre-filled search

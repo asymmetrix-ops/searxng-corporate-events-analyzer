@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,6 +90,50 @@ def get_corporate_events_by_company_id(company_id: int) -> List[dict]:
     except Exception as e:
         print(f"[Xano] get_corporate_events_by_company_id error: {e}")
         return []
+
+
+def search_press_page(url_or_domain: str, company_name: str = "") -> str:
+    """
+    Find a press/news page by searching for {domain} + news/press and picking the first
+    result on the same domain containing news/press/media.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url_or_domain)
+        domain = parsed.netloc or parsed.path
+        domain = domain.replace("www.", "")
+        if not domain:
+            domain = url_or_domain
+        base_domain = domain.lower()
+
+        queries = [
+            f"{base_domain} news",
+            f"{base_domain} press",
+            f"{base_domain} article",
+        ]
+        if company_name:
+            queries.append(f"{company_name} news")
+            queries.append(f"{company_name} press")
+            queries.append(f"{company_name} article")
+
+        for q in queries:
+            encoded = urllib.parse.quote_plus(q)
+            search_url = f"https://www.startpage.com/sp/search?query={encoded}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+            resp = requests.get(search_url, headers=headers, timeout=12)
+            if resp.status_code != 200:
+                continue
+
+            links = re.findall(r'href="(https?://[^"]+)"', resp.text, re.I)
+            for link in links:
+                link_lower = link.lower()
+                if base_domain in link_lower and any(k in link_lower for k in ["news", "press", "media", "press-release", "article"]):
+                    return link
+        return ""
+    except Exception as e:
+        print(f"[PressPage] search error: {e}")
+        return ""
 
 
 # ============================================================
@@ -461,6 +506,63 @@ Page text (truncated):
     return {"error": "Unexpected LLM format"}
 
 
+def validate_enriched_dates(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validates and fixes date logic issues in enriched event data:
+    1. Announcement date cannot be in the future
+    2. Closed date must be >= announcement date
+    3. If dates are swapped, fix them
+    """
+    from datetime import datetime
+    
+    def parse_date_flex(date_str):
+        if not date_str or not isinstance(date_str, str):
+            return None
+        date_str = date_str.strip()
+        formats = [
+            "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+            "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%B %Y", "%b %Y", "%Y"
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str.split("T")[0], fmt)
+            except:
+                continue
+        return None
+    
+    today = datetime.now()
+    
+    # Check both possible field names for dates
+    ann_key = "announcement_date" if "announcement_date" in result else "Announcement Date"
+    closed_key = "closed_date" if "closed_date" in result else "Closed Date"
+    
+    ann_str = result.get(ann_key, "") or ""
+    closed_str = result.get(closed_key, "") or ""
+    
+    ann_date = parse_date_flex(ann_str)
+    closed_date = parse_date_flex(closed_str)
+    
+    # Rule 1: Announcement date cannot be in the future
+    if ann_date and ann_date > today:
+        print(f"   ⚠️ Future announcement date: {ann_str} - clearing")
+        result[ann_key] = ""
+        ann_date = None
+    
+    # Rule 2: Closed date cannot be in the future
+    if closed_date and closed_date > today:
+        print(f"   ⚠️ Future closed date: {closed_str} - clearing")
+        result[closed_key] = ""
+        closed_date = None
+    
+    # Rule 3: If both dates exist, closed must be >= announcement
+    if ann_date and closed_date and closed_date < ann_date:
+        print(f"   🔄 Swapped dates: Ann={ann_str}, Closed={closed_str} - fixing")
+        result[ann_key] = closed_str
+        result[closed_key] = ann_str
+    
+    return result
+
+
 @app.post("/extract_event_meta", response_class=JSONResponse)
 async def extract_event_meta(payload: Dict[str, Any]) -> JSONResponse:
     """
@@ -563,6 +665,111 @@ async def enrich_event(payload: Dict[str, Any]) -> JSONResponse:
             return JSONResponse(enriched, status_code=400)
         return JSONResponse({"enriched_event": enriched})
     except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/smart_enrich_event", response_class=JSONResponse)
+async def smart_enrich_event(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Smart enrichment: First parse source URL, then search web if data is incomplete.
+    Body: { "url": "...", "event": { title, company, counterparties, ... } }
+    
+    Steps:
+    1. Fetch and AI-parse the source URL for detailed extraction
+    2. Check if key fields are complete (title, date, amount, description)
+    3. If incomplete, search the web for additional evidence
+    """
+    url = (payload or {}).get("url", "").strip()
+    ev = (payload or {}).get("event") or {}
+    
+    if not url:
+        return JSONResponse({"error": "Missing url"}, status_code=400)
+    
+    print(f"\n🧠 Smart Enrich: {url}")
+    result = {}
+    
+    try:
+        # =====================================================
+        # Step 1: Fetch and AI-parse the source URL
+        # =====================================================
+        print(f"   📄 Step 1: Parsing source URL...")
+        html = fetch_html(url)
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            body_text = soup.get_text(" ", strip=True)[:15000]  # Limit text
+            
+            # AI extraction from source
+            ai_data = ai_extract_event_from_text(body_text, url)
+            if ai_data and not ai_data.get("error"):
+                result = {**ai_data}
+                print(f"   ✅ AI extracted from source: title={bool(result.get('title'))}, date={bool(result.get('announcement_date'))}, amount={bool(result.get('investment_amount_m'))}")
+        else:
+            print(f"   ⚠️ Could not fetch source URL")
+        
+        # =====================================================
+        # Step 2: Check completeness of key fields
+        # =====================================================
+        has_title = bool(result.get("title"))
+        has_date = bool(result.get("announcement_date"))
+        has_amount = result.get("investment_amount_m") not in [None, "", "N/A", "nan", "NaN"]
+        has_description = bool(result.get("long_description")) and len(result.get("long_description", "")) > 100
+        
+        completeness = sum([has_title, has_date, has_amount, has_description])
+        print(f"   📊 Completeness: {completeness}/4 (title={has_title}, date={has_date}, amount={has_amount}, desc={has_description})")
+        
+        # =====================================================
+        # Step 3: If incomplete, search web for more evidence
+        # =====================================================
+        if completeness < 3:
+            print(f"   🔍 Step 2: Searching web for additional evidence...")
+            
+            # Build search context
+            company = ev.get("company", "") or result.get("company", "")
+            title = ev.get("title", "") or result.get("title", "")
+            counterparties = ev.get("counterparties", [])
+            
+            # Use the full enrichment pipeline
+            enrichment_event = {
+                "title": title,
+                "company": company,
+                "counterparties": counterparties,
+                "source_url": url,
+                "announcement_date": ev.get("announcement_date") or result.get("announcement_date"),
+                "deal_type": ev.get("deal_type") or result.get("deal_type", "")
+            }
+            
+            enriched = ai_enrich_single_event(enrichment_event)
+            if enriched and not enriched.get("error"):
+                # Merge: prefer enriched data for missing fields
+                for key in ["title", "announcement_date", "deal_type", "deal_status", 
+                           "amount", "currency", "stage", "amount_source_url", "long_description"]:
+                    if enriched.get(key) and not result.get(key):
+                        result[key] = enriched[key]
+                    # Also override if result has placeholder values
+                    elif enriched.get(key) and result.get(key) in [None, "", "N/A", "nan", "NaN"]:
+                        result[key] = enriched[key]
+                
+                # Map amount field names
+                if enriched.get("amount") and not result.get("investment_amount_m"):
+                    result["investment_amount_m"] = enriched["amount"]
+                if enriched.get("currency") and not result.get("investment_currency"):
+                    result["investment_currency"] = enriched["currency"]
+                if enriched.get("stage") and not result.get("funding_stage"):
+                    result["funding_stage"] = enriched["stage"]
+                    
+                print(f"   ✅ Web enrichment complete")
+        else:
+            print(f"   ✅ Source parsing sufficient, skipping web search")
+        
+        # =====================================================
+        # Step 4: Validate and fix date logic
+        # =====================================================
+        result = validate_enriched_dates(result)
+        
+        return JSONResponse({"enriched_event": result, "source": "smart_enrich"})
+        
+    except Exception as e:
+        print(f"   ❌ Smart enrich error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -1255,6 +1462,13 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                 val = line.split(":", 1)[-1].strip()
                 if is_valid_value(val):
                     company_name = val
+
+        # Always try web search to correct press page: prefer domain-based result
+        search_input = website or company_name
+        if search_input:
+            found_press = search_press_page(search_input, company_name)
+            if found_press:
+                press_page = found_press
 
         ai_overview = {
             "name": company_name,
