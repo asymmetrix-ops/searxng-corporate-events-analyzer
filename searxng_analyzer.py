@@ -15,6 +15,7 @@ from searxng_crawler import scrape_website
 from searxng_db import store_subsidiaries
 from bs4 import BeautifulSoup
 import base64
+from typing import Optional, Dict, Any
 
 def fetch_logo_free(company_name: str):
     """
@@ -666,10 +667,10 @@ def search_company_linkedin_startpage(query: str, clean_name: str = "", domain_h
 
 def search_linkedin_profile(name: str, company_name: str, position: str = "") -> str:
     """
-    Searches for a person's LinkedIn profile URL using REAL web search (Startpage).
-    Query: "company name" + "person name" + linkedin
-    Picks the first LinkedIn profile URL from search results.
-    Falls back to AI if real search fails.
+    Searches for a person's LinkedIn profile URL.
+    Delegates to search_person_linkedin() which uses the optimal formula:
+    "Name" Company Role linkedin site:linkedin.com/in
+    and trusts Google's first result.
     """
     if not name:
         return ""
@@ -677,33 +678,8 @@ def search_linkedin_profile(name: str, company_name: str, position: str = "") ->
     # Clean the name
     clean_name = re.sub(r'\b(Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Jr\.?|Sr\.?|III|II|IV)\b', '', name, flags=re.I).strip()
     
-    # Query format: "company" "name" linkedin - as user suggested
-    query1 = f'{company_name} {clean_name} linkedin'
-    url = search_linkedin_startpage(query1)
-    if url:
-        return url
-    
-    # Alternative: name + position + linkedin  
-    query2 = f'{clean_name} {position} linkedin'
-    url = search_linkedin_startpage(query2)
-    if url:
-        return url
-    
-    # Last resort: AI fallback
-    prompt = f"""LinkedIn URL for {clean_name} {position} at {company_name}.
-Return ONLY the URL. Format: https://www.linkedin.com/in/username
-If unknown, reply: UNKNOWN"""
-
-    try:
-        response = openrouter_chat("anthropic/claude-3.5-sonnet", prompt, f"LinkedIn-{clean_name}")
-        if response and "linkedin.com/in/" in response.lower() and "unknown" not in response.lower():
-            match = re.search(r'https?://(?:www\.)?linkedin\.com/in/([a-zA-Z0-9_-]+)', response, re.I)
-            if match:
-                return f"https://www.linkedin.com/in/{match.group(1)}"
-    except:
-        pass
-    
-    return ""
+    # Use the main search_person_linkedin function which has the correct "trust first result" logic
+    return search_person_linkedin(clean_name, company_name, position)
 
 
 def search_linkedin_profile_serpapi(name: str, company_name: str, position: str = "") -> str:
@@ -960,6 +936,785 @@ def search_company_linkedin(company_name: str, website_url: str = "") -> str:
     return ""
 
 
+def search_person_linkedin(person_name: str, company_name: str = "", position: str = "") -> str:
+    """
+    Search for a PERSON's LinkedIn profile using SerpAPI or Startpage.
+    Uses query variants like: "{person name} {position} {company name} linkedin"
+    
+    Args:
+        person_name: The person's name to search for
+        company_name: Optional company name to help narrow results
+        position: Optional role/title to improve disambiguation (e.g., CEO, CFO, Partner)
+        
+    Returns:
+        LinkedIn profile URL if found, empty string otherwise
+    """
+    if not person_name:
+        return ""
+    
+    serpapi_available = bool(SERPAPI_KEY)
+    
+    # Clean names for better matching
+    clean_person = person_name.strip()
+    clean_company = (company_name or "").strip()
+    
+    # Remove common company suffixes
+    for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
+                   ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
+        if clean_company.endswith(suffix):
+            clean_company = clean_company[:-len(suffix)].strip()
+    
+    # Clean position for better matching
+    clean_position = (position or "").strip()
+
+    def _role_acronyms(pos: str) -> list:
+        """
+        Extract common C-level acronyms from a verbose title.
+        Example: "Co-Founder and Chief Executive Officer" -> ["CEO"]
+        """
+        pos = (pos or "").strip()
+        if not pos:
+            return []
+        acr = []
+        for m in re.finditer(r"\bChief\s+([A-Za-z][A-Za-z\s]{0,40}?)\s+Officer\b", pos, re.I):
+            mid = (m.group(1) or "").strip()
+            parts = [p for p in re.split(r"[^A-Za-z]+", mid) if p]
+            if parts:
+                candidate = "C" + "".join(p[0].upper() for p in parts) + "O"
+                if candidate in {"CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO"}:
+                    acr.append(candidate)
+        for token in ["CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO", "SVP", "EVP", "VP"]:
+            if re.search(rf"\b{re.escape(token)}\b", pos, re.I):
+                acr.append(token)
+        out = []
+        for a in acr:
+            if a not in out:
+                out.append(a)
+        return out
+
+    role_terms = []
+    if clean_position:
+        role_terms.append(clean_position)
+        role_terms.extend(_role_acronyms(clean_position))
+
+    # Build search queries (most specific first)
+    # IMPORTANT: put the exact "name + company + role + linkedin" formula first.
+    queries = []
+    if clean_company and role_terms:
+        for role in role_terms[:2]:
+            queries.append(f'"{clean_person}" {clean_company} {role} linkedin site:linkedin.com/in')
+            queries.append(f'"{clean_person}" "{clean_company}" "{role}" linkedin site:linkedin.com/in')
+    if clean_company:
+        queries.append(f'"{clean_person}" {clean_company} linkedin site:linkedin.com/in')
+        queries.append(f'"{clean_person}" "{clean_company}" site:linkedin.com/in/')
+        queries.append(f'{clean_person} {clean_company} linkedin')
+    if role_terms:
+        for role in role_terms[:1]:
+            queries.append(f'"{clean_person}" {role} linkedin site:linkedin.com/in')
+    queries.append(f'"{clean_person}" linkedin site:linkedin.com/in')
+    queries.append(f'"{clean_person}" site:linkedin.com/in/')
+    queries.append(f'{clean_person} linkedin profile')
+
+    # Try SerpAPI first
+    if serpapi_available:
+        # -----------------------------------------------------------------
+        # STRATEGY: Trust Google's ranking for high-quality queries.
+        # For the FIRST query (name + company + role + linkedin), just grab
+        # the first linkedin.com/in/ result. Only use scoring for fallbacks.
+        # -----------------------------------------------------------------
+        for query_idx, query in enumerate(queries[:6]):
+            try:
+                params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+                search = GoogleSearch(params)
+                result = search.get_dict()
+                
+                if "error" in result:
+                    print(f"   ⚠️ SerpAPI person LinkedIn search error: {result['error']}")
+                    continue
+                
+                results = result.get("organic_results", [])
+                
+                for r in results:
+                    link = r.get("link", "")
+                    title_raw = r.get("title", "") or ""
+                    title = title_raw.lower()
+                    
+                    # Must be a LinkedIn profile (not company page, not posts)
+                    if "linkedin.com/in/" not in link:
+                        continue
+                    if any(bad in link.lower() for bad in ["/posts/", "/pulse/", "/jobs/", "/company/"]):
+                        continue
+                    
+                    # Extract profile slug
+                    match = re.search(r'linkedin\.com/in/([a-zA-Z0-9_-]+)', link)
+                    if not match:
+                        continue
+                    
+                    profile_slug = match.group(1).lower()
+                    
+                    # Skip generic slugs
+                    if profile_slug in ['in', 'pub', 'profile', 'company', 'jobs']:
+                        continue
+                    
+                    normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                    
+                    # ---------------------------------------------------------
+                    # PRIMARY QUERIES (index 0-1): Trust Google's first result
+                    # These are the "Name Company Role linkedin" queries — high
+                    # quality, so just take the first valid linkedin.com/in/
+                    # ---------------------------------------------------------
+                    if query_idx <= 1:
+                        print(f"   🔗 Found LinkedIn for {person_name}: {normalized_url} (trusted first result)")
+                        return normalized_url
+                    
+                    # ---------------------------------------------------------
+                    # FALLBACK QUERIES (index 2+): Require name in title/snippet
+                    # ---------------------------------------------------------
+                    person_lower = clean_person.lower()
+                    name_parts = [p for p in person_lower.split() if len(p) > 1]
+                    
+                    # Check if last name appears in title (most important)
+                    last_name = name_parts[-1] if name_parts else ""
+                    if last_name and last_name in title:
+                        print(f"   🔗 Found LinkedIn for {person_name}: {normalized_url}")
+                        return normalized_url
+                            
+            except Exception as e:
+                print(f"   ⚠️ SerpAPI person search error: {e}")
+                continue
+    
+    # Fallback: Startpage search with stricter matching
+    try:
+        import urllib.parse
+        
+        # More specific query with quotes for exact name match
+        fallback_queries = []
+        if clean_company and clean_position:
+            fallback_queries.append(f'"{clean_person}" "{clean_company}" "{clean_position}" linkedin')
+        if clean_company:
+            fallback_queries.append(f'"{clean_person}" "{clean_company}" linkedin')
+        if clean_position:
+            fallback_queries.append(f'"{clean_person}" "{clean_position}" linkedin')
+        fallback_queries.append(f'"{clean_person}" linkedin')
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        
+        for fq in fallback_queries[:3]:
+            encoded_query = urllib.parse.quote_plus(fq.strip())
+            search_url = f"https://www.startpage.com/sp/search?query={encoded_query}"
+
+            response = requests.get(search_url, headers=headers, timeout=15)
+            if response.status_code != 200:
+                continue
+
+            # Look for linkedin.com/in/ URLs
+            linkedin_matches = re.findall(r'https?://(?:www\.)?linkedin\.com/in/([a-zA-Z0-9_-]+)', response.text)
+
+            for profile_slug in linkedin_matches:
+                profile_slug = profile_slug.lower()
+                if profile_slug in ['in', 'pub', 'profile', 'company', 'jobs']:
+                    continue
+
+                # Stricter matching - require BOTH first AND last name in slug
+                person_lower = clean_person.lower()
+                name_parts = [p for p in person_lower.split() if len(p) > 1]
+
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    last_name = name_parts[-1]
+                    # Both first and last name should appear in slug
+                    if first_name in profile_slug and last_name in profile_slug:
+                        normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                        print(f"   🔗 Startpage LinkedIn for {person_name}: {normalized_url}")
+                        return normalized_url
+                elif name_parts:
+                    # Single name - just check that one
+                    if name_parts[0] in profile_slug:
+                        normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                        print(f"   🔗 Startpage LinkedIn for {person_name}: {normalized_url}")
+                        return normalized_url
+                    
+    except Exception as e:
+        print(f"   ⚠️ Startpage person search error: {e}")
+    
+    print(f"   ⚠️ No LinkedIn found for: {person_name}")
+    return ""
+
+
+def search_person_location(person_name: str, company_name: str = "", linkedin_url: str = "", position: str = "") -> dict:
+    """
+    Find a person's likely location (city/state/country) using SerpAPI or Startpage snippets.
+    Returns: {"city": "", "state": "", "country": ""} (any may be empty)
+    """
+    result = {"city": "", "state": "", "country": ""}
+    person_name = (person_name or "").strip()
+    company_name = (company_name or "").strip()
+    linkedin_url = (linkedin_url or "").strip()
+    position = (position or "").strip()
+
+    if not person_name:
+        return result
+
+    # Lightweight normalizers
+    country_map = {
+        "uk": "United Kingdom",
+        "u.k.": "United Kingdom",
+        "u.k": "United Kingdom",
+        "usa": "USA",
+        "us": "USA",
+        "u.s.": "USA",
+        "u.s.a.": "USA",
+        "united states": "USA",
+        "united states of america": "USA",
+    }
+
+    # Major US city → state heuristic (keeps it small + high-signal)
+    us_city_to_state = {
+        "san francisco": "California",
+        "los angeles": "California",
+        "san jose": "California",
+        "new york": "New York",
+        "new york city": "New York",
+        "nyc": "New York",
+        "seattle": "Washington",
+        "boston": "Massachusetts",
+        "cambridge": "Massachusetts",
+        "chicago": "Illinois",
+        "austin": "Texas",
+        "dallas": "Texas",
+        "houston": "Texas",
+        "miami": "Florida",
+        "denver": "Colorado",
+        "atlanta": "Georgia",
+        "phoenix": "Arizona",
+        "portland": "Oregon",
+    }
+
+    def normalize_country(c: str) -> str:
+        c = (c or "").strip()
+        if not c:
+            return ""
+        return country_map.get(c.lower(), c)
+
+    def finalize_location(loc: dict) -> dict:
+        if not loc:
+            return loc
+        city = (loc.get("city") or "").strip()
+        state = (loc.get("state") or "").strip()
+        country = normalize_country(loc.get("country") or "")
+        loc["country"] = country
+        city_low = city.lower().strip()
+
+        # Infer USA when a high-signal US city/region is detected but country is missing
+        if city and not country:
+            if "bay area" in city_low or "san francisco" in city_low:
+                loc["country"] = "USA"
+                country = "USA"
+            elif city_low in us_city_to_state:
+                loc["country"] = "USA"
+                country = "USA"
+
+        # Expand common US state abbreviations (SERP snippets often use "San Francisco, CA")
+        us_state_abbrev = {
+            "CA": "California",
+            "NY": "New York",
+            "WA": "Washington",
+            "MA": "Massachusetts",
+            "IL": "Illinois",
+            "TX": "Texas",
+            "FL": "Florida",
+            "CO": "Colorado",
+            "GA": "Georgia",
+            "AZ": "Arizona",
+            "OR": "Oregon",
+        }
+        if country in ["USA", "US", "United States"] and state and len(state) == 2 and state.upper() in us_state_abbrev:
+            loc["state"] = us_state_abbrev[state.upper()]
+            state = loc["state"]
+
+        # Infer state from US city when country indicates USA
+        if city and not state and country in ["USA", "US", "United States"]:
+            looked_up = us_city_to_state.get(city_low, "")
+            if looked_up:
+                loc["state"] = looked_up
+        return loc
+
+    # Location patterns (person-focused + generic)
+    location_patterns = [
+        r"based\s+in\s+([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+)",
+        r"based\s+in\s+([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+)",
+        r"located\s+in\s+([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+)",
+        r"located\s+in\s+([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z][a-zA-Z\s\.\-]+)",
+        r"([A-Z][a-zA-Z\s]+),\s*([A-Z]{2})\s*-based",
+        r"([A-Z][a-zA-Z\s]+)\s*-based",
+        r"([A-Z][a-zA-Z\s]+),\s*(USA|UK|United States|United Kingdom|California|Texas|New York|Florida|Illinois|Washington|Massachusetts)",
+    ]
+
+    def extract_location_from_text(text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+
+        # LinkedIn SERP snippets often contain "Location: X" (exactly like Google SEO snippet text).
+        # Example: "... Education: Duke University · Location: San Francisco · ..."
+        m = re.search(r"\blocation\s*[:\-]\s*([^\n\r|•·]+)", text, re.IGNORECASE)
+        if m:
+            raw = (m.group(1) or "").strip()
+            raw = re.split(r"\s*(?:\|\s*|•\s*|·\s*|-{1,2}\s*)", raw)[0].strip()
+            raw = re.sub(r"\s+\d+\+.*$", "", raw).strip()
+            if raw:
+                parts = [p.strip() for p in raw.split(",") if p and p.strip()]
+                if len(parts) >= 3:
+                    return {"city": parts[0], "state": parts[1], "country": normalize_country(parts[2])}
+                if len(parts) == 2:
+                    second = parts[1]
+                    if len(second.strip()) == 2 and second.strip().isalpha():
+                        return {"city": parts[0], "state": second.strip().upper(), "country": "USA"}
+                    return {"city": parts[0], "state": "", "country": normalize_country(second)}
+                if len(parts) == 1:
+                    return {"city": parts[0], "state": "", "country": ""}
+
+        for pattern in location_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                parts = []
+                if isinstance(match, tuple):
+                    parts = [p.strip() for p in match if p and p.strip()]
+                else:
+                    parts = [match.strip()]
+
+                if not parts:
+                    continue
+
+                city = ""
+                state = ""
+                country = ""
+
+                if len(parts) >= 3:
+                    city = parts[0]
+                    state = parts[1]
+                    country = normalize_country(parts[2])
+                elif len(parts) == 2:
+                    city = parts[0]
+                    second = parts[1]
+                    # US state abbreviation implies USA
+                    if len(second.strip()) == 2 and second.strip().isalpha():
+                        state = second.strip().upper()
+                        country = "USA"
+                    else:
+                        country = normalize_country(second)
+                elif len(parts) == 1:
+                    city = parts[0]
+
+                if city and len(city) > 2:
+                    return {"city": city, "state": state, "country": country}
+
+        return None
+
+    serpapi_available = bool(SERPAPI_KEY)
+
+    # Queries
+    def _role_acronyms(pos: str) -> list:
+        """
+        Extract common C-level acronyms from a verbose title.
+        Example: "Co-Founder and Chief Executive Officer" -> ["CEO"]
+        """
+        pos = (pos or "").strip()
+        if not pos:
+            return []
+        acr = []
+        # Pull each "Chief X Officer" segment and turn into C?O acronyms.
+        for m in re.finditer(r"\bChief\s+([A-Za-z][A-Za-z\s]{0,40}?)\s+Officer\b", pos, re.I):
+            mid = (m.group(1) or "").strip()
+            parts = [p for p in re.split(r"[^A-Za-z]+", mid) if p]
+            if parts:
+                candidate = "C" + "".join(p[0].upper() for p in parts) + "O"
+                # Normalize common ones (avoid weird long acronyms)
+                if candidate in {"CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO"}:
+                    acr.append(candidate)
+        # Also detect "VP"/"SVP"/"EVP" etc.
+        for token in ["CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO", "SVP", "EVP", "VP"]:
+            if re.search(rf"\b{re.escape(token)}\b", pos, re.I):
+                acr.append(token)
+        # De-dupe
+        out = []
+        for a in acr:
+            if a not in out:
+                out.append(a)
+        return out
+
+    role_terms = []
+    if position:
+        role_terms.append(position)
+        role_terms.extend(_role_acronyms(position))
+
+    # ============================================================
+    # STRATEGY: Use the exact formula that works in Google:
+    #   "{Name}" {Company} {Role} location
+    # NO site: constraint - let Google naturally return LinkedIn first.
+    # Then extract "Location: ..." from the SEO snippet.
+    # ============================================================
+    queries = []
+    
+    # PRIMARY QUERIES: exact formula from user's example
+    # "Jennifer Taylor" Plaid President location -> returns LinkedIn with "Location: San Francisco"
+    if company_name and role_terms:
+        for role in role_terms[:2]:
+            queries.append(f'"{person_name}" {company_name} {role} location')
+    
+    if company_name:
+        queries.append(f'"{person_name}" {company_name} location')
+    
+    if role_terms:
+        for role in role_terms[:2]:
+            queries.append(f'"{person_name}" {role} location')
+    
+    # FALLBACK QUERIES
+    queries.append(f'"{person_name}" location')
+    if linkedin_url:
+        queries.append(f'{linkedin_url} location')
+
+    # 1) SerpAPI (preferred) - TRUST GOOGLE'S FIRST RESULT
+    # The query "{Name}" {Company} {Role} location returns LinkedIn profile first
+    # with "Location: San Francisco" in the SEO snippet. Just grab it.
+    if serpapi_available:
+        for query in queries[:4]:  # Try up to 4 queries
+            try:
+                params = {"q": query, "num": 5, "api_key": SERPAPI_KEY}
+                search = GoogleSearch(params)
+                result = search.get_dict()
+                
+                if "error" in result:
+                    print(f"   ⚠️ SerpAPI location error: {result['error']}")
+                    continue
+                
+                results = result.get("organic_results", [])
+                
+                # Trust Google's ranking - take first result with "Location:" in snippet
+                for r in results:
+                    title = r.get("title", "") or ""
+                    snippet = r.get("snippet", "") or ""
+                    combined = f"{title} {snippet}"
+                    
+                    # Look for "Location:" pattern in the snippet (LinkedIn SEO format)
+                    loc = extract_location_from_text(combined)
+                    if loc and loc.get("city"):
+                        loc = finalize_location(loc)
+                        print(f"   📍 Person location for {person_name}: {loc} (from: {query[:50]}...)")
+                        return loc
+                        
+            except Exception as e:
+                print(f"   ⚠️ SerpAPI location error: {e}")
+                continue
+
+    # 2) Startpage fallback (quick + rough, like HQ fallback)
+    try:
+        import urllib.parse
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        for q in queries[:3]:
+            encoded_query = urllib.parse.quote_plus(q)
+            search_url = f"https://www.startpage.com/sp/search?query={encoded_query}"
+            resp = requests.get(search_url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                loc = extract_location_from_text(resp.text)
+                if loc and loc.get("city"):
+                    loc = finalize_location(loc)
+                    print(f"   📍 Startpage person location for {person_name}: {loc}")
+                    return loc
+    except Exception as e:
+        print(f"⚠️ Person location Startpage error: {e}")
+
+    return result
+
+
+def search_company_headquarters(company_name: str, website_url: str = "") -> dict:
+    """
+    Search for a company's headquarters location using SerpAPI or web search.
+    Uses queries like: "{company name} headquarters location city country"
+    
+    Args:
+        company_name: The company name to search for
+        website_url: Optional company website to help narrow results
+        
+    Returns:
+        Dict with keys: city, state, country (any may be empty string)
+    """
+    result = {"city": "", "state": "", "country": ""}
+    
+    if not company_name and not website_url:
+        return result
+    
+    serpapi_available = bool(SERPAPI_KEY)
+    
+    # Clean company name
+    clean_name = (company_name or "").strip()
+    for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
+                   ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
+        if clean_name.endswith(suffix):
+            clean_name = clean_name[:-len(suffix)].strip()
+    
+    # Extract domain from website
+    domain_hint = ""
+    if website_url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(website_url)
+            domain = parsed.netloc.replace("www.", "")
+            domain_hint = domain.split('.')[0] if '.' in domain else domain
+        except:
+            pass
+    
+    # Major US cities to state mapping (for automatic state lookup)
+    us_city_to_state = {
+        'san francisco': 'California', 'los angeles': 'California', 'san diego': 'California',
+        'san jose': 'California', 'oakland': 'California', 'palo alto': 'California',
+        'mountain view': 'California', 'menlo park': 'California', 'cupertino': 'California',
+        'sunnyvale': 'California', 'santa clara': 'California', 'redwood city': 'California',
+        'new york': 'New York', 'new york city': 'New York', 'nyc': 'New York', 'manhattan': 'New York',
+        'brooklyn': 'New York', 'buffalo': 'New York',
+        'seattle': 'Washington', 'bellevue': 'Washington', 'redmond': 'Washington',
+        'boston': 'Massachusetts', 'cambridge': 'Massachusetts',
+        'chicago': 'Illinois',
+        'austin': 'Texas', 'dallas': 'Texas', 'houston': 'Texas', 'san antonio': 'Texas',
+        'denver': 'Colorado', 'boulder': 'Colorado',
+        'atlanta': 'Georgia',
+        'miami': 'Florida', 'tampa': 'Florida', 'orlando': 'Florida',
+        'phoenix': 'Arizona', 'scottsdale': 'Arizona',
+        'portland': 'Oregon',
+        'las vegas': 'Nevada',
+        'salt lake city': 'Utah',
+        'raleigh': 'North Carolina', 'charlotte': 'North Carolina', 'durham': 'North Carolina',
+        'nashville': 'Tennessee',
+        'detroit': 'Michigan', 'ann arbor': 'Michigan',
+        'minneapolis': 'Minnesota',
+        'philadelphia': 'Pennsylvania', 'pittsburgh': 'Pennsylvania',
+        'washington': 'District of Columbia', 'washington dc': 'District of Columbia', 'washington d.c.': 'District of Columbia',
+        'arlington': 'Virginia', 'mclean': 'Virginia', 'reston': 'Virginia',
+        'baltimore': 'Maryland', 'bethesda': 'Maryland',
+        'indianapolis': 'Indiana',
+        'columbus': 'Ohio', 'cleveland': 'Ohio', 'cincinnati': 'Ohio',
+        'kansas city': 'Missouri', 'st louis': 'Missouri', 'st. louis': 'Missouri',
+        'omaha': 'Nebraska',
+        'new orleans': 'Louisiana',
+        'milwaukee': 'Wisconsin', 'madison': 'Wisconsin',
+        'hartford': 'Connecticut', 'stamford': 'Connecticut',
+        'providence': 'Rhode Island',
+        'jersey city': 'New Jersey', 'newark': 'New Jersey', 'hoboken': 'New Jersey',
+    }
+    
+    # Country name normalization
+    country_map = {
+        'united states': 'USA', 'united states of america': 'USA', 'us': 'USA', 'u.s.': 'USA', 'america': 'USA',
+        'united kingdom': 'UK', 'great britain': 'UK', 'britain': 'UK', 'england': 'UK', 'scotland': 'UK', 'wales': 'UK',
+        'united arab emirates': 'UAE', 'uae': 'UAE',
+    }
+    
+    # US state abbreviations
+    us_states = {
+        'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY',
+        'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND',
+        'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
+    }
+    
+    # US state full names to abbreviations
+    us_state_names = {
+        'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR', 'california': 'CA',
+        'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE', 'florida': 'FL', 'georgia': 'GA',
+        'hawaii': 'HI', 'idaho': 'ID', 'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA',
+        'kansas': 'KS', 'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
+        'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS', 'missouri': 'MO',
+        'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+        'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH',
+        'oklahoma': 'OK', 'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+        'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT', 'vermont': 'VT',
+        'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV', 'wisconsin': 'WI', 'wyoming': 'WY',
+        'district of columbia': 'DC', 'washington dc': 'DC', 'washington d.c.': 'DC'
+    }
+    
+    def normalize_country(c):
+        c_lower = c.lower().strip()
+        return country_map.get(c_lower, c.strip())
+    
+    def is_us_state(s):
+        """Check if string is a US state (full name or abbreviation)."""
+        s_upper = s.upper().strip()
+        s_lower = s.lower().strip()
+        return s_upper in us_states or s_lower in us_state_names
+    
+    def get_state_abbrev(s):
+        """Convert state name to abbreviation."""
+        s_upper = s.upper().strip()
+        s_lower = s.lower().strip()
+        if s_upper in us_states:
+            return s_upper
+        return us_state_names.get(s_lower, s.strip())
+    
+    def lookup_state_for_city(city, country):
+        """Look up state for a US city if country is USA."""
+        if country.upper() not in ['USA', 'US', 'UNITED STATES', 'AMERICA']:
+            return ""
+        city_lower = city.lower().strip()
+        if city_lower in us_city_to_state:
+            return us_city_to_state[city_lower]
+        return ""
+    
+    def finalize_location(loc):
+        """Ensure state is populated if we have city + USA."""
+        if not loc:
+            return loc
+        city = loc.get("city", "")
+        state = loc.get("state", "")
+        country = loc.get("country", "")
+        
+        # If we have city + USA but no state, look it up
+        if city and not state and country in ['USA', 'US', 'United States']:
+            looked_up = lookup_state_for_city(city, country)
+            if looked_up:
+                loc["state"] = looked_up
+                print(f"   📍 Looked up state for {city}: {looked_up}")
+        
+        return loc
+    
+    # Common location patterns to extract
+    location_patterns = [
+        # "headquartered in City, State, Country"
+        r'headquartered\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # "headquartered in City, Country" or "headquartered in City, State"
+        r'headquartered\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # "based in City, State, Country"
+        r'based\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # "based in City, Country"
+        r'based\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # "headquarters in City, State"
+        r'headquarters?\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # "City, State-based" or "City-based"
+        r'([A-Z][a-zA-Z\s\.]+),\s*([A-Z]{2})\s*-based',
+        # "located in City, Country"
+        r'located\s+in\s+([A-Z][a-zA-Z\s\.]+),\s*([A-Z][a-zA-Z\s\.]+)',
+        # Simple "City, USA" or "City, California" patterns
+        r'([A-Z][a-zA-Z\s]+),\s*(USA|UK|United States|California|Texas|New York|Florida|Illinois|Washington|Massachusetts)',
+    ]
+    
+    def extract_location_from_text(text):
+        """Try to extract city, state, country from text snippets."""
+        for pattern in location_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    parts = [p.strip() for p in match if p and p.strip()]
+                else:
+                    parts = [match.strip()]
+                
+                if not parts:
+                    continue
+                
+                city = ""
+                state = ""
+                country = ""
+                
+                if len(parts) >= 3:
+                    city = parts[0]
+                    state = parts[1]
+                    country = normalize_country(parts[2])
+                elif len(parts) == 2:
+                    city = parts[0]
+                    # Check if second part is a US state (full name or abbreviation)
+                    if is_us_state(parts[1]):
+                        state = get_state_abbrev(parts[1])
+                        country = "USA"
+                    else:
+                        country = normalize_country(parts[1])
+                elif len(parts) == 1:
+                    city = parts[0]
+                
+                if city and len(city) > 2:
+                    return {"city": city, "state": state, "country": country}
+        
+        return None
+    
+    # Try SerpAPI first
+    if serpapi_available:
+        for query in [
+            f'"{clean_name}" headquarters location',
+            f'"{clean_name}" head office city',
+            f'{clean_name} company headquarters',
+        ][:3]:
+            try:
+                params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+                search = GoogleSearch(params)
+                api_result = search.get_dict()
+                
+                if "error" in api_result:
+                    print(f"   ⚠️ SerpAPI HQ search error: {api_result['error']}")
+                    continue
+                
+                # Check snippets for location info
+                results = api_result.get("organic_results", [])
+                for r in results:
+                    snippet = r.get("snippet", "")
+                    title = r.get("title", "")
+                    combined = f"{title} {snippet}"
+                    
+                    location = extract_location_from_text(combined)
+                    if location and location.get("city"):
+                        location = finalize_location(location)
+                        print(f"   📍 Found HQ for {company_name}: {location}")
+                        return location
+                
+                # Also check knowledge graph if available
+                kg = api_result.get("knowledge_graph", {})
+                if kg:
+                    hq = kg.get("headquarters", "") or kg.get("location", "")
+                    if hq:
+                        location = extract_location_from_text(f"headquartered in {hq}")
+                        if location and location.get("city"):
+                            location = finalize_location(location)
+                            print(f"   📍 Found HQ (KG) for {company_name}: {location}")
+                            return location
+                        
+            except Exception as e:
+                print(f"   ⚠️ SerpAPI HQ search error: {e}")
+                continue
+    
+    # Fallback: Startpage search with multiple queries
+    fallback_queries = [
+        f"{clean_name} headquarters",
+        f"{clean_name} head office location",
+        f'"{clean_name}" company location city',
+    ]
+    if domain_hint:
+        fallback_queries.insert(0, f"{domain_hint} company headquarters location")
+    
+    for fallback_query in fallback_queries[:2]:
+        try:
+            import urllib.parse
+            
+            encoded_query = urllib.parse.quote_plus(fallback_query)
+            search_url = f"https://www.startpage.com/sp/search?query={encoded_query}"
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+            
+            response = requests.get(search_url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                location = extract_location_from_text(response.text)
+                if location and location.get("city"):
+                    location = finalize_location(location)
+                    print(f"   📍 Startpage HQ for {company_name}: {location}")
+                    return location
+                        
+        except Exception as e:
+            print(f"   ⚠️ Startpage HQ search error: {e}")
+            continue
+    
+    print(f"   ⚠️ No headquarters found for: {company_name}")
+    return result
+
+
 def get_top_management(company_name, text=""):
     """
     Robustly extracts top management (CEO, CFO, etc.) from Wikipedia, LinkedIn, Crunchbase, or AI models.
@@ -1034,10 +1789,10 @@ For EACH executive, provide:
     - https://company.com/leadership (without person name)
     - https://company.com/ (homepage)
   If no dedicated individual page exists, use empty string "".
-- bio: Professional executive summary (3-5 sentences) in THIS EXACT STYLE:
+- bio: Professional executive summary (3-5 sentences) with SPECIFIC, VERIFIABLE details:
 
 EXAMPLE BIO STYLE:
-"Experienced CEO and Board Director with successful track record in Technology and Financial Services. 20+ years in decision making roles for Private Equity and Corporates. Skilled in General Management, Transformational Leadership, Strategy Development and M&A. International profile having operated out of US, UK and EMEA. MBA from Harvard Business School."
+"Experienced CEO and Board Director with successful track record in Technology and Financial Services. 20+ years in decision making roles for Private Equity and Corporates. Skilled in General Management, Transformational Leadership, Strategy Development and M&A. International profile having operated out of US, UK and EMEA. MBA from Harvard Business School and BSc in Computer Science from MIT."
 
 BIO REQUIREMENTS:
 - Write in third person, professional tone
@@ -1045,7 +1800,15 @@ BIO REQUIREMENTS:
 - Include industry expertise and sectors
 - Mention key skills and competencies
 - Note international experience if applicable
-- End with education background (degrees, universities)
+- End with SPECIFIC education: name ACTUAL universities and degree types (e.g., "MBA from DePaul University and BSc in Computer Systems from University of Nevada")
+
+CRITICAL BIO RULES - DO NOT USE:
+- NEVER write "holds a degree from a leading university" - name the ACTUAL university
+- NEVER write "graduated from a top institution" - be specific
+- NEVER write "academic background in the field" - list actual degrees
+- NEVER write "earned credentials from a prestigious school" - name it
+- NEVER use bracketed references like (1), (2), [4], [5] 
+- If you don't know the actual university, OMIT education entirely rather than being vague
 - NO bullet points, write as flowing paragraph
 
 CONTEXT ABOUT {company_name}:
@@ -1130,7 +1893,35 @@ Return JSON array only:
                 print(f"   ⚠️ No LinkedIn found for {name}")
 
     # =====================================================
-    # 5️⃣ Clean & Deduplicate
+    # 5️⃣ Clean Bios - Remove Citations & Generic Text
+    # =====================================================
+    for m in management_results:
+        bio = m.get("bio", "")
+        if bio:
+            # Remove bracketed citation references like (1), (2), [4], [5]
+            bio = re.sub(r'\s*\(\d+\)', '', bio)
+            bio = re.sub(r'\s*\[\d+\]', '', bio)
+            bio = re.sub(r'\s*\(\d+,\s*\d+\)', '', bio)  # (1, 2)
+            bio = re.sub(r'\s*\[\d+,\s*\d+\]', '', bio)  # [1, 2]
+            
+            # Remove generic educational phrases
+            generic_patterns = [
+                r'Holds?\s+a\s+(bachelor\'?s?|master\'?s?|doctorate|PhD|degree)\s+from\s+a\s+(leading|top|prestigious|renowned)\s+(U\.S\.|US|university|institution|school)[^.]*\.',
+                r'Earned\s+a\s+(bachelor\'?s?|master\'?s?|doctorate|PhD|degree)\s+from\s+a\s+(leading|top|prestigious|renowned)\s+(U\.S\.|US|university|institution|school)[^.]*\.',
+                r'Graduated\s+from\s+a\s+(leading|top|prestigious|renowned)\s+(U\.S\.|US|university|institution|school)[^.]*\.',
+                r'Has\s+an?\s+academic\s+background\s+in\s+(the\s+)?field[^.]*\.',
+                r'Earned\s+credentials?\s+from\s+a\s+(prestigious|top|leading)\s+(school|institution)[^.]*\.',
+            ]
+            for pattern in generic_patterns:
+                bio = re.sub(pattern, '', bio, flags=re.IGNORECASE)
+            
+            # Clean up whitespace and double periods
+            bio = re.sub(r'\s{2,}', ' ', bio).strip()
+            bio = re.sub(r'\.{2,}', '.', bio)
+            m["bio"] = bio
+    
+    # =====================================================
+    # 6️⃣ Clean & Deduplicate URLs
     # =====================================================
     
     def is_valid_individual_page_url(url: str, person_name: str) -> bool:
@@ -1941,22 +2732,29 @@ For EACH verified event, extract these EXACT fields:
 
 11. **advisors**: Array of professional advisory firms that advised on this transaction.
    
-   ADVISOR TYPES:
+   ⚠️ IMPORTANT: EXCLUDE LEGAL ADVISORS - Only extract financial and consulting advisors!
+   
+   ADVISOR TYPES TO INCLUDE:
    - Financial advisors (investment banks): Goldman Sachs, Morgan Stanley, JP Morgan, Lazard, Evercore, Centerview Partners, PJT Partners, Rothschild, Moelis, Jefferies, etc.
-   - Legal advisors (law firms): Skadden, Sullivan & Cromwell, Wachtell Lipton, Kirkland & Ellis, Simpson Thacher, Latham & Watkins, Davis Polk, Freshfields, Clifford Chance, etc.
    - Consulting/Due Diligence: McKinsey, BCG, Bain, Deloitte, EY, KPMG, PwC, etc.
+   
+   ❌ DO NOT INCLUDE:
+   - Legal advisors / Law firms (Skadden, Sullivan & Cromwell, Wachtell Lipton, Kirkland & Ellis, Simpson Thacher, Latham & Watkins, Davis Polk, Freshfields, Clifford Chance, etc.)
+   - Any firm providing legal counsel, legal representation, or legal services
    
    For EACH advisor include:
    - advisor_name: Exact name of the advisory firm (REQUIRED)
-   - advisor_type: "Financial Advisor" | "Legal Advisor" | "Due Diligence" | "Tax Advisor" | "Other"
+   - advisor_type: "Financial Advisor" | "Due Diligence" | "Tax Advisor" | "Other" (NOT "Legal Advisor")
    - advised_party: Which counterparty they advised (e.g., "S&P Global", "Target", "Buyer")
    - announcement_url: URL where this advisor relationship was mentioned, if available
    
-   ADVISOR EXTRACTION TIPS:
-   - Look for phrases like "advised by", "financial advisor to", "legal counsel to", "represented by"
-   - Investment banks often advise on deal terms, valuation, and negotiations
-   - Law firms handle legal documentation, regulatory filings, due diligence
-   - If no advisors mentioned, use empty array []
+   ADVISOR EXTRACTION RULES:
+   ✓ ONLY extract advisors EXPLICITLY mentioned in deal announcements/press releases
+   ✓ Look for phrases like "advised by", "financial advisor to", "served as financial advisor"
+   ✓ Investment banks often advise on deal terms, valuation, and negotiations
+   ✓ DO NOT infer or guess advisors - only include if explicitly stated in sources
+   ✓ If no advisors explicitly mentioned, use empty array []
+   ✗ NEVER include law firms or legal counsel (out of scope)
 
 COUNTERPARTY EXTRACTION RULES:
 ✓ EVERY deal has at least 2 counterparties (e.g., Acquirer + Target)
@@ -2002,8 +2800,7 @@ Return ONLY valid JSON array (no markdown, no explanation):
       {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Lance Uggla", "title": "Chairman & CEO", "linkedin_url": ""}}]}}
     ],
     "advisors": [
-      {{"advisor_name": "Goldman Sachs", "advisor_type": "Financial Advisor", "advised_party": "S&P Global", "announcement_url": ""}},
-      {{"advisor_name": "Davis Polk & Wardwell", "advisor_type": "Legal Advisor", "advised_party": "S&P Global", "announcement_url": ""}}
+      {{"advisor_name": "Goldman Sachs", "advisor_type": "Financial Advisor", "advised_party": "S&P Global", "announcement_url": ""}}
     ]
   }},
   {{
@@ -2111,13 +2908,46 @@ JSON:'''
             elif not deal_status:
                 deal_status = "Unknown"
             
-            # Extract advisors
+            # Extract advisors (EXCLUDING legal advisors)
             advisors = []
+            # Known legal advisor indicators
+            legal_keywords = ['legal', 'law', 'counsel', 'attorney', 'solicitor', 'llp', 'lawyers']
+            known_law_firms = [
+                'skadden', 'sullivan & cromwell', 'sullivan cromwell', 'wachtell', 'kirkland',
+                'simpson thacher', 'latham', 'davis polk', 'freshfields', 'clifford chance',
+                'allen & overy', 'linklaters', 'white & case', 'cleary gottlieb', 'cravath',
+                'debevoise', 'paul weiss', 'weil gotshal', 'milbank', 'gibson dunn',
+                'sidley', 'jones day', 'baker mckenzie', 'hogan lovells', 'norton rose',
+                'dla piper', 'herbert smith', 'ashurst', 'slaughter and may', 'cooley'
+            ]
+            
             for adv in e.get("advisors", []):
                 if adv and isinstance(adv, dict):
+                    adv_name = str(adv.get("advisor_name", "")).strip()
+                    adv_type = str(adv.get("advisor_type", "")).strip()
+                    adv_name_lower = adv_name.lower()
+                    adv_type_lower = adv_type.lower()
+                    
+                    # Skip if explicitly marked as legal advisor
+                    if 'legal' in adv_type_lower:
+                        print(f"   ⚠️ Excluding legal advisor: {adv_name}")
+                        continue
+                    
+                    # Skip if name matches known law firms
+                    is_law_firm = any(law_firm in adv_name_lower for law_firm in known_law_firms)
+                    if is_law_firm:
+                        print(f"   ⚠️ Excluding law firm: {adv_name}")
+                        continue
+                    
+                    # Skip if name contains legal keywords
+                    has_legal_keyword = any(kw in adv_name_lower for kw in legal_keywords)
+                    if has_legal_keyword and 'financial' not in adv_type_lower:
+                        print(f"   ⚠️ Excluding potential legal advisor: {adv_name}")
+                        continue
+                    
                     advisors.append({
-                        "advisor_name": str(adv.get("advisor_name", "")).strip(),
-                        "advisor_type": str(adv.get("advisor_type", "")).strip(),
+                        "advisor_name": adv_name,
+                        "advisor_type": adv_type,
                         "advised_party": str(adv.get("advised_party", "")).strip(),
                         "announcement_url": str(adv.get("announcement_url", "")).strip()
                     })

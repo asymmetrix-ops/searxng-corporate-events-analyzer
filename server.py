@@ -26,6 +26,99 @@ import requests
 from bs4 import BeautifulSoup
 
 
+def _parse_openrouter_json(raw: str) -> dict:
+    """
+    Best-effort parser for OpenRouter responses that should be JSON.
+    Accepts raw JSON or JSON wrapped in code fences.
+    """
+    if not raw:
+        return {}
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.replace("json", "", 1).strip()
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_location_with_ai(person_name: str, company_name: str, position: str, linkedin_url: str, loc: dict) -> dict:
+    """
+    Mandatory normalization step: expand US state abbreviations (e.g., CA->California),
+    standardize to our canonical format, and ensure {city,state,country}.
+    Uses OpenRouter for normalization; falls back to original loc if parsing fails.
+    """
+    if not loc:
+        return {"city": "", "state": "", "country": ""}
+
+    raw_location = ", ".join([str(loc.get("city", "")).strip(), str(loc.get("state", "")).strip(), str(loc.get("country", "")).strip()]).strip(", ").strip()
+
+    prompt = f"""
+You are a location normalizer.
+Return STRICT one-line minified JSON (no code fences) with keys: {{"city":"","state":"","country":""}}.
+
+Our canonical standard is:
+- city: city/metro name (e.g., "Chicago")
+- state: state/province/region (full name, not abbreviation) (e.g., "Illinois")
+- country: full English country name (e.g., "United States")
+
+Rules:
+- Expand abbreviations where possible:
+  - US states: CA->California, NY->New York, WA->Washington, MA->Massachusetts, IL->Illinois, TX->Texas, FL->Florida, CO->Colorado, GA->Georgia, AZ->Arizona, OR->Oregon, DC->District of Columbia.
+  - Countries: US/USA/U.S. -> United States; UK/U.K. -> United Kingdom; UAE -> United Arab Emirates.
+- If a location implies a country but it’s missing, infer it.
+- If the location is a region/metro (e.g., "Washington DC-Baltimore Area"), choose the best canonical city/state/country (e.g., city="Washington", state="District of Columbia", country="United States") if reasonable.
+- Never return abbreviations in state or country. Prefer full names.
+- If unknown, use empty strings.
+
+Context:
+- Person: {person_name}
+- Company: {company_name}
+- Position: {position}
+- LinkedIn URL: {linkedin_url}
+- Raw extracted location: {raw_location}
+"""
+
+    try:
+        raw = openrouter_chat("openai/gpt-4o-mini", prompt, f"normalize-location-{person_name[:32]}")
+        parsed = _parse_openrouter_json(raw)
+        out = {
+            "city": (parsed.get("city") or "").strip(),
+            "state": (parsed.get("state") or "").strip(),
+            "country": (parsed.get("country") or "").strip(),
+        }
+        # Lightweight final normalization / guardrails (global-friendly)
+        country_norm = {
+            "usa": "United States",
+            "us": "United States",
+            "u.s.": "United States",
+            "u.s.a.": "United States",
+            "united states of america": "United States",
+            "uk": "United Kingdom",
+            "u.k.": "United Kingdom",
+            "united kingdom of great britain and northern ireland": "United Kingdom",
+            "uae": "United Arab Emirates",
+        }
+        if out["country"]:
+            out["country"] = country_norm.get(out["country"].strip().lower(), out["country"])
+        # "DC" -> "District of Columbia" if AI leaves it abbreviated
+        if out["state"].strip().upper() == "DC":
+            out["state"] = "District of Columbia"
+        # If AI returned nothing useful, fall back
+        if any(out.values()):
+            return out
+    except Exception as e:
+        print(f"⚠️ Location normalization AI error: {e}")
+
+    return {
+        "city": (loc.get("city") or "").strip(),
+        "state": (loc.get("state") or "").strip(),
+        "country": (loc.get("country") or "").strip(),
+    }
+
+
 # ============================================================
 # 🔹 Environment
 # ============================================================
@@ -796,6 +889,188 @@ async def index(request: Request) -> HTMLResponse:
     )
 
 
+@app.post("/api/search_company_headquarters", response_class=JSONResponse)
+async def search_company_headquarters_api(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Search for a company's headquarters location, or look up state if city/country provided.
+    Body: { "company": "Acme Corp", "website": "https://acme.com", "city": "San Francisco", "country": "USA" }
+    Returns: { "city": "San Francisco", "state": "California", "country": "USA" }
+    """
+    company = (payload or {}).get("company", "").strip()
+    website = (payload or {}).get("website", "").strip()
+    existing_city = (payload or {}).get("city", "").strip()
+    existing_country = (payload or {}).get("country", "").strip()
+    
+    # Major US cities to state mapping
+    us_city_to_state = {
+        'san francisco': 'California', 'los angeles': 'California', 'san diego': 'California',
+        'san jose': 'California', 'oakland': 'California', 'palo alto': 'California',
+        'mountain view': 'California', 'menlo park': 'California', 'cupertino': 'California',
+        'sunnyvale': 'California', 'santa clara': 'California', 'redwood city': 'California',
+        'irvine': 'California', 'santa monica': 'California', 'pasadena': 'California',
+        'new york': 'New York', 'new york city': 'New York', 'nyc': 'New York', 'manhattan': 'New York',
+        'brooklyn': 'New York', 'buffalo': 'New York',
+        'seattle': 'Washington', 'bellevue': 'Washington', 'redmond': 'Washington',
+        'boston': 'Massachusetts', 'cambridge': 'Massachusetts',
+        'chicago': 'Illinois',
+        'austin': 'Texas', 'dallas': 'Texas', 'houston': 'Texas', 'san antonio': 'Texas', 'plano': 'Texas',
+        'denver': 'Colorado', 'boulder': 'Colorado',
+        'atlanta': 'Georgia',
+        'miami': 'Florida', 'tampa': 'Florida', 'orlando': 'Florida', 'jacksonville': 'Florida',
+        'phoenix': 'Arizona', 'scottsdale': 'Arizona', 'tempe': 'Arizona',
+        'portland': 'Oregon',
+        'las vegas': 'Nevada', 'reno': 'Nevada',
+        'salt lake city': 'Utah',
+        'raleigh': 'North Carolina', 'charlotte': 'North Carolina', 'durham': 'North Carolina',
+        'nashville': 'Tennessee',
+        'detroit': 'Michigan', 'ann arbor': 'Michigan',
+        'minneapolis': 'Minnesota', 'st paul': 'Minnesota',
+        'philadelphia': 'Pennsylvania', 'pittsburgh': 'Pennsylvania',
+        'washington': 'District of Columbia', 'washington dc': 'District of Columbia', 
+        'washington d.c.': 'District of Columbia', 'dc': 'District of Columbia',
+        'arlington': 'Virginia', 'mclean': 'Virginia', 'reston': 'Virginia', 'alexandria': 'Virginia',
+        'baltimore': 'Maryland', 'bethesda': 'Maryland',
+        'indianapolis': 'Indiana',
+        'columbus': 'Ohio', 'cleveland': 'Ohio', 'cincinnati': 'Ohio',
+        'kansas city': 'Missouri', 'st louis': 'Missouri', 'st. louis': 'Missouri',
+        'omaha': 'Nebraska',
+        'new orleans': 'Louisiana',
+        'milwaukee': 'Wisconsin', 'madison': 'Wisconsin',
+        'hartford': 'Connecticut', 'stamford': 'Connecticut', 'greenwich': 'Connecticut',
+        'providence': 'Rhode Island',
+        'jersey city': 'New Jersey', 'newark': 'New Jersey', 'hoboken': 'New Jersey', 'princeton': 'New Jersey',
+    }
+    
+    # If we already have city + USA/US, just look up the state
+    if existing_city and existing_country:
+        country_upper = existing_country.upper().strip()
+        if country_upper in ['USA', 'US', 'UNITED STATES', 'UNITED STATES OF AMERICA', 'AMERICA']:
+            city_lower = existing_city.lower().strip()
+            state = us_city_to_state.get(city_lower, "")
+            if state:
+                result = {"city": existing_city, "state": state, "country": "USA"}
+                print(f"📍 State lookup for {existing_city}, {existing_country}: {state}")
+                return JSONResponse(result)
+            else:
+                print(f"⚠️ Unknown US city: {existing_city}, trying web search...")
+        else:
+            # Non-US country - just return what we have
+            result = {"city": existing_city, "state": "", "country": existing_country}
+            print(f"📍 Non-US location: {existing_city}, {existing_country}")
+            return JSONResponse(result)
+    
+    if not company and not website:
+        return JSONResponse({"error": "Missing 'company' or 'website' field", "city": "", "state": "", "country": ""}, status_code=400)
+    
+    try:
+        from searxng_analyzer import search_company_headquarters
+        result = search_company_headquarters(company, website)
+        
+        # If search found a city + USA but no state, try lookup
+        if result.get("city") and result.get("country", "").upper() in ['USA', 'US'] and not result.get("state"):
+            city_lower = result["city"].lower().strip()
+            state = us_city_to_state.get(city_lower, "")
+            if state:
+                result["state"] = state
+                print(f"📍 Added state from lookup: {state}")
+        
+        print(f"📍 HQ search result for {company}: {result}")
+        return JSONResponse(result)
+            
+    except ImportError as e:
+        print(f"❌ search_company_headquarters not available: {e}")
+        return JSONResponse({"error": "Function not available", "city": "", "state": "", "country": ""}, status_code=500)
+    
+    except Exception as e:
+        print(f"❌ Error searching company HQ: {e}")
+        return JSONResponse({"error": str(e), "city": "", "state": "", "country": ""}, status_code=500)
+
+
+@app.post("/api/search_individual_linkedin", response_class=JSONResponse)
+async def search_individual_linkedin(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Search for an individual's LinkedIn profile.
+    Body: { "name": "John Smith", "company": "Acme Corp", "position": "CFO" }
+    Returns: { "linkedin_url": "https://linkedin.com/in/johnsmith" } or { "linkedin_url": null }
+    """
+    name = (payload or {}).get("name", "").strip()
+    company = (payload or {}).get("company", "").strip()
+    position = (payload or {}).get("position", "").strip()
+    
+    if not name:
+        return JSONResponse({"error": "Missing 'name' field", "linkedin_url": None}, status_code=400)
+    
+    try:
+        # Build search query: "{name} {company} linkedin"
+        search_query = " ".join([p for p in [name, position, company, "linkedin"] if p]).strip()
+        print(f"🔍 Searching individual LinkedIn: {search_query}")
+        
+        # Use searxng_analyzer if available
+        from searxng_analyzer import search_person_linkedin
+        linkedin_url = search_person_linkedin(name, company, position)
+        
+        if linkedin_url:
+            print(f"✅ Found LinkedIn for {name}: {linkedin_url}")
+            return JSONResponse({"linkedin_url": linkedin_url, "query": search_query})
+        else:
+            print(f"⚠️ No LinkedIn found for: {name}")
+            return JSONResponse({"linkedin_url": None, "query": search_query})
+            
+    except ImportError:
+        print("⚠️ searxng_analyzer.search_person_linkedin not available, trying fallback")
+        # Fallback: try using the general search function
+        try:
+            from searxng_analyzer import searxng_search
+            search_query = " ".join([p for p in [name, position, company, "linkedin"] if p]).strip()
+            results = searxng_search(search_query, num_results=5)
+            
+            # Find first LinkedIn profile URL
+            for result in results:
+                url = result.get("url", "")
+                if "linkedin.com/in/" in url:
+                    print(f"✅ Found LinkedIn (fallback): {url}")
+                    return JSONResponse({"linkedin_url": url, "query": search_query})
+            
+            print(f"⚠️ No LinkedIn found (fallback) for: {name}")
+            return JSONResponse({"linkedin_url": None, "query": search_query})
+            
+        except Exception as e:
+            print(f"❌ Fallback search failed: {e}")
+            return JSONResponse({"error": str(e), "linkedin_url": None}, status_code=500)
+    
+    except Exception as e:
+        print(f"❌ Error searching individual LinkedIn: {e}")
+        return JSONResponse({"error": str(e), "linkedin_url": None}, status_code=500)
+
+
+@app.post("/api/search_individual_location", response_class=JSONResponse)
+async def search_individual_location(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Search for an individual's likely location (city/state/country) using our search engine.
+    Body: { "name": "Mary Meeker", "company": "Kleiner Perkins", "position": "Partner", "linkedin_url": "https://..." }
+    Returns: { "city": "...", "state": "...", "country": "..." }
+    """
+    name = (payload or {}).get("name", "").strip()
+    company = (payload or {}).get("company", "").strip()
+    position = (payload or {}).get("position", "").strip()
+    linkedin_url = (payload or {}).get("linkedin_url", "").strip()
+
+    if not name:
+        return JSONResponse({"error": "Missing 'name' field", "city": "", "state": "", "country": ""}, status_code=400)
+
+    try:
+        from searxng_analyzer import search_person_location
+        result = search_person_location(name, company, linkedin_url, position=position) or {"city": "", "state": "", "country": ""}
+        # Always normalize via AI so abbreviations (e.g., "CA") become full state names.
+        if result and (result.get("city") or result.get("state") or result.get("country")):
+            result = _normalize_location_with_ai(name, company, position, linkedin_url, result)
+        print(f"📍 Individual location result for {name}: {result}")
+        return JSONResponse(result)
+    except Exception as e:
+        print(f"❌ Error searching individual location: {e}")
+        return JSONResponse({"error": str(e), "city": "", "state": "", "country": ""}, status_code=500)
+
+
 @app.post("/refresh_db", response_class=JSONResponse)
 async def refresh_db(payload: Dict[str, Any]) -> JSONResponse:
     """
@@ -1470,9 +1745,58 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             if found_press:
                 press_page = found_press
 
+        # Auto-lookup state for US cities
+        state_province = ""
+        if city and country:
+            country_upper = country.upper().strip()
+            if country_upper in ['USA', 'US', 'UNITED STATES', 'UNITED STATES OF AMERICA', 'AMERICA']:
+                us_city_to_state = {
+                    'san francisco': 'California', 'los angeles': 'California', 'san diego': 'California',
+                    'san jose': 'California', 'oakland': 'California', 'palo alto': 'California',
+                    'mountain view': 'California', 'menlo park': 'California', 'cupertino': 'California',
+                    'sunnyvale': 'California', 'santa clara': 'California', 'redwood city': 'California',
+                    'irvine': 'California', 'santa monica': 'California', 'pasadena': 'California',
+                    'new york': 'New York', 'new york city': 'New York', 'nyc': 'New York', 'manhattan': 'New York',
+                    'brooklyn': 'New York', 'buffalo': 'New York',
+                    'seattle': 'Washington', 'bellevue': 'Washington', 'redmond': 'Washington',
+                    'boston': 'Massachusetts', 'cambridge': 'Massachusetts',
+                    'chicago': 'Illinois',
+                    'austin': 'Texas', 'dallas': 'Texas', 'houston': 'Texas', 'san antonio': 'Texas', 'plano': 'Texas',
+                    'denver': 'Colorado', 'boulder': 'Colorado',
+                    'atlanta': 'Georgia',
+                    'miami': 'Florida', 'tampa': 'Florida', 'orlando': 'Florida', 'jacksonville': 'Florida',
+                    'phoenix': 'Arizona', 'scottsdale': 'Arizona', 'tempe': 'Arizona',
+                    'portland': 'Oregon',
+                    'las vegas': 'Nevada', 'reno': 'Nevada',
+                    'salt lake city': 'Utah',
+                    'raleigh': 'North Carolina', 'charlotte': 'North Carolina', 'durham': 'North Carolina',
+                    'nashville': 'Tennessee',
+                    'detroit': 'Michigan', 'ann arbor': 'Michigan',
+                    'minneapolis': 'Minnesota', 'st paul': 'Minnesota',
+                    'philadelphia': 'Pennsylvania', 'pittsburgh': 'Pennsylvania',
+                    'washington': 'District of Columbia', 'washington dc': 'District of Columbia',
+                    'washington d.c.': 'District of Columbia', 'dc': 'District of Columbia',
+                    'arlington': 'Virginia', 'mclean': 'Virginia', 'reston': 'Virginia', 'alexandria': 'Virginia',
+                    'baltimore': 'Maryland', 'bethesda': 'Maryland',
+                    'indianapolis': 'Indiana',
+                    'columbus': 'Ohio', 'cleveland': 'Ohio', 'cincinnati': 'Ohio',
+                    'kansas city': 'Missouri', 'st louis': 'Missouri', 'st. louis': 'Missouri',
+                    'omaha': 'Nebraska',
+                    'new orleans': 'Louisiana',
+                    'milwaukee': 'Wisconsin', 'madison': 'Wisconsin',
+                    'hartford': 'Connecticut', 'stamford': 'Connecticut', 'greenwich': 'Connecticut',
+                    'providence': 'Rhode Island',
+                    'jersey city': 'New Jersey', 'newark': 'New Jersey', 'hoboken': 'New Jersey', 'princeton': 'New Jersey',
+                }
+                city_lower = city.lower().strip()
+                state_province = us_city_to_state.get(city_lower, "")
+                if state_province:
+                    print(f"[AI] 📍 Auto-detected state for {city}: {state_province}")
+
         ai_overview = {
             "name": company_name,
             "city": city,
+            "state_province": state_province,
             "country": country,
             "ownership": ownership,
             "website": website,
