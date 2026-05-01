@@ -16,6 +16,12 @@ from searxng_db import store_subsidiaries
 from bs4 import BeautifulSoup
 import base64
 from typing import Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
 def fetch_logo_free(company_name: str):
     """
@@ -322,7 +328,9 @@ async def _run_parallel_searches(queries: list, api_key: str, num_results: int =
                         all_results.append({
                             "title": r.get("title", ""),
                             "snippet": r.get("snippet", ""),
-                            "link": url
+                            "link": url,
+                            # Google organic "date" when present (headline date / freshness hint)
+                            "published_date": (r.get("date") or "").strip(),
                         })
             
             # Small delay between batches to avoid rate limits
@@ -366,6 +374,176 @@ def serpapi_parallel_search(queries: list, api_key: str, num_results: int = 10) 
     except Exception as e:
         print(f"⚠️ Parallel search error: {e}")
         return []
+
+
+def lookup_ticker(company_name: str, website_url: str = "") -> str:
+    """
+    Find a stock ticker symbol for a company name using SerpAPI.
+    Returns ticker string like "EFX" or "" if not found/not public.
+    """
+    if not SERPAPI_KEY:
+        return ""
+
+    clean_name = (company_name or "").strip()
+    if not clean_name:
+        return ""
+
+    # If a URL was passed as company name, extract the bare domain label
+    if clean_name.startswith(("http://", "https://")):
+        from urllib.parse import urlparse as _up
+        _domain = _up(clean_name).netloc.replace("www.", "")
+        clean_name = _domain.split(".")[0]  # "equifax" from "equifax.com"
+
+    queries = [
+        f'"{clean_name}" stock ticker symbol NASDAQ NYSE',
+        f'"{clean_name}" ticker site:finance.yahoo.com',
+    ]
+    if website_url and not website_url.startswith(("http://", "https://")):
+        queries.append(f'"{website_url}" stock ticker')
+
+    results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=5)
+
+    for r in results:
+        snippet = (r.get("snippet", "") + " " + r.get("title", "")).upper()
+        match = re.search(
+            r'\b(?:NASDAQ|NYSE|LSE|TSX|ASX|FTSE|EURONEXT)[:\s]+([A-Z.\-]{1,8})\b',
+            snippet,
+        )
+        if match:
+            ticker = match.group(1).strip()
+            print(f"   📈 Found ticker for {company_name}: {ticker}")
+            return ticker
+
+        link = r.get("link", "")
+        if "finance.yahoo.com/quote/" in link:
+            m = re.search(r'/quote/([A-Z.\-]{1,8})(?:/|$)', link)
+            if m:
+                ticker = m.group(1)
+                print(f"   📈 Found ticker from Yahoo URL: {ticker}")
+                return ticker
+
+    return ""
+
+
+def get_yahoo_finance_data(ticker: str) -> dict:
+    """
+    Fetch key financial metrics from Yahoo Finance for a given ticker.
+    Returns dict with EV, revenue, EBITDA, multiples, and holder data.
+    """
+    if not ticker or yf is None:
+        if ticker and yf is None:
+            print("   ⚠️ yfinance is not installed; skipping Yahoo Finance enrichment")
+        return {}
+
+    ticker = ticker.strip().upper()
+    print(f"   📊 Fetching Yahoo Finance data for ticker: {ticker}")
+
+    result = {}
+
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+
+        if not info or (info.get("trailingPegRatio") is None and not info.get("shortName")):
+            print(f"   ⚠️ No Yahoo Finance data found for ticker: {ticker}")
+            return {}
+
+        result["ticker"] = ticker
+        result["exchange"] = info.get("exchange", "")
+        result["company_name"] = info.get("shortName") or info.get("longName", "")
+        result["currency"] = info.get("financialCurrency") or info.get("currency", "USD")
+
+        market_cap = info.get("marketCap")
+        ev = info.get("enterpriseValue")
+        result["market_cap_m"] = round(market_cap / 1_000_000, 2) if market_cap else None
+        result["enterprise_value_m"] = round(ev / 1_000_000, 2) if ev else None
+
+        revenue = info.get("totalRevenue")
+        ebitda = info.get("ebitda")
+        gross_profit = info.get("grossProfits")
+        result["revenue_m"] = round(revenue / 1_000_000, 2) if revenue else None
+        result["ebitda_m"] = round(ebitda / 1_000_000, 2) if ebitda else None
+        result["gross_profit_m"] = round(gross_profit / 1_000_000, 2) if gross_profit else None
+
+        result["profit_margin"] = info.get("profitMargins")
+        result["ebitda_margin"] = (
+            round(ebitda / revenue, 4)
+            if ebitda and revenue and revenue > 0
+            else None
+        )
+        result["gross_margin"] = info.get("grossMargins")
+        result["operating_margin"] = info.get("operatingMargins")
+
+        result["revenue_growth"] = info.get("revenueGrowth")
+        result["earnings_growth"] = info.get("earningsGrowth")
+
+        result["ev_revenue"] = info.get("enterpriseToRevenue")
+        result["ev_ebitda"] = info.get("enterpriseToEbitda")
+        result["pe_trailing"] = info.get("trailingPE")
+        result["pe_forward"] = info.get("forwardPE")
+
+        result["employees"] = info.get("fullTimeEmployees")
+        result["institutional_ownership_pct"] = info.get("institutionPercentHeld")
+        result["insider_ownership_pct"] = info.get("insiderPercentHeld")
+
+        try:
+            inst_holders = t.institutional_holders
+            if inst_holders is not None and not inst_holders.empty:
+                holders_list = []
+                for _, row in inst_holders.head(10).iterrows():
+                    holders_list.append({
+                        "name": str(row.get("Holder", "")),
+                        "pct_held": round(float(row.get("% Out", 0)) * 100, 2),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": int(row.get("Value", 0)),
+                    })
+                result["institutional_holders"] = holders_list
+        except Exception as e:
+            print(f"   ⚠️ Institutional holders fetch failed: {e}")
+
+        try:
+            mf_holders = t.mutualfund_holders
+            if mf_holders is not None and not mf_holders.empty:
+                mf_list = []
+                for _, row in mf_holders.head(5).iterrows():
+                    mf_list.append({
+                        "name": str(row.get("Holder", "")),
+                        "pct_held": round(float(row.get("% Out", 0)) * 100, 2),
+                    })
+                result["mutualfund_holders"] = mf_list
+        except Exception as e:
+            print(f"   ⚠️ Mutual fund holders fetch failed: {e}")
+
+        result["fiscal_year_end"] = info.get("lastFiscalYearEnd")
+        result["source_url"] = f"https://finance.yahoo.com/quote/{ticker}/key-statistics/"
+
+        print(
+            f"   ✅ Yahoo Finance: EV=${result.get('enterprise_value_m')}M, "
+            f"Rev=${result.get('revenue_m')}M, "
+            f"EBITDA=${result.get('ebitda_m')}M"
+        )
+
+        return result
+
+    except Exception as e:
+        print(f"   ❌ Yahoo Finance fetch error for {ticker}: {e}")
+        return {}
+
+
+def enrich_with_yahoo_finance(
+    company_name: str,
+    website_url: str = "",
+    known_ticker: str = "",
+) -> dict:
+    """
+    Find a public ticker then fetch Yahoo Finance data. Empty dict means
+    not public, ticker not found, yfinance missing, or data unavailable.
+    """
+    ticker = known_ticker.strip().upper() if known_ticker else lookup_ticker(company_name, website_url)
+    if not ticker:
+        print(f"   ℹ️ No ticker found for {company_name} — skipping Yahoo Finance")
+        return {}
+    return get_yahoo_finance_data(ticker)
 
 
 # ============================================================
@@ -748,169 +926,108 @@ def search_company_website(company_name: str) -> str:
         if clean_name.endswith(suffix):
             clean_name = clean_name[:-len(suffix)].strip()
     
-    # Search queries ordered by specificity
+    # Search queries ordered by specificity — run all in parallel
     search_queries = [
         f'"{clean_name}" official website',
         f'{clean_name} company website',
         f'"{company_name}"',
     ]
-    
-    for query in search_queries:
+
+    skip_domains = ['linkedin.com', 'facebook.com', 'twitter.com', 'x.com',
+                    'crunchbase.com', 'bloomberg.com', 'reuters.com', 'wikipedia.org',
+                    'zoominfo.com', 'dnb.com', 'glassdoor.com', 'indeed.com',
+                    'yelp.com', 'yellowpages.com', 'bbb.org', 'manta.com']
+    name_lower = clean_name.lower()
+    name_words = set(name_lower.split())
+
+    def _run_website_query(query):
         try:
             params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
-            search = GoogleSearch(params)
-            result = search.get_dict()
-            
+            result = GoogleSearch(params).get_dict()
             if "error" in result:
-                print(f"   ⚠️ SerpAPI website search error: {result['error']}")
-                continue
-            
-            results = result.get("organic_results", [])
-            
-            for r in results:
+                return None
+            for r in result.get("organic_results", []):
                 link = r.get("link", "")
                 title = r.get("title", "").lower()
-                snippet = r.get("snippet", "").lower()
-                
-                # Skip social media, directories, news sites
-                skip_domains = ['linkedin.com', 'facebook.com', 'twitter.com', 'x.com', 
-                               'crunchbase.com', 'bloomberg.com', 'reuters.com', 'wikipedia.org',
-                               'zoominfo.com', 'dnb.com', 'glassdoor.com', 'indeed.com',
-                               'yelp.com', 'yellowpages.com', 'bbb.org', 'manta.com']
-                if any(domain in link.lower() for domain in skip_domains):
+                if any(d in link.lower() for d in skip_domains):
                     continue
-                
-                # Check if company name appears in title or domain
-                name_lower = clean_name.lower()
-                name_words = set(name_lower.split())
-                
-                # Extract domain from URL
                 try:
-                    from urllib.parse import urlparse
-                    parsed = urlparse(link)
-                    domain = parsed.netloc.lower().replace('www.', '')
+                    from urllib.parse import urlparse as _up
+                    _parsed = _up(link)
+                    domain = _parsed.netloc.lower().replace('www.', '')
                     domain_name = domain.split('.')[0] if '.' in domain else domain
-                except:
-                    domain = ""
+                except Exception:
                     domain_name = ""
-                
-                # Match criteria: name in title, or name words in domain
-                name_in_title = name_lower in title or any(word in title for word in name_words if len(word) > 3)
-                name_in_domain = any(word in domain_name for word in name_words if len(word) > 3)
-                
+                name_in_title = name_lower in title or any(w in title for w in name_words if len(w) > 3)
+                name_in_domain = any(w in domain_name for w in name_words if len(w) > 3)
                 if name_in_title or name_in_domain:
-                    # Normalize URL
-                    if not link.startswith('http'):
-                        link = f"https://{link}"
-                    print(f"   🌐 Found website for {company_name}: {link}")
-                    return link
-                    
+                    return link if link.startswith('http') else f"https://{link}"
         except Exception as e:
             print(f"   ⚠️ SerpAPI website search error: {e}")
-            continue
-    
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(search_queries)) as _ws_ex:
+        futures = [_ws_ex.submit(_run_website_query, q) for q in search_queries]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                print(f"   🌐 Found website for {company_name}: {result}")
+                return result
+
     return ""
 
 
-def search_company_linkedin(company_name: str, website_url: str = "") -> str:
-    """
-    Search for a COMPANY's LinkedIn page using multiple queries via SerpAPI.
-    More accurate than AI guessing - uses real search results.
-    
-    Args:
-        company_name: The company name to search for
-        website_url: Optional company website to help narrow results
-        
-    Returns:
-        LinkedIn company URL if found, empty string otherwise
-    """
-    if not company_name and not website_url:
-        return ""
-    
-    serpapi_available = bool(SERPAPI_KEY)
-
-    # Clean company name - remove common suffixes for better matching
+def _clean_company_name_for_lookup(company_name: str) -> str:
     clean_name = (company_name or "").strip()
     for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
                    ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
         if clean_name.endswith(suffix):
             clean_name = clean_name[:-len(suffix)].strip()
-    
-    # Extract domain from website for additional matching
-    domain_hint = ""
-    url_for_domain = website_url or ""
-    # If the company name itself is a URL, use it to extract domain
-    if not url_for_domain and clean_name.startswith("http"):
-        url_for_domain = clean_name
-    if url_for_domain:
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url_for_domain)
-            domain = parsed.netloc.replace("www.", "")
-            domain = domain.split('.')[0] if '.' in domain else domain
-            if domain and len(domain) > 2:
-                domain_hint = domain
-        except:
-            pass
-    
-    # Multiple search strategies - ordered by expected accuracy (SerpAPI first)
+    return clean_name
+
+
+def _extract_domain_hint(website_url: str = "", fallback_value: str = "") -> str:
+    url_for_domain = (website_url or "").strip()
+    if not url_for_domain and (fallback_value or "").strip().startswith("http"):
+        url_for_domain = (fallback_value or "").strip()
+    if not url_for_domain:
+        return ""
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url_for_domain)
+        domain = (parsed.netloc or parsed.path or "").replace("www.", "")
+        domain = domain.split('.')[0] if '.' in domain else domain
+        return domain if domain and len(domain) > 2 else ""
+    except Exception:
+        return ""
+
+
+def search_company_linkedin_detailed(company_name: str, website_url: str = "") -> dict:
+    """
+    Search for a company's LinkedIn page and return provenance metadata.
+    """
+    if not company_name and not website_url:
+        return {
+            "linkedin_url": "",
+            "source": "not_found",
+            "matched_by": "",
+            "query_used": "",
+            "queries_used": [],
+        }
+
+    serpapi_available = bool(SERPAPI_KEY)
+    clean_name = _clean_company_name_for_lookup(company_name)
+    domain_hint = _extract_domain_hint(website_url, clean_name)
+
     serpapi_queries = [
-        f'"{clean_name}" site:linkedin.com/company/',
-        f'"{clean_name}" {domain_hint} site:linkedin.com/company/' if domain_hint else None,
-        f'{clean_name} linkedin company page',
-        f'"{company_name}" linkedin',
+        f'"{clean_name}" site:linkedin.com/company/' if clean_name else None,
+        f'"{clean_name}" {domain_hint} site:linkedin.com/company/' if clean_name and domain_hint else None,
+        f'{clean_name} linkedin company page' if clean_name else None,
+        f'"{company_name}" linkedin' if company_name else None,
     ]
     serpapi_queries = [q for q in serpapi_queries if q and serpapi_available]
-    
-    found_urls = []
-    
-    for query in serpapi_queries:
-        try:
-            params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
-            search = GoogleSearch(params)
-            result = search.get_dict()
-            
-            if "error" in result:
-                print(f"   ⚠️ SerpAPI company LinkedIn search error: {result['error']}")
-                continue
-            
-            results = result.get("organic_results", [])
-            for r in results:
-                link = r.get("link", "")
-                title = r.get("title", "").lower()
-                
-                if "linkedin.com/company/" not in link:
-                    continue
-                
-                match = re.search(r'linkedin\.com/company/([a-zA-Z0-9_-]+)', link)
-                if not match:
-                    continue
-                
-                company_slug = match.group(1).lower()
-                
-                if company_slug in ['company', 'jobs', 'pulse', 'learning', 'about']:
-                    continue
-                
-                clean_name_lower = clean_name.lower()
-                name_words = set(clean_name_lower.split())
-                slug_words = set(company_slug.replace('-', ' ').replace('_', ' ').split())
-                
-                name_in_title = clean_name_lower in title
-                name_in_slug = any(word in company_slug for word in name_words if len(word) > 2)
-                slug_matches_name = len(name_words & slug_words) >= 1
-                
-                if name_in_title or name_in_slug or slug_matches_name:
-                    normalized_url = f"https://www.linkedin.com/company/{company_slug}/"
-                    if normalized_url not in found_urls:
-                        found_urls.append(normalized_url)
-                        print(f"   🔗 Found LinkedIn for {company_name}: {normalized_url}")
-                        return normalized_url
-                        
-        except Exception as e:
-            print(f"   ⚠️ SerpAPI company search error: {e}")
-            continue
-    
-    # Fallback: real web search (Startpage) using domain + linkedin as suggested
+
     fallback_queries = []
     if domain_hint:
         fallback_queries.extend([
@@ -922,18 +1039,109 @@ def search_company_linkedin(company_name: str, website_url: str = "") -> str:
         fallback_queries.append(f"{clean_name} linkedin")
     if company_name:
         fallback_queries.append(f"{company_name} linkedin")
-    
-    for query in fallback_queries:
-        url = search_company_linkedin_startpage(query, clean_name=clean_name, domain_hint=domain_hint)
-        if url:
-            print(f"   🔗 Startpage LinkedIn for {company_name}: {url}")
-            return url
-    
-    # If we found any URLs but none were high confidence, return the first one
+
+    queries_used = list(serpapi_queries) + list(fallback_queries)
+    found_urls = []
+    clean_name_lower = clean_name.lower()
+    name_words = set(clean_name_lower.split())
+
+    def _run_serpapi_li_query(query):
+        """Run one SerpAPI query, return matching LinkedIn URL or None."""
+        try:
+            params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+            result = GoogleSearch(params).get_dict()
+            if "error" in result:
+                return None, []
+            candidates = []
+            for r in result.get("organic_results", []):
+                link = r.get("link", "")
+                title = r.get("title", "").lower()
+                if "linkedin.com/company/" not in link:
+                    continue
+                m = re.search(r'linkedin\.com/company/([a-zA-Z0-9_-]+)', link)
+                if not m:
+                    continue
+                slug = m.group(1).lower()
+                if slug in ['company', 'jobs', 'pulse', 'learning', 'about']:
+                    continue
+                slug_words = set(slug.replace('-', ' ').replace('_', ' ').split())
+                name_in_title = clean_name_lower in title if clean_name_lower else False
+                name_in_slug = any(w in slug for w in name_words if len(w) > 2)
+                slug_matches = len(name_words & slug_words) >= 1 if name_words else False
+                normalized = f"https://www.linkedin.com/company/{slug}/"
+                candidates.append(normalized)
+                if name_in_title or name_in_slug or slug_matches:
+                    return normalized, candidates
+            return None, candidates
+        except Exception as e:
+            print(f"   ⚠️ SerpAPI company search error: {e}")
+            return None, []
+
+    def _run_startpage_li_query(query):
+        """Run one Startpage fallback query, return URL or None."""
+        try:
+            url = search_company_linkedin_startpage(query, clean_name=clean_name, domain_hint=domain_hint)
+            return url or None
+        except Exception:
+            return None
+
+    # Run all SerpAPI queries in parallel
+    with ThreadPoolExecutor(max_workers=max(len(serpapi_queries), 1)) as _li_ex:
+        sp_futures = {_li_ex.submit(_run_serpapi_li_query, q): q for q in serpapi_queries}
+        for fut in as_completed(sp_futures):
+            matched_url, candidates = fut.result()
+            for c in candidates:
+                if c not in found_urls:
+                    found_urls.append(c)
+            if matched_url:
+                print(f"   🔗 Found LinkedIn for {company_name}: {matched_url}")
+                return {
+                    "linkedin_url": matched_url,
+                    "source": "serpapi",
+                    "matched_by": "website_domain" if domain_hint else "company_name",
+                    "query_used": sp_futures[fut],
+                    "queries_used": queries_used,
+                }
+
+    # Run all Startpage fallback queries in parallel
+    with ThreadPoolExecutor(max_workers=max(len(fallback_queries), 1)) as _fb_ex:
+        fb_futures = {_fb_ex.submit(_run_startpage_li_query, q): q for q in fallback_queries}
+        for fut in as_completed(fb_futures):
+            url = fut.result()
+            if url:
+                print(f"   🔗 Startpage LinkedIn for {company_name}: {url}")
+                return {
+                    "linkedin_url": url,
+                    "source": "startpage",
+                    "matched_by": "website_domain" if domain_hint else "fallback",
+                    "query_used": fb_futures[fut],
+                    "queries_used": queries_used,
+                }
+
     if found_urls:
-        return found_urls[0]
-    
-    return ""
+        return {
+            "linkedin_url": found_urls[0],
+            "source": "serpapi",
+            "matched_by": "website_domain" if domain_hint else "company_name",
+            "query_used": queries_used[0] if queries_used else "",
+            "queries_used": queries_used,
+        }
+
+    return {
+        "linkedin_url": "",
+        "source": "not_found",
+        "matched_by": "",
+        "query_used": "",
+        "queries_used": queries_used,
+    }
+
+
+def search_company_linkedin(company_name: str, website_url: str = "") -> str:
+    """
+    Backward-compatible wrapper returning only the LinkedIn URL.
+    """
+    result = search_company_linkedin_detailed(company_name, website_url)
+    return result.get("linkedin_url", "")
 
 
 def search_person_linkedin(person_name: str, company_name: str = "", position: str = "") -> str:
@@ -1057,24 +1265,36 @@ def search_person_linkedin(person_name: str, company_name: str = "", position: s
                         continue
                     
                     normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
-                    
+
                     # ---------------------------------------------------------
-                    # PRIMARY QUERIES (index 0-1): Trust Google's first result
-                    # These are the "Name Company Role linkedin" queries — high
-                    # quality, so just take the first valid linkedin.com/in/
+                    # SLUG NAME CHECK (all queries): reject URLs where neither
+                    # first nor last name appears in the slug.
+                    # e.g. "Sachin Kalwani" must not accept "rahul-jha-03978a37"
+                    # ---------------------------------------------------------
+                    person_lower = clean_person.lower()
+                    name_parts = [p for p in person_lower.split() if len(p) > 1]
+                    first_name = name_parts[0] if name_parts else ""
+                    last_name = name_parts[-1] if len(name_parts) >= 2 else ""
+
+                    slug_has_first = first_name and first_name in profile_slug
+                    slug_has_last = last_name and last_name in profile_slug
+
+                    # For names with 2+ parts, require at least first OR last name in slug
+                    if len(name_parts) >= 2 and not slug_has_first and not slug_has_last:
+                        print(f"   ⛔ Slug mismatch — skipping {normalized_url} for {person_name}")
+                        continue  # try next search result
+
+                    # ---------------------------------------------------------
+                    # PRIMARY QUERIES (index 0-1): slug passed, trust this result
                     # ---------------------------------------------------------
                     if query_idx <= 1:
                         print(f"   🔗 Found LinkedIn for {person_name}: {normalized_url} (trusted first result)")
                         return normalized_url
-                    
+
                     # ---------------------------------------------------------
-                    # FALLBACK QUERIES (index 2+): Require name in title/snippet
+                    # FALLBACK QUERIES (index 2+): also require name in title/snippet
                     # ---------------------------------------------------------
-                    person_lower = clean_person.lower()
-                    name_parts = [p for p in person_lower.split() if len(p) > 1]
-                    
                     # Check if last name appears in title (most important)
-                    last_name = name_parts[-1] if name_parts else ""
                     if last_name and last_name in title:
                         print(f"   🔗 Found LinkedIn for {person_name}: {normalized_url}")
                         return normalized_url
@@ -1141,6 +1361,326 @@ def search_person_linkedin(person_name: str, company_name: str = "", position: s
     
     print(f"   ⚠️ No LinkedIn found for: {person_name}")
     return ""
+
+
+def search_person_linkedin_with_location(person_name: str, company_name: str = "", position: str = "") -> dict:
+    """
+    Search for a person's LinkedIn profile AND extract location from SEO snippets in one call.
+    This is more efficient than calling search_person_linkedin + search_person_location separately.
+    
+    Returns: {"linkedin_url": "...", "location": {"city": "", "state": "", "country": ""}}
+    """
+    result = {"linkedin_url": "", "location": {"city": "", "state": "", "country": ""}}
+    
+    if not person_name:
+        return result
+    
+    serpapi_available = bool(SERPAPI_KEY)
+    
+    # Clean names for better matching
+    clean_person = person_name.strip()
+    clean_company = (company_name or "").strip()
+    clean_company_lower = clean_company.lower()
+    
+    # Remove common company suffixes
+    for suffix in [', Inc.', ', Inc', ' Inc.', ' Inc', ', LLC', ' LLC', ', Ltd.', ', Ltd', ' Ltd.', ' Ltd',
+                   ', Corp.', ', Corp', ' Corp.', ' Corp', ', Limited', ' Limited', ', Co.', ' Co.']:
+        if clean_company.endswith(suffix):
+            clean_company = clean_company[:-len(suffix)].strip()
+            clean_company_lower = clean_company.lower()
+    
+    # Extract key words from company name for matching (e.g., "S&P Global" -> ["s&p", "global"])
+    company_keywords = [w.lower() for w in re.split(r'\s+', clean_company) if len(w) > 2]
+    
+    clean_position = (position or "").strip()
+
+    def _role_acronyms(pos: str) -> list:
+        pos = (pos or "").strip()
+        if not pos:
+            return []
+        acr = []
+        for m in re.finditer(r"\bChief\s+([A-Za-z][A-Za-z\s]{0,40}?)\s+Officer\b", pos, re.I):
+            mid = (m.group(1) or "").strip()
+            parts = [p for p in re.split(r"[^A-Za-z]+", mid) if p]
+            if parts:
+                candidate = "C" + "".join(p[0].upper() for p in parts) + "O"
+                if candidate in {"CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO"}:
+                    acr.append(candidate)
+        for token in ["CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO", "CISO", "SVP", "EVP", "VP"]:
+            if re.search(rf"\b{re.escape(token)}\b", pos, re.I):
+                acr.append(token)
+        out = []
+        for a in acr:
+            if a not in out:
+                out.append(a)
+        return out
+
+    role_terms = []
+    if clean_position:
+        role_terms.append(clean_position)
+        role_terms.extend(_role_acronyms(clean_position))
+
+    # Build search queries (most specific first)
+    queries = []
+    if clean_company and role_terms:
+        for role in role_terms[:2]:
+            queries.append(f'"{clean_person}" "{clean_company}" {role} linkedin site:linkedin.com/in')
+    if clean_company:
+        queries.append(f'"{clean_person}" "{clean_company}" linkedin site:linkedin.com/in')
+        queries.append(f'"{clean_person}" {clean_company} linkedin site:linkedin.com/in')
+    if role_terms:
+        for role in role_terms[:1]:
+            queries.append(f'"{clean_person}" {role} linkedin site:linkedin.com/in')
+    queries.append(f'"{clean_person}" linkedin site:linkedin.com/in')
+
+    # Country normalization
+    country_map = {
+        "uk": "United Kingdom", "u.k.": "United Kingdom", "u.k": "United Kingdom",
+        "usa": "USA", "us": "USA", "u.s.": "USA", "u.s.a.": "USA",
+        "united states": "USA", "united states of america": "USA",
+    }
+    
+    def normalize_country(c: str) -> str:
+        c = (c or "").strip()
+        if not c:
+            return ""
+        return country_map.get(c.lower(), c)
+
+    def extract_location_from_snippet(text: str, title: str = "") -> dict:
+        """
+        Extract location from LinkedIn SEO result.
+        
+        LinkedIn title formats (MOST RELIABLE):
+        - "Erica Bourne - London, England, United Kingdom"
+        - "John Smith - San Francisco, California, United States"
+        - "Jane Doe - New York, New York, United States"
+        
+        LinkedIn snippet formats:
+        - "Location: London · 500+ connections..."
+        - "Location: Santiago de Surco, Peru"
+        """
+        if not text and not title:
+            return {}
+        
+        # PATTERN 0 (MOST RELIABLE): LinkedIn title format "Name - City, State, Country"
+        # This is the most reliable source as LinkedIn always formats titles this way
+        if title:
+            # Match "Name - Location" where location has comma-separated parts
+            # Pattern must have at least one comma to be a valid location
+            title_match = re.search(r'\s+-\s+([A-Z][a-zA-Z\s]+(?:,\s*[A-Z][a-zA-Z\s]+)+)\s*$', title)
+            if title_match:
+                loc_part = title_match.group(1).strip()
+                # Sanity check: location should be reasonably short (< 80 chars)
+                if len(loc_part) < 80:
+                    parts = [p.strip() for p in loc_part.split(",") if p and p.strip()]
+                    if len(parts) >= 3:
+                        return {"city": parts[0], "state": parts[1], "country": normalize_country(parts[2])}
+                    if len(parts) == 2:
+                        second = parts[1]
+                        if len(second.strip()) == 2 and second.strip().isalpha():
+                            return {"city": parts[0], "state": second.strip().upper(), "country": "USA"}
+                        return {"city": parts[0], "state": "", "country": normalize_country(second)}
+        
+        # PATTERN 1: LinkedIn snippet "Location: X" - but extract BEFORE the delimiter
+        # Note: snippet often has "Location: London · 500+ connections" - we only get "London"
+        # So we need to combine with title data above
+        m = re.search(r"\blocation\s*[:\-]\s*([^\n\r|•·]+)", text, re.IGNORECASE)
+        if m:
+            raw = (m.group(1) or "").strip()
+            # Stop at common delimiters
+            raw = re.split(r"\s*(?:\|\s*|•\s*|·\s*|Education|Experience|Connections|\d+\s*connections)", raw, flags=re.I)[0].strip()
+            raw = re.sub(r"\s+\d+\+.*$", "", raw).strip()
+            if raw:
+                parts = [p.strip() for p in raw.split(",") if p and p.strip()]
+                if len(parts) >= 3:
+                    return {"city": parts[0], "state": parts[1], "country": normalize_country(parts[2])}
+                if len(parts) == 2:
+                    second = parts[1]
+                    if len(second.strip()) == 2 and second.strip().isalpha():
+                        return {"city": parts[0], "state": second.strip().upper(), "country": "USA"}
+                    return {"city": parts[0], "state": "", "country": normalize_country(second)}
+                if len(parts) == 1:
+                    loc = parts[0]
+                    area_match = re.match(r"(?:Greater\s+)?(.+?)(?:\s+(?:Area|Metropolitan|Metro))?\s*$", loc, re.I)
+                    if area_match:
+                        loc = area_match.group(1).strip()
+                    if normalize_country(loc) != loc or loc.lower() in country_map:
+                        return {"city": "", "state": "", "country": normalize_country(loc)}
+                    return {"city": loc, "state": "", "country": ""}
+        
+        # PATTERN 2: Look for "City, State, Country" anywhere in combined text
+        loc_pattern = re.search(r"([A-Z][a-z]+(?:\s+[A-Za-z]+)*),\s*([A-Z][a-z]+(?:\s+[A-Za-z]+)*),\s*([A-Z][a-z]+(?:\s+[A-Za-z]+)*)", text)
+        if loc_pattern:
+            city, state, country = loc_pattern.groups()
+            return {"city": city.strip(), "state": state.strip(), "country": normalize_country(country.strip())}
+        
+        # PATTERN 3: "City, Country" pattern for international locations
+        loc_pattern2 = re.search(r"([A-Z][a-z]+(?:\s+de\s+[A-Z][a-z]+)?(?:\s+[A-Za-z]+)*),\s+(Peru|Chile|Argentina|Brazil|Mexico|Colombia|Spain|France|Germany|Italy|United Kingdom|UK|USA|United States|Canada|Australia|India|China|Japan|Singapore|Hong Kong|Belgium|Netherlands|Switzerland|Sweden|Norway|Denmark|Ireland|Austria|Poland|Portugal)", text, re.I)
+        if loc_pattern2:
+            city, country = loc_pattern2.groups()
+            return {"city": city.strip(), "state": "", "country": normalize_country(country.strip())}
+        
+        return {}
+    
+    def verify_company_match(text: str) -> bool:
+        """Check if the snippet/title mentions the company name"""
+        if not clean_company:
+            return True  # No company to verify
+        text_lower = text.lower()
+        # Check if company name or its keywords appear in text
+        if clean_company_lower in text_lower:
+            return True
+        # Check if majority of company keywords appear
+        if company_keywords:
+            matches = sum(1 for kw in company_keywords if kw in text_lower)
+            return matches >= len(company_keywords) * 0.5
+        return False
+
+    # Try SerpAPI first
+    if serpapi_available:
+        for query_idx, query in enumerate(queries[:6]):
+            try:
+                params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
+                search = GoogleSearch(params)
+                api_result = search.get_dict()
+                
+                if "error" in api_result:
+                    print(f"   ⚠️ SerpAPI error: {api_result['error']}")
+                    continue
+                
+                results = api_result.get("organic_results", [])
+                
+                for r in results:
+                    link = r.get("link", "")
+                    title_raw = r.get("title", "") or ""
+                    snippet = r.get("snippet", "") or ""
+                    title = title_raw.lower()
+                    combined = f"{title_raw} {snippet}"
+                    
+                    # Must be a LinkedIn profile
+                    if "linkedin.com/in/" not in link:
+                        continue
+                    if any(bad in link.lower() for bad in ["/posts/", "/pulse/", "/jobs/", "/company/"]):
+                        continue
+                    
+                    # Extract profile slug
+                    match = re.search(r'linkedin\.com/in/([a-zA-Z0-9_-]+)', link)
+                    if not match:
+                        continue
+                    
+                    profile_slug = match.group(1).lower()
+                    
+                    if profile_slug in ['in', 'pub', 'profile', 'company', 'jobs']:
+                        continue
+                    
+                    normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                    
+                    # IMPORTANT: Verify company appears in snippet to avoid wrong person
+                    # For primary queries with company, require company verification
+                    if query_idx <= 1 and clean_company:
+                        if not verify_company_match(combined):
+                            print(f"   ⚠️ Skipping {normalized_url} - company '{clean_company}' not in snippet")
+                            continue
+                    
+                    # Slug name check — reject if neither first nor last name in slug
+                    person_lower = clean_person.lower()
+                    name_parts = [p for p in person_lower.split() if len(p) > 1]
+                    last_name = name_parts[-1] if len(name_parts) >= 2 else ""
+                    first_name = name_parts[0] if name_parts else ""
+
+                    slug_has_first = first_name and first_name in profile_slug
+                    slug_has_last = last_name and last_name in profile_slug
+
+                    if len(name_parts) >= 2 and not slug_has_first and not slug_has_last:
+                        print(f"   ⛔ Slug mismatch — skipping {normalized_url} for {person_name}")
+                        continue
+
+                    # For primary queries, trust first result (after company + slug verification)
+                    if query_idx <= 1:
+                        result["linkedin_url"] = normalized_url
+                        # Extract location - pass title separately for "Name - City, State, Country" parsing
+                        loc = extract_location_from_snippet(snippet, title_raw)
+                        if loc:
+                            result["location"] = {"city": loc.get("city", ""), "state": loc.get("state", ""), "country": loc.get("country", "")}
+                        print(f"   🔗 Found LinkedIn+Location for {person_name}: {normalized_url}, loc={result['location']}")
+                        return result
+
+                    # Fallback queries - require name in title AND company match
+                    if last_name and last_name in title:
+                        if clean_company and not verify_company_match(combined):
+                            continue
+                        result["linkedin_url"] = normalized_url
+                        loc = extract_location_from_snippet(snippet, title_raw)
+                        if loc:
+                            result["location"] = {"city": loc.get("city", ""), "state": loc.get("state", ""), "country": loc.get("country", "")}
+                        print(f"   🔗 Found LinkedIn+Location for {person_name}: {normalized_url}, loc={result['location']}")
+                        return result
+                            
+            except Exception as e:
+                print(f"   ⚠️ SerpAPI error: {e}")
+                continue
+    
+    # Startpage fallback
+    try:
+        import urllib.parse
+        
+        fallback_queries = []
+        if clean_company and clean_position:
+            fallback_queries.append(f'"{clean_person}" "{clean_company}" "{clean_position}" linkedin')
+        if clean_company:
+            fallback_queries.append(f'"{clean_person}" "{clean_company}" linkedin')
+        fallback_queries.append(f'"{clean_person}" linkedin')
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        
+        for fq in fallback_queries[:3]:
+            encoded_query = urllib.parse.quote_plus(fq.strip())
+            search_url = f"https://www.startpage.com/sp/search?query={encoded_query}"
+
+            response = requests.get(search_url, headers=headers, timeout=15)
+            if response.status_code != 200:
+                continue
+
+            # Look for LinkedIn URLs
+            linkedin_matches = re.findall(r'https?://(?:www\.)?linkedin\.com/in/([a-zA-Z0-9_-]+)', response.text)
+
+            for profile_slug in linkedin_matches:
+                profile_slug = profile_slug.lower()
+                if profile_slug in ['in', 'pub', 'profile', 'company', 'jobs']:
+                    continue
+
+                person_lower = clean_person.lower()
+                name_parts = [p for p in person_lower.split() if len(p) > 1]
+
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    last_name = name_parts[-1]
+                    if first_name in profile_slug and last_name in profile_slug:
+                        normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                        result["linkedin_url"] = normalized_url
+                        # Try to extract location from full page text
+                        loc = extract_location_from_snippet(response.text)
+                        if loc:
+                            result["location"] = {"city": loc.get("city", ""), "state": loc.get("state", ""), "country": loc.get("country", "")}
+                        print(f"   🔗 Startpage LinkedIn+Location for {person_name}: {normalized_url}, loc={result['location']}")
+                        return result
+                elif name_parts:
+                    if name_parts[0] in profile_slug:
+                        normalized_url = f"https://www.linkedin.com/in/{profile_slug}/"
+                        result["linkedin_url"] = normalized_url
+                        loc = extract_location_from_snippet(response.text)
+                        if loc:
+                            result["location"] = {"city": loc.get("city", ""), "state": loc.get("state", ""), "country": loc.get("country", "")}
+                        print(f"   🔗 Startpage LinkedIn+Location for {person_name}: {normalized_url}, loc={result['location']}")
+                        return result
+                    
+    except Exception as e:
+        print(f"   ⚠️ Startpage error: {e}")
+    
+    print(f"   ⚠️ No LinkedIn found for: {person_name}")
+    return result
 
 
 def search_person_location(person_name: str, company_name: str = "", linkedin_url: str = "", position: str = "") -> dict:
@@ -1256,7 +1796,24 @@ def search_person_location(person_name: str, company_name: str = "", linkedin_ur
         if not text:
             return None
 
-        # LinkedIn SERP snippets often contain "Location: X" (exactly like Google SEO snippet text).
+        # PATTERN 0: LinkedIn title format "Name - City, State, Country" (MOST RELIABLE)
+        # Example: "Erica Bourne - London, England, United Kingdom"
+        # Must have comma-separated location parts and reasonable length (< 80 chars)
+        title_match = re.search(r'\s+-\s+([A-Z][a-zA-Z\s]+(?:,\s*[A-Z][a-zA-Z\s]+)+)\s*(?:$|\||Location)', text)
+        if title_match:
+            loc_part = title_match.group(1).strip()
+            # Sanity check: location should be reasonably short
+            if len(loc_part) < 80:
+                parts = [p.strip() for p in loc_part.split(",") if p and p.strip()]
+                if len(parts) >= 3:
+                    return {"city": parts[0], "state": parts[1], "country": normalize_country(parts[2])}
+                if len(parts) == 2:
+                    second = parts[1]
+                    if len(second.strip()) == 2 and second.strip().isalpha():
+                        return {"city": parts[0], "state": second.strip().upper(), "country": "USA"}
+                    return {"city": parts[0], "state": "", "country": normalize_country(second)}
+
+        # PATTERN 1: LinkedIn SERP snippets "Location: X"
         # Example: "... Education: Duke University · Location: San Francisco · ..."
         m = re.search(r"\blocation\s*[:\-]\s*([^\n\r|•·]+)", text, re.IGNORECASE)
         if m:
@@ -1375,38 +1932,24 @@ def search_person_location(person_name: str, company_name: str = "", linkedin_ur
     if linkedin_url:
         queries.append(f'{linkedin_url} location')
 
-    # 1) SerpAPI (preferred) - TRUST GOOGLE'S FIRST RESULT
+    # 1) SerpAPI (preferred, PARALLEL) - TRUST GOOGLE'S FIRST RESULT
     # The query "{Name}" {Company} {Role} location returns LinkedIn profile first
     # with "Location: San Francisco" in the SEO snippet. Just grab it.
     if serpapi_available:
-        for query in queries[:4]:  # Try up to 4 queries
-            try:
-                params = {"q": query, "num": 5, "api_key": SERPAPI_KEY}
-                search = GoogleSearch(params)
-                result = search.get_dict()
-                
-                if "error" in result:
-                    print(f"   ⚠️ SerpAPI location error: {result['error']}")
-                    continue
-                
-                results = result.get("organic_results", [])
-                
-                # Trust Google's ranking - take first result with "Location:" in snippet
-                for r in results:
-                    title = r.get("title", "") or ""
-                    snippet = r.get("snippet", "") or ""
-                    combined = f"{title} {snippet}"
-                    
-                    # Look for "Location:" pattern in the snippet (LinkedIn SEO format)
-                    loc = extract_location_from_text(combined)
-                    if loc and loc.get("city"):
-                        loc = finalize_location(loc)
-                        print(f"   📍 Person location for {person_name}: {loc} (from: {query[:50]}...)")
-                        return loc
-                        
-            except Exception as e:
-                print(f"   ⚠️ SerpAPI location error: {e}")
-                continue
+        loc_queries = queries[:4]  # Use up to 4 queries
+        loc_results = serpapi_parallel_search(loc_queries, SERPAPI_KEY, num_results=5)
+        
+        for r in loc_results:
+            title = r.get("title", "") or ""
+            snippet = r.get("snippet", "") or ""
+            combined = f"{title} {snippet}"
+            
+            # Look for "Location:" pattern in the snippet (LinkedIn SEO format)
+            loc = extract_location_from_text(combined)
+            if loc and loc.get("city"):
+                loc = finalize_location(loc)
+                print(f"   📍 Person location for {person_name}: {loc}")
+                return loc
 
     # 2) Startpage fallback (quick + rough, like HQ fallback)
     try:
@@ -1428,6 +1971,78 @@ def search_person_location(person_name: str, company_name: str = "", linkedin_ur
         print(f"⚠️ Person location Startpage error: {e}")
 
     return result
+
+
+def get_raw_serpapi_results_for_person_location(person_name: str, company_name: str = "", position: str = "") -> dict:
+    """
+    Get raw SerpAPI organic_results for AI analysis of person's location.
+    Returns the full organic_results array for the LLM to analyze.
+    
+    Args:
+        person_name: The person's name
+        company_name: Optional company name
+        position: Optional position/title
+        
+    Returns:
+        Dict with keys: query (str), organic_results (list of result dicts)
+    """
+    person_name = (person_name or "").strip()
+    company_name = (company_name or "").strip()
+    position = (position or "").strip()
+    
+    if not person_name or not SERPAPI_KEY:
+        return {"query": "", "organic_results": []}
+    
+    # Build the search query - similar to how we'd search manually
+    query_parts = [f'"{person_name}"']
+    if company_name:
+        query_parts.append(company_name)
+    if position:
+        # Clean position - extract key role if it's too long
+        if len(position) > 30:
+            # Try to extract C-level acronyms
+            for role in ["CEO", "CFO", "CTO", "COO", "CPO", "CMO", "CIO", "CRO"]:
+                if role.lower() in position.lower() or f"Chief {role[1:-1]}" in position:
+                    query_parts.append(role)
+                    break
+            else:
+                # Just take first few words
+                query_parts.append(" ".join(position.split()[:3]))
+        else:
+            query_parts.append(position)
+    query_parts.append("location")
+    
+    query = " ".join(query_parts)
+    print(f"🔍 Raw SerpAPI search for location: {query}")
+    
+    try:
+        params = {"q": query, "num": 10, "api_key": SERPAPI_KEY, "hl": "en", "gl": "us"}
+        search = GoogleSearch(params)
+        result = search.get_dict()
+        
+        if "error" in result:
+            print(f"   ⚠️ SerpAPI error: {result['error']}")
+            return {"query": query, "organic_results": []}
+        
+        organic_results = result.get("organic_results", [])
+        
+        # Simplify the results to just what AI needs: title, snippet, link
+        simplified = []
+        for r in organic_results[:10]:
+            simplified.append({
+                "position": r.get("position", 0),
+                "title": r.get("title", ""),
+                "snippet": r.get("snippet", ""),
+                "link": r.get("link", ""),
+                "source": r.get("source", "")
+            })
+        
+        print(f"   ✅ Got {len(simplified)} organic results for AI analysis")
+        return {"query": query, "organic_results": simplified}
+        
+    except Exception as e:
+        print(f"   ❌ SerpAPI raw search error: {e}")
+        return {"query": query, "organic_results": []}
 
 
 def search_company_headquarters(company_name: str, website_url: str = "") -> dict:
@@ -1635,49 +2250,26 @@ def search_company_headquarters(company_name: str, website_url: str = "") -> dic
         
         return None
     
-    # Try SerpAPI first
+    # Try SerpAPI first (PARALLEL)
     if serpapi_available:
-        for query in [
+        hq_queries = [
             f'"{clean_name}" headquarters location',
             f'"{clean_name}" head office city',
             f'{clean_name} company headquarters',
-        ][:3]:
-            try:
-                params = {"q": query, "num": 10, "api_key": SERPAPI_KEY}
-                search = GoogleSearch(params)
-                api_result = search.get_dict()
-                
-                if "error" in api_result:
-                    print(f"   ⚠️ SerpAPI HQ search error: {api_result['error']}")
-                    continue
-                
-                # Check snippets for location info
-                results = api_result.get("organic_results", [])
-                for r in results:
-                    snippet = r.get("snippet", "")
-                    title = r.get("title", "")
-                    combined = f"{title} {snippet}"
-                    
-                    location = extract_location_from_text(combined)
-                    if location and location.get("city"):
-                        location = finalize_location(location)
-                        print(f"   📍 Found HQ for {company_name}: {location}")
-                        return location
-                
-                # Also check knowledge graph if available
-                kg = api_result.get("knowledge_graph", {})
-                if kg:
-                    hq = kg.get("headquarters", "") or kg.get("location", "")
-                    if hq:
-                        location = extract_location_from_text(f"headquartered in {hq}")
-                        if location and location.get("city"):
-                            location = finalize_location(location)
-                            print(f"   📍 Found HQ (KG) for {company_name}: {location}")
-                            return location
-                        
-            except Exception as e:
-                print(f"   ⚠️ SerpAPI HQ search error: {e}")
-                continue
+        ]
+        print(f"   → Running {len(hq_queries)} HQ queries in PARALLEL...")
+        hq_results = serpapi_parallel_search(hq_queries, SERPAPI_KEY, num_results=10)
+        
+        for r in hq_results:
+            snippet = r.get("snippet", "")
+            title = r.get("title", "")
+            combined = f"{title} {snippet}"
+            
+            location = extract_location_from_text(combined)
+            if location and location.get("city"):
+                location = finalize_location(location)
+                print(f"   📍 Found HQ for {company_name}: {location}")
+                return location
     
     # Fallback: Startpage search with multiple queries
     fallback_queries = [
@@ -1732,26 +2324,22 @@ def get_top_management(company_name, text=""):
     if not text.strip():
         text = get_wikipedia_summary(company_name)
 
-    # Search for company leadership info
+    # Search for company leadership info (PARALLEL)
     context_queries = [
         f'"{company_name}" leadership team CEO CFO executives',
         f'"{company_name}" management team board directors',
         f'{company_name} CEO "chief executive" OR CFO OR CTO',
     ]
     
-    for query in context_queries:
-        try:
-            params = {
-                "q": query,
-                "num": 10,
-                "api_key": os.getenv("SERPAPI_KEY"),
-            }
-            search = GoogleSearch(params)
-            results = search.get_dict().get("organic_results", [])
-            context_snippets = " ".join([r.get("snippet", "") for r in results if r.get("snippet")])
-            text += "\n\n" + context_snippets
-        except Exception as e:
-            print(f"⚠️ Context search failed: {e}")
+    serpapi_key = os.getenv("SERPAPI_KEY")
+    if serpapi_key:
+        print(f"   → Running {len(context_queries)} management queries in PARALLEL...")
+        mgmt_search_results = serpapi_parallel_search(context_queries, serpapi_key, num_results=10)
+        for r in mgmt_search_results:
+            snippet = r.get("snippet", "")
+            if snippet:
+                text += "\n\n" + snippet
+        print(f"   ✅ Management parallel search: {len(mgmt_search_results)} results")
 
     # =====================================================
     # 2️⃣ AI Extraction - Get Names First
@@ -1873,24 +2461,25 @@ Return JSON array only:
             print(f"⚠️ Claude fallback parse failed: {e}")
 
     # =====================================================
-    # 4️⃣ Search LinkedIn for EACH Executive Individually
+    # 4️⃣ Search LinkedIn for EACH Executive in parallel
     # =====================================================
-    print(f"🔗 Searching LinkedIn profiles for {len(management_results)} executives...")
-    
-    for m in management_results:
+    print(f"🔗 Searching LinkedIn profiles for {len(management_results)} executives (parallel)...")
+
+    def _find_exec_linkedin(m):
         name = m.get("name", "")
         position = m.get("position", "")
-        
-        if name:
-            # Search for this person's LinkedIn profile
-            linkedin_url = search_linkedin_profile(name, company_name, position)
-            
-            if linkedin_url:
-                m["linkedin_url"] = linkedin_url
-                print(f"   ✅ Found LinkedIn for {name}")
-            else:
-                m["linkedin_url"] = ""
-                print(f"   ⚠️ No LinkedIn found for {name}")
+        if not name:
+            return
+        linkedin_url = search_linkedin_profile(name, company_name, position)
+        if linkedin_url:
+            m["linkedin_url"] = linkedin_url
+            print(f"   ✅ Found LinkedIn for {name}")
+        else:
+            m["linkedin_url"] = ""
+            print(f"   ⚠️ No LinkedIn found for {name}")
+
+    with ThreadPoolExecutor(max_workers=min(len(management_results) or 1, 5)) as exec_li_ex:
+        list(exec_li_ex.map(_find_exec_linkedin, management_results))
 
     # =====================================================
     # 5️⃣ Clean Bios - Remove Citations & Generic Text
@@ -2064,25 +2653,24 @@ def enrich_counterparties_with_individuals(events: list, main_company: str) -> l
         print("   ⚠️ No OpenRouter key for individual enrichment")
         return events
     
-    # Enrich ALL events (no limit)
+    # Enrich ALL events in parallel (max 5 concurrent to respect rate limits)
     total_events = len(events)
-    
-    for idx, event in enumerate(events):
+
+    def _enrich_single_event(idx_event_tuple):
+        idx, event = idx_event_tuple
         event_short = event.get("Event (short)", "")
         announcement_date = event.get("Announcement Date", "")
         closed_date = event.get("Closed Date", "")
         counterparties = event.get("counterparties", [])
-        
+
         if not counterparties:
-            continue
-            
-        # Build query for this deal
+            return
+
         cp_names = [cp.get("company_name", "") for cp in counterparties if cp.get("company_name")]
         if len(cp_names) < 1:
             print(f"         → Skipping: no counterparty names found")
-            continue
-        
-        # Build date context
+            return
+
         date_context = ""
         if announcement_date:
             date_context += f"Announced: {announcement_date}"
@@ -2090,9 +2678,9 @@ def enrich_counterparties_with_individuals(events: list, main_company: str) -> l
             date_context += f", Closed: {closed_date}" if date_context else f"Closed: {closed_date}"
         if not date_context:
             date_context = "Date unknown"
-            
+
         print(f"      [{idx+1}/{total_events}] Enriching: {event_short[:50]}...")
-            
+
         query = f"""For the corporate deal: "{event_short}"
 Date: {date_context}
 Companies involved: {', '.join(cp_names)}
@@ -2136,62 +2724,54 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
                 },
                 timeout=45
             )
-            
+
             if response.status_code == 200:
                 raw = response.json()["choices"][0]["message"]["content"].strip()
-                
-                # Extract JSON (could be object or array)
+
                 start_obj = raw.find('{')
                 end_obj = raw.rfind('}') + 1
                 start_arr = raw.find('[')
                 end_arr = raw.rfind(']') + 1
-                
+
                 enrichment_data = None
-                
-                # Try object format first
+
                 if start_obj != -1 and end_obj > start_obj:
                     try:
                         enrichment_data = json.loads(raw[start_obj:end_obj])
                         if "counterparties" in enrichment_data:
                             enrichment_data = enrichment_data["counterparties"]
-                    except:
+                    except Exception:
                         pass
-                
-                # Try array format
+
                 if not enrichment_data and start_arr != -1 and end_arr > start_arr:
                     try:
                         enrichment_data = json.loads(raw[start_arr:end_arr])
-                    except:
+                    except Exception:
                         pass
-                
+
                 if enrichment_data and isinstance(enrichment_data, list):
                     print(f"         → Found {len(enrichment_data)} companies in enrichment response")
-                    # Map enrichment data to counterparties
                     for enrich_cp in enrichment_data:
                         enrich_company = enrich_cp.get("company", "").lower()
                         enrich_url = enrich_cp.get("press_release_url", "")
                         enrich_linkedin = enrich_cp.get("company_linkedin_url", "")
                         enrich_individuals = enrich_cp.get("individuals", [])
                         print(f"         → {enrich_company}: {len(enrich_individuals)} individuals found")
-                        
-                        # Find matching counterparty
+
                         for cp in counterparties:
                             cp_name = cp.get("company_name", "").lower()
                             if enrich_company in cp_name or cp_name in enrich_company or \
                                any(word in cp_name for word in enrich_company.split() if len(word) > 3):
-                                
-                                # Update press release URL
+
                                 if enrich_url and not cp.get("press_release_url"):
                                     cp["press_release_url"] = enrich_url
-                                
-                                # Update LinkedIn URL
+
                                 if enrich_linkedin and not cp.get("company_linkedin_url"):
                                     cp["company_linkedin_url"] = enrich_linkedin
-                                
-                                # Add individuals
+
                                 if "individuals" not in cp:
                                     cp["individuals"] = []
-                                    
+
                                 existing_names = [i.get("name", "").lower() for i in cp["individuals"]]
                                 for ind in enrich_individuals:
                                     ind_name = ind.get("name", "")
@@ -2203,93 +2783,96 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
                                         })
                                         existing_names.append(ind_name.lower())
                                 break
-                                
+
         except Exception as e:
             print(f"      ⚠️ Enrichment failed for '{event_short[:30]}...': {e}")
-            continue
+
+    # Run all event enrichments in parallel (max 5 concurrent Perplexity calls)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        list(executor.map(_enrich_single_event, enumerate(events)))
     
     # =====================================================
     # Post-process: Find Website URLs and verify LinkedIn URLs
     # AI often hallucinates URLs, so we verify/find with SerpAPI
+    # Run all counterparties in parallel (each cp is fully independent)
     # =====================================================
-    print(f"\n🔍 Finding counterparty website & LinkedIn URLs via search...")
-    for event in events:
-        counterparties = event.get("counterparties", [])
-        for cp in counterparties:
-            cp_name = cp.get("company_name", "")
-            cp_website = cp.get("company_website", "") or cp.get("company_url", "") or cp.get("website", "")
-            existing_linkedin = cp.get("company_linkedin_url", "")
-            
-            if not cp_name:
-                continue
-            
-            # ==========================================
-            # 1) Find Website URL if missing
-            # ==========================================
-            if not cp_website:
-                print(f"   → Searching website for: {cp_name}...")
-                found_website = search_company_website(cp_name)
-                if found_website:
-                    cp["company_website"] = found_website
-                    cp["company_url"] = found_website
-                    cp["website"] = found_website
-                    cp_website = found_website  # Use for LinkedIn search below
-                else:
-                    print(f"   ⚠️ No website found for {cp_name}")
-            
-            # ==========================================
-            # 2) Find/Verify LinkedIn URL
-            # ==========================================
-            needs_linkedin_search = False
-            if not existing_linkedin:
+    print(f"\n🔍 Finding counterparty website & LinkedIn URLs via search (parallel)...")
+
+    # Collect every (event, cp) pair so we can process them all concurrently
+    all_cp_pairs = [
+        (event, cp)
+        for event in events
+        for cp in event.get("counterparties", [])
+        if cp.get("company_name")
+    ]
+
+    def _enrich_single_cp(event_cp_tuple):
+        _event, cp = event_cp_tuple
+        cp_name = cp.get("company_name", "")
+        cp_website = cp.get("company_website", "") or cp.get("company_url", "") or cp.get("website", "")
+        existing_linkedin = cp.get("company_linkedin_url", "")
+
+        # 1) Find Website URL if missing
+        if not cp_website:
+            print(f"   → Searching website for: {cp_name}...")
+            found_website = search_company_website(cp_name)
+            if found_website:
+                cp["company_website"] = found_website
+                cp["company_url"] = found_website
+                cp["website"] = found_website
+                cp_website = found_website
+            else:
+                print(f"   ⚠️ No website found for {cp_name}")
+
+        # 2) Find/Verify LinkedIn URL
+        needs_linkedin_search = False
+        if not existing_linkedin:
+            needs_linkedin_search = True
+        elif existing_linkedin:
+            slug = existing_linkedin.split('/company/')[-1].rstrip('/').lower() if '/company/' in existing_linkedin else ""
+            name_slug = cp_name.lower().replace(' ', '-').replace(',', '').replace('.', '').replace("'", '')
+            if slug and (slug == name_slug or slug.replace('-', '') == name_slug.replace('-', '')):
                 needs_linkedin_search = True
-            elif existing_linkedin:
-                # Check if the URL looks like it might be AI-generated (generic pattern)
-                # e.g., "linkedin.com/company/company-name" when name is "Company Name Inc."
-                slug = existing_linkedin.split('/company/')[-1].rstrip('/').lower() if '/company/' in existing_linkedin else ""
-                name_slug = cp_name.lower().replace(' ', '-').replace(',', '').replace('.', '').replace("'", '')
-                # If slug is suspiciously similar to a direct name conversion, verify it
-                if slug and (slug == name_slug or slug.replace('-', '') == name_slug.replace('-', '')):
-                    needs_linkedin_search = True
-            
-            if needs_linkedin_search:
-                print(f"   → Searching LinkedIn for: {cp_name}...")
-                real_linkedin = search_company_linkedin(cp_name, cp_website)
-                if real_linkedin:
-                    if existing_linkedin and existing_linkedin != real_linkedin:
-                        print(f"   ✅ Corrected LinkedIn: {existing_linkedin} → {real_linkedin}")
-                    else:
-                        print(f"   ✅ Found LinkedIn: {real_linkedin}")
-                    cp["company_linkedin_url"] = real_linkedin
-                elif not existing_linkedin:
-                    print(f"   ⚠️ No LinkedIn found for {cp_name}")
-            
-            # ==========================================
-            # 3) Find LinkedIn URLs for individuals in this counterparty
-            # ==========================================
-            individuals = cp.get("individuals", [])
-            if individuals:
-                print(f"   👤 Searching LinkedIn for {len(individuals)} individuals at {cp_name}...")
-                for ind in individuals:
-                    ind_name = ind.get("name", "")
-                    ind_title = ind.get("title", "")
-                    existing_ind_linkedin = ind.get("linkedin_url", "")
-                    
-                    if not ind_name:
-                        continue
-                    
-                    # Skip if already has a valid LinkedIn URL
-                    if existing_ind_linkedin and "linkedin.com/in/" in existing_ind_linkedin:
-                        continue
-                    
-                    # Search for this person's LinkedIn profile
-                    person_linkedin = search_linkedin_profile(ind_name, cp_name, ind_title)
-                    if person_linkedin:
-                        ind["linkedin_url"] = person_linkedin
-                        print(f"      ✅ Found LinkedIn for {ind_name}: {person_linkedin}")
-                    else:
-                        print(f"      ⚠️ No LinkedIn found for {ind_name}")
-    
+
+        if needs_linkedin_search:
+            print(f"   → Searching LinkedIn for: {cp_name}...")
+            real_linkedin = search_company_linkedin(cp_name, cp_website)
+            if real_linkedin:
+                if existing_linkedin and existing_linkedin != real_linkedin:
+                    print(f"   ✅ Corrected LinkedIn: {existing_linkedin} → {real_linkedin}")
+                else:
+                    print(f"   ✅ Found LinkedIn: {real_linkedin}")
+                cp["company_linkedin_url"] = real_linkedin
+            elif not existing_linkedin:
+                print(f"   ⚠️ No LinkedIn found for {cp_name}")
+
+        # 3) Find LinkedIn URLs for individuals — parallelized per individual
+        individuals = cp.get("individuals", [])
+        if individuals:
+            print(f"   👤 Searching LinkedIn for {len(individuals)} individuals at {cp_name} (parallel)...")
+
+            def _find_ind_linkedin(ind):
+                ind_name = ind.get("name", "")
+                ind_title = ind.get("title", "")
+                existing_ind_linkedin = ind.get("linkedin_url", "")
+                if not ind_name:
+                    return
+                if existing_ind_linkedin and "linkedin.com/in/" in existing_ind_linkedin:
+                    return
+                person_linkedin = search_linkedin_profile(ind_name, cp_name, ind_title)
+                if person_linkedin:
+                    ind["linkedin_url"] = person_linkedin
+                    print(f"      ✅ Found LinkedIn for {ind_name}: {person_linkedin}")
+                else:
+                    print(f"      ⚠️ No LinkedIn found for {ind_name}")
+
+            with ThreadPoolExecutor(max_workers=min(len(individuals), 5)) as ind_ex:
+                list(ind_ex.map(_find_ind_linkedin, individuals))
+
+    # Process all counterparties concurrently (cap at 8 workers to avoid hammering SerpAPI)
+    with ThreadPoolExecutor(max_workers=8) as cp_ex:
+        list(cp_ex.map(_enrich_single_cp, all_cp_pairs))
+
     return events
 
 
@@ -2317,22 +2900,17 @@ def detect_company_type(company_name: str, serpapi_key: str) -> dict:
     }
     
     try:
-        # Quick search to understand company profile
+        # Quick search to understand company profile (PARALLEL)
         queries = [
             f'"{company_name}" founded startup',
             f'"{company_name}" series funding OR seed round OR accelerator',
             f'"{company_name}" site:crunchbase.com OR site:linkedin.com/company'
         ]
         
-        all_snippets = ""
-        for q in queries:
-            try:
-                params = {"q": q, "num": 5, "api_key": serpapi_key}
-                results = GoogleSearch(params).get_dict().get("organic_results", [])
-                for r in results:
-                    all_snippets += f" {r.get('title', '')} {r.get('snippet', '')}"
-            except:
-                pass
+        print(f"   → Running {len(queries)} company type queries in PARALLEL...")
+        parallel_results = serpapi_parallel_search(queries, serpapi_key, num_results=5)
+        all_snippets = " ".join([f"{r.get('title', '')} {r.get('snippet', '')}" for r in parallel_results])
+        print(f"   ✅ Company type search: {len(parallel_results)} results")
         
         all_snippets_lower = all_snippets.lower()
         
@@ -2526,7 +3104,13 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     context = ""
     results_to_analyze = len(search_results)
     for i, result in enumerate(search_results, 1):
-        context += f"[{i}] {result['title']}\n{result['snippet']}\nSource: {result['link']}\n\n"
+        pd = (result.get("published_date") or "").strip()
+        pd_line = f"Search result date: {pd}\n" if pd else ""
+        context += (
+            f"[{i}] {result['title']}\n{result['snippet']}\n"
+            f"{pd_line}"
+            f"Source: {result['link']}\n\n"
+        )
 
     print(f"   → Sending {results_to_analyze} results to AI for extraction...")
     
@@ -2624,11 +3208,13 @@ For EACH verified event, extract these EXACT fields:
    - If deal not yet closed or date unknown, use empty string ""
    
    DATE ACCURACY RULES (CRITICAL):
-   - ONLY use dates EXPLICITLY stated in the search results
-   - Look for phrases like "announced on [date]", "completed [date]", "dated [date]"
+   - ONLY use dates tied to THIS transaction (announcement, signing, closing) — not company founding, prior milestones, or unrelated history in the snippet.
+   - NEVER use "founded in YYYY", "established in", or "since YYYY" as announcement_date or closed_date unless the snippet is explicitly about THIS deal and uses that date for the deal.
+   - Look for phrases like "announced on [date]", "press release dated", "completed on [date]", "closed [date]".
+   - If each result shows "Search result date: …" and you set source_url to that result's URL, prefer that line for announcement_date when the body does not give a clearer explicit announcement date (it is the article/listing date, not a random older year in the text).
    - If article mentions year but not exact date, check the article date/URL for clues
    - If ONLY year is known: use "Jan 1, YYYY" and add "(approximate)" to event description
-   - NEVER guess dates - if unsure, use article publication date with "(announced)" note
+   - Do not guess — leave dates empty rather than picking an unrelated older date from the snippet.
    - Cross-reference dates across multiple sources when possible
    - Prefer announcement_date if only one date is available
 
@@ -2844,7 +3430,7 @@ JSON:'''
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "anthropic/claude-3.5-sonnet:beta",
+                "model": "anthropic/claude-sonnet-4.6",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,  # Slightly increased for more creative extraction
                 "max_tokens": 32000  # Doubled to allow more events with enhanced counterparty data
@@ -3024,27 +3610,11 @@ def get_ceo_from_serpapi_ai(company_name: str) -> str:
         f"{company_name} chief executive officer",
     ]
 
-    serp_text = ""
-
-    for q in queries:
-        try:
-            params = {
-                "q": q,
-                "num": 10,
-                "hl": "en",
-                "gl": "us",
-                "api_key": SERPAPI_KEY
-            }
-            search = GoogleSearch(params).get_dict()
-            results = search.get("organic_results", [])
-
-            for r in results:
-                title = r.get("title", "")
-                snippet = r.get("snippet", "")
-                serp_text += f"{title}\n{snippet}\n\n"
-
-        except Exception as e:
-            print("⚠️ SERPAPI error:", e)
+    # PARALLEL search for CEO queries
+    print(f"   → Running {len(queries)} CEO queries in PARALLEL...")
+    parallel_results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=10)
+    serp_text = "\n\n".join([f"{r.get('title', '')}\n{r.get('snippet', '')}" for r in parallel_results])
+    print(f"   ✅ CEO search: {len(parallel_results)} results")
 
     if not serp_text.strip():
         print("❌ No SERPAPI text for CEO extraction.")
@@ -3103,7 +3673,7 @@ def get_ceo_from_serpapi(company_name: str) -> str:
     print(f"🔎 SERPAPI (Advanced CEO Extraction) → {company_name}")
 
     # =====================================================
-    # 1️⃣ SERPAPI Google Search Queries
+    # 1️⃣ SERPAPI Google Search Queries (PARALLEL)
     # =====================================================
     queries = [
         f'"{company_name}" CEO',
@@ -3115,27 +3685,11 @@ def get_ceo_from_serpapi(company_name: str) -> str:
         f'"{company_name}" CEO site:crunchbase.com',
     ]
 
-    results_text = ""
-
-    for q in queries:
-        try:
-            params = {
-                "q": q,
-                "num": 10,
-                "hl": "en",
-                "gl": "us",
-                "api_key": SERPAPI_KEY,
-            }
-
-            search = GoogleSearch(params)
-            res = search.get_dict().get("organic_results", [])
-
-            for r in res:
-                title = r.get("title", "")
-                snippet = r.get("snippet", "")
-                results_text += f"{title}. {snippet}\n"
-        except Exception as e:
-            print(f"⚠️ SERPAPI CEO search failed: {e}")
+    # PARALLEL search for all CEO queries at once
+    print(f"   → Running {len(queries)} advanced CEO queries in PARALLEL...")
+    parallel_results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=10)
+    results_text = "\n".join([f"{r.get('title', '')}. {r.get('snippet', '')}" for r in parallel_results])
+    print(f"   ✅ Advanced CEO search: {len(parallel_results)} results")
 
     # If SERPAPI returned nothing
     if not results_text.strip():
@@ -3212,11 +3766,14 @@ Text:
 # ============================================================
 # 🔹 Company Summary Generator
 # ============================================================
-def generate_summary(company_name, text=""):
+def generate_summary(company_name, text="", yahoo_data=None):
     """
     Company summary where CEO is ALWAYS extracted using
     SERPAPI + strict AI CEO extractor (zero hallucination).
     Uses web search as fallback when Wikipedia has no data.
+
+    Pass pre-fetched ``yahoo_data`` (dict from enrich_with_yahoo_finance) to skip
+    a redundant Yahoo Finance lookup inside this function.
     """
     
     # Extract domain/company name from URL if needed
@@ -3234,9 +3791,9 @@ def generate_summary(company_name, text=""):
     if not text.strip():
         text = get_wikipedia_summary(search_name)
     
-    # If Wikipedia has no useful data, use web search
+    # If Wikipedia has no useful data, use web search (PARALLEL)
     if not text.strip() or len(text) < 100:
-        print(f"   → Wikipedia has no data for {search_name}, using web search...")
+        print(f"   → Wikipedia has no data for {search_name}, using web search (PARALLEL)...")
         # Search for company info from multiple sources
         search_queries = [
             f'"{search_name}" company about headquarters',
@@ -3245,15 +3802,16 @@ def generate_summary(company_name, text=""):
             f'"{search_name}" founded CEO location',
             f'site:{website_from_input.replace("https://", "").replace("http://", "").rstrip("/")}' if website_from_input else f'"{search_name}" company',
         ]
-        search_text = ""
-        for q in search_queries:
-            if q:  # Skip empty queries
-                result = serpapi_search(q, num_results=5)
-                if result:
-                    search_text += result + "\n\n"
-        if search_text.strip():
-            text = search_text
-            print(f"   → Collected {len(text)} chars of search data")
+        search_queries = [q for q in search_queries if q]  # Filter empty queries
+        
+        serpapi_key = os.environ.get("SERPAPI_KEY", "")
+        if serpapi_key and search_queries:
+            print(f"   → Running {len(search_queries)} summary queries in PARALLEL...")
+            parallel_results = serpapi_parallel_search(search_queries, serpapi_key, num_results=5)
+            search_text = "\n".join([f"{r.get('title', '')}: {r.get('snippet', '')}" for r in parallel_results])
+            if search_text.strip():
+                text = search_text
+                print(f"   ✅ Parallel summary search: {len(parallel_results)} results, {len(text)} chars")
     
     # ------ Step 1.5: Find press page via direct URL checking + search ------
     press_page_url = ""
@@ -3280,7 +3838,7 @@ def generate_summary(company_name, text=""):
         except:
             return False
     
-    # Step 1.5a: Try common press page URL patterns directly
+    # Step 1.5a: Try common press page URL patterns (PARALLEL)
     if website_base:
         common_press_paths = [
             "/press", "/news", "/newsroom", "/media",
@@ -3293,58 +3851,128 @@ def generate_summary(company_name, text=""):
             "/en/press", "/en/news", "/en/newsroom",
         ]
         
-        print(f"   → Checking common press page paths on {website_base}...")
-        for path in common_press_paths:
-            if press_page_url:
-                break
+        print(f"   → Checking {len(common_press_paths)} press page paths in PARALLEL on {website_base}...")
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def check_press_path(path):
             test_url = website_base + path
             try:
                 if check_url_exists(test_url):
-                    press_page_url = test_url
-                    print(f"   ✅ Found press page: {press_page_url}")
-                    break
+                    return test_url
             except:
-                continue
+                pass
+            return None
+        
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_path = {executor.submit(check_press_path, p): p for p in common_press_paths}
+            for future in as_completed(future_to_path):
+                try:
+                    result = future.result()
+                except Exception:
+                    # Cancelled futures raise CancelledError here — skip them
+                    continue
+                if result and not press_page_url:
+                    press_page_url = result
+                    print(f"   ✅ Found press page: {press_page_url}")
+                    # Cancel remaining futures
+                    for f in future_to_path:
+                        f.cancel()
     
-    # Step 1.5b: If not found, search via SerpAPI
+    # Step 1.5b: If not found, search via SerpAPI (PARALLEL)
     if not press_page_url and domain_for_search:
         press_search_queries = [
             f'site:{domain_for_search} press OR newsroom OR "press releases"',
             f'site:{domain_for_search} news announcements',
         ]
         
-        for pq in press_search_queries:
-            if press_page_url:
-                break
-            try:
-                import os
-                serpapi_key = os.environ.get("SERPAPI_KEY", "")
-                if serpapi_key:
-                    resp = requests.get(
-                        "https://serpapi.com/search",
-                        params={"q": pq, "api_key": serpapi_key, "num": 5},
-                        timeout=10
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        organic = data.get("organic_results", [])
-                        for result in organic:
-                            link = result.get("link", "")
-                            # Check if it's a press/news page
-                            press_keywords = ["/press", "/news", "/newsroom", "/media", "/announcements", "press-release", "/insights"]
-                            if any(kw in link.lower() for kw in press_keywords):
-                                # Validate the URL exists
-                                if check_url_exists(link):
-                                    press_page_url = link
-                                    print(f"   ✅ Found press page via search: {press_page_url}")
-                                    break
-            except Exception as e:
-                print(f"   → Press page search error: {e}")
+        serpapi_key = os.environ.get("SERPAPI_KEY", "")
+        if serpapi_key:
+            print(f"   → Running {len(press_search_queries)} press page queries in PARALLEL...")
+            press_results = serpapi_parallel_search(press_search_queries, serpapi_key, num_results=5)
+
+            def _is_press_section(url: str) -> bool:
+                """Accept only section-level press/news pages, not individual articles."""
+                if not url:
+                    return False
+                try:
+                    from urllib.parse import urlparse as _up
+                    path = _up(url).path.rstrip("/").lower()
+                    segs = [s for s in path.split("/") if s]
+                    SECTION_KW = {"news", "press", "newsroom", "press-releases", "press-room",
+                                  "media", "media-center", "announcements", "updates", "articles",
+                                  "blog", "insights", "in-the-news", "coverage", "category"}
+                    if not any(kw in path for kw in SECTION_KW):
+                        return False
+                    if len(segs) > 4:
+                        return False
+                    last = segs[-1] if segs else ""
+                    if len(last) > 60:
+                        return False
+                    if re.search(r'\d{4}[-/]\d{2}', last):
+                        return False
+                    return True
+                except Exception:
+                    return False
+
+            for result in press_results:
+                link = result.get("link", "")
+                if link and _is_press_section(link):
+                    if check_url_exists(link):
+                        press_page_url = link
+                        print(f"   ✅ Found press page via search: {press_page_url}")
+                        break
+                elif link:
+                    print(f"   ⚠️ Skipped press URL (looks like article): {link}")
     
     if press_page_url:
         print(f"   📰 Press page URL: {press_page_url}")
     else:
         print(f"   ⚠️ No press page found")
+
+    # ------ Step 1.6: Add targeted financial/investor search context ------
+    financial_queries = [
+        f'"{search_name}" enterprise value OR EV revenue EBITDA',
+        f'"{search_name}" investors OR "backed by" OR "portfolio of"',
+        f'"{search_name}" site:pitchbook.com OR site:crunchbase.com',
+    ]
+    serpapi_key = os.environ.get("SERPAPI_KEY", "")
+    if serpapi_key and financial_queries:
+        try:
+            print(f"   → Running {len(financial_queries)} financial context queries in PARALLEL...")
+            fin_results = serpapi_parallel_search(financial_queries, serpapi_key, num_results=5)
+            fin_text = "\n".join(
+                [f"{r.get('title', '')}: {r.get('snippet', '')}" for r in fin_results]
+            )
+            if fin_text.strip():
+                text += "\n\n" + fin_text
+                print(f"   ✅ Added financial context: {len(fin_results)} results, {len(fin_text)} chars")
+        except Exception as e:
+            print(f"   ⚠️ Financial context search failed: {e}")
+
+    # Use pre-fetched Yahoo data if passed in (avoids a double lookup)
+    if yahoo_data is None:
+        yahoo_data = enrich_with_yahoo_finance(search_name, website_from_input)
+    if yahoo_data:
+        institutional_holders = yahoo_data.get("institutional_holders", []) or []
+        yahoo_context = f"""
+Yahoo Finance Data (authoritative, use these values):
+- Enterprise Value: ${yahoo_data.get('enterprise_value_m')}M {yahoo_data.get('currency', '')}
+- Revenue (TTM): ${yahoo_data.get('revenue_m')}M {yahoo_data.get('currency', '')}
+- EBITDA (TTM): ${yahoo_data.get('ebitda_m')}M {yahoo_data.get('currency', '')}
+- EBITDA Margin: {round(yahoo_data.get('ebitda_margin', 0) * 100, 1) if yahoo_data.get('ebitda_margin') else 'N/A'}%
+- Market Cap: ${yahoo_data.get('market_cap_m')}M
+- EV/Revenue: {yahoo_data.get('ev_revenue')}x
+- EV/EBITDA: {yahoo_data.get('ev_ebitda')}x
+- Revenue Growth: {round(yahoo_data.get('revenue_growth', 0) * 100, 1) if yahoo_data.get('revenue_growth') else 'N/A'}%
+- Employees: {yahoo_data.get('employees')}
+- Exchange: {yahoo_data.get('exchange')} ({yahoo_data.get('ticker')})
+- Institutional Ownership: {round((yahoo_data.get('institutional_ownership_pct') or 0) * 100, 1)}%
+- Top Institutional Holders: {', '.join([h['name'] for h in institutional_holders[:5]])}
+- Source: {yahoo_data.get('source_url')}
+"""
+        text = yahoo_context + "\n\n" + text
+        print("   ✅ Yahoo Finance data injected into context")
 
     # ------ Step 2: Use Perplexity for accurate company info ------
     
@@ -3377,6 +4005,7 @@ Return ONLY in this exact markdown format (no extra text):
 
 **Company Details**
 - Company Name: <full legal/common name>
+- Former Name: <previous legal/common name, or Unknown>
 - Year Founded: <year>
 - Website: <full URL like https://www.example.com>
 - LinkedIn: <full LinkedIn URL like https://www.linkedin.com/company/example>
@@ -3387,6 +4016,23 @@ Return ONLY in this exact markdown format (no extra text):
 - Primary Sectors: <comma-separated list of the main sectors this company operates in>
 - Secondary Sectors: <comma-separated list of additional but less central sectors, or "None">
 - CEO: <full name>
+- Investors: <comma-separated list of known investors (VCs, PE firms, corporates), or Unknown>
+- Last Investment Amount: <latest funding round / investment amount, e.g. 50 or 50m, or Unknown>
+- Last Investment Currency: <ISO currency code, e.g. USD, EUR, GBP, or Unknown>
+- Last Investment Date: <YYYY-MM-DD if available, otherwise YYYY-MM or YYYY, or Unknown>
+- Last Investment Source: <source URL for latest funding/investment data, or Unknown>
+- Revenues: <latest revenue in millions, or Unknown>
+- Revenues Currency: <ISO currency code, e.g. USD, EUR, GBP, or Unknown>
+- Revenues Year: <year, or Unknown>
+- Revenues Source: <source URL for revenue data, or Unknown>
+- Enterprise Value: <enterprise value in millions, or Unknown>
+- Enterprise Value Currency: <ISO currency code, e.g. USD, EUR, GBP, or Unknown>
+- Enterprise Value Year: <year, or Unknown>
+- Enterprise Value Source: <source URL for enterprise value data, or Unknown>
+- EBITDA: <latest EBITDA in millions, or Unknown>
+- EBITDA Currency: <ISO currency code, e.g. USD, EUR, GBP, or Unknown>
+- EBITDA Year: <year, or Unknown>
+- EBITDA Source: <source URL for EBITDA data, or Unknown>
 
 CRITICAL RULES:
 
@@ -3457,14 +4103,21 @@ CRITICAL RULES:
    - This should be more specific than a sector - it's the primary business model/focus area.
 
 7. Sector Definition (for Primary/Secondary Sectors):
-   - A *sector* is a broad category of the economy that groups together companies with similar business activities.
-   - Examples: Technology, Healthcare, Financial Services, Consumer Goods, Industrials, Energy, Real Estate,
-     Telecommunications, Utilities, Materials, Public Sector, Education, Non-Profit, Government, etc.
+   - You MUST choose sector names ONLY from this exact list — do NOT invent new sector names:
+     Technology, Information Technology, Healthcare, Financial Services, Consumer Goods,
+     Consumer Discretionary, Consumer Staples, Industrials, Energy, Real Estate,
+     Telecommunications, Utilities, Materials, Environment, Maritime, Aerospace & Defense,
+     Media, Education, Government, Non-Profit, Transportation, Retail, Business Services,
+     Data & Analytics, Pharmaceuticals, Biotechnology, Food & Beverage, Agriculture,
+     Construction, Insurance, Defense, Cybersecurity, Logistics, Mining, Chemicals,
+     Automotive, Aviation, Shipping, CleanTech, FinTech, HealthTech, PropTech
    - Primary Sectors = where the company generates most of its value / core business.
    - Secondary Sectors = adjacent areas or important but non-core activities.
+   - When in doubt, pick the closest broad sector from the list above (e.g. "Marine Technology" → "Maritime", "Ocean Intelligence" → "Technology").
 
 8. Search your knowledge for this company if the source text is insufficient
-9. If you truly cannot find a value, write "Unknown"
+9. For financial metrics, prioritize the most recent disclosed figures and cite a source URL when available.
+10. If you truly cannot find a value, write "Unknown"
 
 {"Known website: " + website_from_input if website_from_input else ""}
 
@@ -3479,17 +4132,18 @@ Source text for reference:
     )
 
     if not summary:
-        return "❌ No details found."
-    
-    print(f"   → AI returned company info: {summary[:300]}...")
-    summary = openrouter_chat(
-        "openai/gpt-4o-mini",
-        prompt,
-        "Company Info Extractor"
-    )
+        # Only fall back to GPT if Sonar fails entirely. Sonar has live web access
+        # and is the better source for investors/financial metrics.
+        summary = openrouter_chat(
+            "openai/gpt-4o-mini",
+            prompt,
+            "Company Info Extractor"
+        )
 
     if not summary:
         return "❌ No details found."
+
+    print(f"   → AI returned company info: {summary[:300]}...")
 
     # ------ Step 3: Get CEO strictly from SERPAPI ------
     ceo = get_ceo_from_serpapi_ai(company_name)
@@ -3529,14 +4183,226 @@ Source text for reference:
             final_lines.append(f"- Press Page: {press_page_url}")
             print(f"   → Added press page URL from search: {press_page_url}")
 
+    if yahoo_data:
+        yahoo_source = yahoo_data.get("source_url", "")
+        yahoo_currency = yahoo_data.get("currency", "")
+        yahoo_year = str(datetime.now().year)
+        institutional_holders = yahoo_data.get("institutional_holders", []) or []
+        yahoo_fields = {}
+
+        if institutional_holders:
+            yahoo_fields["Investors"] = ", ".join([h.get("name", "") for h in institutional_holders[:5] if h.get("name")])
+        if yahoo_data.get("revenue_m") is not None:
+            yahoo_fields["Revenues"] = str(yahoo_data.get("revenue_m"))
+            yahoo_fields["Revenues Currency"] = yahoo_currency
+            yahoo_fields["Revenues Year"] = yahoo_year
+            yahoo_fields["Revenues Source"] = yahoo_source
+        if yahoo_data.get("enterprise_value_m") is not None:
+            yahoo_fields["Enterprise Value"] = str(yahoo_data.get("enterprise_value_m"))
+            yahoo_fields["Enterprise Value Currency"] = yahoo_currency
+            yahoo_fields["Enterprise Value Year"] = yahoo_year
+            yahoo_fields["Enterprise Value Source"] = yahoo_source
+        if yahoo_data.get("ebitda_m") is not None:
+            yahoo_fields["EBITDA"] = str(yahoo_data.get("ebitda_m"))
+            yahoo_fields["EBITDA Currency"] = yahoo_currency
+            yahoo_fields["EBITDA Year"] = yahoo_year
+            yahoo_fields["EBITDA Source"] = yahoo_source
+
+        if yahoo_fields:
+            _INVALID = {"unknown", "n/a", "none", "-", ""}
+            for field, value in yahoo_fields.items():
+                field_lower = field.lower()
+                replaced = False
+                for i, line in enumerate(final_lines):
+                    if ":" not in line:
+                        continue
+                    fname = line.split(":", 1)[0].lstrip("- ").strip().lower()
+                    if fname == field_lower:
+                        existing_val = line.split(":", 1)[-1].strip().lower()
+                        if existing_val in _INVALID:
+                            # Replace the LLM's Unknown/empty with Yahoo data
+                            final_lines[i] = f"- {field}: {value}"
+                        replaced = True
+                        break
+                if not replaced:
+                    final_lines.append(f"- {field}: {value}")
+
     return "\n".join(final_lines).strip()
 
 # ============================================================
 # 🔹 Company Description Generator
 # ============================================================
+def _parse_company_details_markdown(company_details: str) -> dict:
+    """
+    Parse the markdown produced by generate_summary() into a dict of fields.
+
+    Expected shape:
+    **Company Details**
+    - Field: Value
+    """
+    if not company_details:
+        return {}
+
+    fields = {}
+    for raw_line in (company_details or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("**") and line.endswith("**"):
+            continue
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        key = (k or "").strip().lower()
+        val = (v or "").strip()
+        if not key:
+            continue
+        fields[key] = val
+    return fields
+
+
+def detect_ownership_from_description(description: str) -> dict:
+    """
+    Use LLM to infer ownership type from a company description.
+    Returns a dict with primary_ownership_type, secondary_ownership_types,
+    confidence, and reasoning — mapped to the Xano OWNERSHIP_TYPES values.
+    """
+    if not description or not description.strip():
+        return {"ownership": "", "confidence": "Low", "reasoning": "No description provided"}
+
+    # Map prompt output → Xano OWNERSHIP_TYPES labels
+    OWNERSHIP_MAP = {
+        "publicly listed":              "Public",
+        "publicly traded":              "Public",
+        "public":                       "Public",
+        "vc-backed":                    "Venture Capital",
+        "vc backed":                    "Venture Capital",
+        "venture capital":              "Venture Capital",
+        "venture-backed":               "Venture Capital",
+        "pe-owned":                     "Private Equity",
+        "pe owned":                     "Private Equity",
+        "private equity":               "Private Equity",
+        "sponsor-backed":               "Private Equity",
+        "sponsor backed":               "Private Equity",
+        "subsidiary of public company": "Subsidiary",
+        "subsidiary of private company":"Subsidiary",
+        "subsidiary":                   "Subsidiary",
+        "acquired":                     "Acquired",
+        "government-owned":             "Government",
+        "government owned":             "Government",
+        "state-owned":                  "Government",
+        "state owned":                  "Government",
+        "government":                   "Government",
+        "nonprofit":                    "Foundation",
+        "non-profit":                   "Foundation",
+        "not-for-profit":               "Foundation",
+        "foundation":                   "Foundation",
+        "employee-owned":               "Employee-Owned",
+        "employee owned":               "Employee-Owned",
+        "cooperative":                  "Consortium",
+        "co-op":                        "Consortium",
+        "consortium":                   "Consortium",
+        "fund":                         "Fund",
+        "institutionally backed":       "Fund",
+        "institutional":                "Fund",
+        "partnership":                  "Partnership",
+        "founder-owned":                "Private",
+        "founder owned":                "Private",
+        "family-owned":                 "Private",
+        "family owned":                 "Private",
+        "bootstrapped":                 "Private",
+        "privately held":               "Private",
+        "private":                      "Private",
+    }
+
+    prompt = f"""You are given a company description.
+
+Your task is to determine the most likely ownership type of the company based only on the information provided in the description.
+
+Possible ownership types:
+- Publicly Listed
+- Privately Held
+- VC-backed
+- PE-owned
+- Founder-owned
+- Family-owned
+- Bootstrapped
+- Government-owned
+- State-owned
+- Subsidiary of Public Company
+- Subsidiary of Private Company
+- Employee-owned
+- Cooperative
+- Nonprofit
+- Institutionally Backed
+- Sponsor-backed
+
+Instructions:
+1. Read the company description carefully.
+2. Infer the most likely ownership type based on wording such as:
+   - mentions of venture funding, Series A/B/C, investors, startup, venture capital → VC-backed
+   - mentions of private equity firms, buyouts, majority ownership, portfolio company → PE-owned
+   - mentions of public markets, stock exchange, listed company, ticker symbol → Publicly Listed
+   - mentions of subsidiary, division, owned by another company → Subsidiary of Public Company or Subsidiary of Private Company
+   - mentions of family control, founder control, self-funded growth, government ownership, nonprofit status, etc.
+3. If multiple ownership types apply, return a primary_ownership_type and optional secondary_ownership_types.
+4. If there is not enough information to confidently assign a more specific category, default to "Privately Held".
+5. Do not invent facts that are not supported by the description.
+6. Return confidence as High, Medium, or Low.
+
+Return ONLY valid JSON (no markdown, no extra text):
+{{
+  "primary_ownership_type": "",
+  "secondary_ownership_types": [],
+  "confidence": "",
+  "reasoning": ""
+}}
+
+Company description:
+{description[:3000]}"""
+
+    try:
+        raw = openrouter_chat("openai/gpt-4o-mini", prompt, "Ownership Detector")
+        if not raw:
+            return {"ownership": "", "confidence": "Low", "reasoning": "LLM returned empty"}
+
+        # Strip markdown code fences if present
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned)
+
+        result = json.loads(cleaned)
+        primary = (result.get("primary_ownership_type") or "").strip().lower()
+        xano_type = OWNERSHIP_MAP.get(primary, "")
+
+        # Try partial match if exact key not found
+        if not xano_type:
+            for key, val in OWNERSHIP_MAP.items():
+                if key in primary or primary in key:
+                    xano_type = val
+                    break
+
+        if not xano_type:
+            xano_type = "Private"  # safe default
+
+        print(f"[Ownership] '{primary}' → '{xano_type}' (confidence: {result.get('confidence','?')})")
+        return {
+            "ownership": xano_type,
+            "confidence": result.get("confidence", "Medium"),
+            "reasoning": result.get("reasoning", ""),
+            "secondary": result.get("secondary_ownership_types", []),
+        }
+    except Exception as e:
+        print(f"[Ownership] Detection error: {e}")
+        return {"ownership": "", "confidence": "Low", "reasoning": str(e)}
+
+
 def generate_description(company_name, text="", company_details=""):
     """
-    Generates a professional, neutral, fact-based company description in a single paragraph.
+    Generates a professional, neutral, fact-based company profile in a consistent, useful format.
 
     Args:
         company_name (str): The name of the company.
@@ -3544,11 +4410,22 @@ def generate_description(company_name, text="", company_details=""):
         company_details (str): Optional verified company details to include in context.
 
     Returns:
-        str: A single-paragraph company description, or an error message if generation fails.
+        str: A consistent multi-line company profile, or an error message if generation fails.
     """
     # Use provided text or fetch from Wikipedia
     if not text.strip():
         text = get_wikipedia_summary(company_name)
+    parsed = _parse_company_details_markdown(company_details or "")
+    year_founded = parsed.get("year founded", "")
+    headquarters = parsed.get("headquarters", "")
+    ownership_status = parsed.get("ownership status", "")
+    ceo = parsed.get("ceo", "")
+    primary_business_focus = parsed.get("primary business focus", "")
+    # NOTE: Sectors are intentionally not emitted in the final description output.
+    # We still parse them above in case other parts of the pipeline need them later.
+    primary_sectors = parsed.get("primary sectors", "")
+    secondary_sectors = parsed.get("secondary sectors", "")
+
     # Combine verified details and source text for context
     combined_context = f"""
 Verified Company Information:
@@ -3557,25 +4434,24 @@ Verified Company Information:
 Additional Context:
 {text[:6000]}
 """
-    prompt = f"""You are Company Description Writer v1. You produce professional, neutral, and fact-based company descriptions in a single paragraph, using only company websites and reliable news sources.
+    prompt = f"""You are Company Profile Writer v2. You produce professional, neutral, fact-based company profiles that are highly useful for analysts.
 
 RULES:
 - Write in an objective tone, avoiding marketing language, flowery adjectives, or adverbs.
 - NEVER use generic non-factual words: 'significant', 'important', 'best', 'leading', 'cutting-edge', 'innovative'.
-- Provide SPECIFIC factual details, especially for funding rounds and investors (names, amounts, rounds, percentages).
-- All content must be ONE SINGLE PARAGRAPH - no bullet points, no lists, no line breaks.
-- Do NOT include a concluding sentence or summary - end when factual information ends.
+- Provide SPECIFIC factual details where available (e.g., funding rounds and investors: names, amounts, rounds).
+- Do NOT invent data. If a field is unknown, write "Unknown" (or "None" where appropriate).
 - Do NOT include promotional sentences like "More information can be found on their website".
 - Do NOT mention the company website URL in the description.
+- Prefer concrete nouns over vague claims (e.g., "credit bureau data", "shipping telemetry", "hospital EHR analytics").
 
-REQUIRED CONTENT (include where available):
-- Year founded
-- Products and services (if data provider: specify data types with granularity)
-- CEO and founder(s)
-- Acquisitions and disposals
-- Funding rounds (last confirmed round, main investors)
-- Headquarters location (city/country only, no street address)
-- Ownership structure
+OUTPUT FORMAT (MUST follow exactly; 6 lines; no extra lines):
+Snapshot: <1 sentence: what the company is/does, include year+HQ if known>
+What they do: <2–3 clauses on core offering; be specific about the job-to-be-done>
+Products/services: <1 sentence naming key products/services or product categories; include key data types if relevant>
+Customers & markets: <who buys/uses it + typical industries + geography if known>
+Business model & distribution: <how it makes money + delivery channels (SaaS, API, licenses, services, etc.) if known>
+Ownership & key events: <ownership status/parent + notable funding/acquisitions/disposals with dates/amounts if known>
 
 OWNERSHIP RULES:
 - If PE-backed: specify the PE firm and when sponsorship occurred.
@@ -3588,24 +4464,89 @@ FOR DATA/ANALYTICS PROVIDERS:
 - Specify distinct products if 2 or more exist.
 - Reader must understand what dataset is at the core of the offering.
 
-REFERENCE EXAMPLE (follow this style):
-"IMPECT is a football analytics software company founded in 2014 by Stefan Reinartz, Jens Hegeler, Lukas Keppler, and Matthias Sienz, headquartered in Cologne, Germany. The company develops cloud-based tools and data services for clubs, coaches, scouts and federations, focusing on tactical insight, player performance, opponent analysis, and internal benchmarking using proprietary metrics. One of its signature innovations is the Packing metric, which measures how effectively players move the ball past opponents using passing and positioning, intended to provide higher explanatory power for game success than basic statistics like possession or pass completion. Impect operates a SaaS business model, collecting and owning event data from a large number of matches across many leagues (over 40,000 matches annually in 252 countries for 150+ teams). Its products include a scouting platform, analysis tools, data APIs, and raw event datasets. In 2025, Impect was acquired by Catapult Sports in a deal worth up to EUR78m ($91m), as part of a strategy by Catapult to integrate tactical and scouting analytics into its broader video-, performance- and wearable-technology product suite."
+VERIFIED FIELDS (use these first; do NOT contradict them):
+- Company: {company_name}
+- Primary business focus: {primary_business_focus or "Unknown"}
+- Year founded: {year_founded or "Unknown"}
+- Headquarters: {headquarters or "Unknown"}
+- CEO: {ceo or "Unknown"}
+- Ownership status: {ownership_status or "Unknown"}
 
-Now write a single-paragraph description for "{company_name}" using ONLY the verified information below. Do NOT invent data.
+Now generate the company profile using ONLY the verified information below and any reliable facts present in the additional context. Do NOT invent data.
 
 {combined_context}
 """
-    result = openrouter_chat("openai/gpt-4o-mini", prompt, "Company Description Writer v1")
+    result = openrouter_chat("openai/gpt-4o-mini", prompt, "Company Profile Writer v2")
     # Validate the description
     if not result or len(result.strip()) < 40:
         return "❌ No factual description could be generated."
-    # Clean up - ensure single paragraph, remove any trailing website mentions
+    # Clean up - remove any trailing website mentions
     result = result.strip()
     # Remove common trailing patterns about websites
     import re
     result = re.sub(r'\s*(For more information|More information|Visit|Learn more)[^.]*\.?\s*$', '', result, flags=re.IGNORECASE)
     result = re.sub(r'\s*\(?https?://[^\s\)]+\)?\s*\.?\s*$', '', result)
-    return result.strip()
+    # Normalize to the expected 6-line format (robust against model drift).
+    expected_labels = [
+        "Snapshot:",
+        "What they do:",
+        "Products/services:",
+        "Customers & markets:",
+        "Business model & distribution:",
+        "Ownership & key events:",
+    ]
+
+    def _starts_with_label(line: str, label: str) -> bool:
+        return (line or "").strip().lower().startswith(label.lower())
+
+    raw_lines = [ln.strip() for ln in result.splitlines() if ln.strip()]
+    picked = {}
+    for ln in raw_lines:
+        for label in expected_labels:
+            if _starts_with_label(ln, label) and label not in picked:
+                picked[label] = ln
+                break
+
+    # If the model returned already-unlabeled lines, assume they are in order.
+    if not picked:
+        if len(raw_lines) >= len(expected_labels):
+            for i, label in enumerate(expected_labels):
+                picked[label] = f"{label} {raw_lines[i]}".strip()
+
+    # Deterministic fallbacks for missing required lines.
+    if "Snapshot:" not in picked:
+        parts = []
+        if primary_business_focus and primary_business_focus.strip() and primary_business_focus.strip().lower() not in ["unknown", "n/a"]:
+            parts.append(f"{company_name} is a {primary_business_focus.strip()} company")
+        else:
+            parts.append(f"{company_name} is a company")
+        if year_founded and year_founded.strip().lower() not in ["unknown", "n/a"]:
+            parts.append(f"founded in {year_founded.strip()}")
+        if headquarters and headquarters.strip().lower() not in ["unknown", "n/a"]:
+            parts.append(f"headquartered in {headquarters.strip()}")
+        picked["Snapshot:"] = "Snapshot: " + ", ".join(parts) + "."
+
+    if "What they do:" not in picked:
+        picked["What they do:"] = "What they do: Unknown"
+    if "Products/services:" not in picked:
+        picked["Products/services:"] = "Products/services: Unknown"
+    if "Customers & markets:" not in picked:
+        picked["Customers & markets:"] = "Customers & markets: Unknown"
+    if "Business model & distribution:" not in picked:
+        picked["Business model & distribution:"] = "Business model & distribution: Unknown"
+    if "Ownership & key events:" not in picked:
+        ownership_txt = ownership_status.strip() if ownership_status else "Unknown"
+        picked["Ownership & key events:"] = f"Ownership & key events: {ownership_txt}"
+
+    # Final output should be plain text (no bullet/label prefixes).
+    out_lines = []
+    for label in expected_labels:
+        ln = picked.get(label, "").strip()
+        if _starts_with_label(ln, label):
+            ln = ln[len(label):].strip()
+        out_lines.append(ln or "Unknown")
+
+    return " ".join(out_lines).strip()
 
 # ============================================================
 # 🔹 Subsidiary Data Generator

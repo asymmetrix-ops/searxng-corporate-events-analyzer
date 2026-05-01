@@ -50,6 +50,13 @@ def check_company_by_url(website_url: str) -> Optional[dict]:
         response.raise_for_status()
         data = response.json()
         
+        # Handle list response (API returns [{"id":..., "name":..., "url":...}])
+        if isinstance(data, list):
+            if len(data) > 0 and isinstance(data[0], dict):
+                return data[0]
+            return None
+        
+        # Handle dict response (legacy/fallback)
         # API returns null or empty if not found
         if data is None or data == {} or (isinstance(data, dict) and data.get("id") is None):
             return None
@@ -835,21 +842,21 @@ if st.button("🚀 Analyze Company"):
 
             # Store report if new company
             if not db_company_data:
-            store_report(
-                search_query,
-                summary,
-                description,
-                json.dumps(corporate_events),
-                json.dumps(mgmt_list),
-            )
-            store_search(
-                search_query,
-                wiki_text,
-                summary,
-                description,
-                json.dumps(corporate_events),
-                json.dumps(mgmt_list),
-            )
+                store_report(
+                    search_query,
+                    summary,
+                    description,
+                    json.dumps(corporate_events),
+                    json.dumps(mgmt_list),
+                )
+                store_search(
+                    search_query,
+                    wiki_text,
+                    summary,
+                    description,
+                    json.dumps(corporate_events),
+                    json.dumps(mgmt_list),
+                )
             
             progress.progress(100)
             status.text("✅ Done")
@@ -1164,7 +1171,7 @@ if st.button("🚀 Analyze Company"):
                                 st.markdown("---")
                                 if is_missing:
                                     st.warning("⚠️ This event is not in the database")
-            else:
+                                else:
                                     st.info("✅ This event appears to match a database record")
                                 
                                 # Check if this event was already added (persisted in session state)

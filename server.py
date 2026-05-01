@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import traceback
 import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -20,6 +21,8 @@ from searxng_analyzer import (
     get_wikipedia_summary,
     get_top_management,
     openrouter_chat,
+    detect_ownership_from_description,
+    enrich_with_yahoo_finance,
 )
 
 import requests
@@ -119,13 +122,152 @@ Context:
     }
 
 
+def _extract_location_from_serpapi_with_ai(person_name: str, company_name: str, position: str, organic_results: list) -> dict:
+    """
+    Use AI (OpenRouter) to analyze SerpAPI organic_results and extract the person's location.
+    This is more reliable than regex patterns as the LLM can understand context.
+    
+    Args:
+        person_name: The person's name
+        company_name: The company name
+        position: The person's position/title
+        organic_results: List of SerpAPI organic_results (each has title, snippet, link)
+        
+    Returns:
+        Dict with keys: city, state, country (any may be empty string)
+    """
+    if not organic_results:
+        return {"city": "", "state": "", "country": ""}
+    
+    # Format the results for the AI prompt
+    results_text = ""
+    for i, r in enumerate(organic_results[:10], 1):
+        title = r.get("title", "").strip()
+        snippet = r.get("snippet", "").strip()
+        link = r.get("link", "").strip()
+        source = r.get("source", "").strip()
+        results_text += f"\n{i}. Title: {title}\n   Snippet: {snippet}\n   Link: {link}\n   Source: {source}\n"
+    
+    prompt = f"""You are analyzing Google search results to find WHERE AN INDIVIDUAL PERSON LIVES/IS BASED (city/state/country).
+
+**Person:** {person_name}
+**Company they work for:** {company_name}
+**Position:** {position}
+
+**Search Results:**
+{results_text}
+
+**CRITICAL INSTRUCTIONS:**
+
+1. Find the INDIVIDUAL PERSON'S location - NOT the company's headquarters!
+   - A person can work for "London Stock Exchange" but live in Chicago
+   - A person can be CEO of a Paris company but be based in New York
+   - IGNORE company addresses, office locations, and corporate headquarters
+
+2. Look for PERSONAL location indicators:
+   - LinkedIn profile titles: "Name - City, State, Country" (MOST RELIABLE)
+   - Phrases like "based in [City]", "lives in [City]", "[Name] of [City]"
+   - Personal LinkedIn snippets showing "Location: [City]"
+   - Biography mentions of where the person resides
+
+3. What to IGNORE:
+   - Company headquarters addresses (e.g., "10 Paternoster Square, London" is an office address)
+   - "c/o Company Address" - this is a mailing address, not personal location
+   - Generic company location mentions
+
+4. PRIORITIZE LinkedIn results (linkedin.com/in/) - the title format "Name - Location" is the person's actual location
+
+5. If the LinkedIn title shows a different location than the company's headquarters, USE THE LINKEDIN LOCATION - that's where the person actually is.
+
+Return the person's location in this exact JSON format (NO code fences, just raw JSON):
+{{"city": "CityName", "state": "StateName", "country": "CountryName"}}
+
+**Rules:**
+- Use FULL names, not abbreviations (e.g., "California" not "CA", "United Kingdom" not "UK")
+- For "Greater X Area" locations, use the main city (e.g., "Greater Chicago Area" → city="Chicago", state="Illinois", country="United States")
+- If you can't determine a field, use empty string ""
+- For UK locations, state is the county/region (e.g., "England", "Greater London")
+
+Return ONLY the JSON object, nothing else."""
+
+    try:
+        raw = openrouter_chat("openai/gpt-4o-mini", prompt, f"extract-location-{person_name[:32]}")
+        parsed = _parse_openrouter_json(raw)
+        out = {
+            "city": (parsed.get("city") or "").strip(),
+            "state": (parsed.get("state") or "").strip(),
+            "country": (parsed.get("country") or "").strip(),
+        }
+        
+        # Lightweight normalization
+        country_norm = {
+            "usa": "United States",
+            "us": "United States",
+            "u.s.": "United States",
+            "united states of america": "United States",
+            "uk": "United Kingdom",
+            "u.k.": "United Kingdom",
+            "uae": "United Arab Emirates",
+        }
+        if out["country"]:
+            out["country"] = country_norm.get(out["country"].strip().lower(), out["country"])
+            
+        if out["state"].strip().upper() == "DC":
+            out["state"] = "District of Columbia"
+            
+        print(f"🤖 AI extracted location for {person_name}: {out}")
+        return out
+        
+    except Exception as e:
+        print(f"⚠️ AI location extraction error: {e}")
+        return {"city": "", "state": "", "country": ""}
+
+
 # ============================================================
 # 🔹 Environment
 # ============================================================
 load_dotenv()
 
 XANO_BASE_URL = "https://xdil-abvj-o7rq.e2.xano.io"
-SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY", "").strip()
+XANO_EMAIL    = os.getenv("XANO_EMAIL", "").strip()
+XANO_PASSWORD = os.getenv("XANO_PASSWORD", "").strip()
+SCRAPFLY_KEY  = os.getenv("SCRAPFLY_KEY", "").strip()
+
+# ── Xano auth token (fetched once at startup, refreshed on 401) ──────────────
+_xano_token: str = ""
+
+def _xano_login() -> str:
+    """POST credentials to Xano auth and return the bearer token."""
+    if not XANO_EMAIL or not XANO_PASSWORD:
+        print("⚠️  XANO_EMAIL / XANO_PASSWORD not set — investor search will be unavailable")
+        return ""
+    try:
+        resp = requests.post(
+            f"{XANO_BASE_URL}/api:vnXelut6/auth/login",
+            json={"email": XANO_EMAIL, "password": XANO_PASSWORD},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        token = resp.json().get("authToken", "")
+        if token:
+            print("🔑 Xano auth token obtained successfully")
+        else:
+            print("⚠️  Xano login succeeded but no authToken in response")
+        return token
+    except Exception as e:
+        print(f"⚠️  Xano login failed: {e}")
+        return ""
+
+def _get_xano_token(force_refresh: bool = False) -> str:
+    """Return cached token, refreshing if missing or forced."""
+    global _xano_token
+    if not _xano_token or force_refresh:
+        _xano_token = _xano_login()
+    return _xano_token
+
+# Attempt login at import time so the token is ready before the first request
+_xano_token = _xano_login()
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ============================================================
 # 🔹 FastAPI setup (placed early so routes can use `app`)
@@ -151,6 +293,14 @@ def check_company_by_url(website_url: str) -> Optional[dict]:
         resp = requests.get(endpoint, params={"website_url": website_url}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+        
+        # Handle list response (API returns [{"id":..., "name":..., "url":...}])
+        if isinstance(data, list):
+            if len(data) > 0 and isinstance(data[0], dict):
+                return data[0]
+            return None
+        
+        # Handle dict response (legacy/fallback)
         if data is None or data == {} or (isinstance(data, dict) and data.get("id") is None):
             return None
         return data
@@ -185,10 +335,89 @@ def get_corporate_events_by_company_id(company_id: int) -> List[dict]:
         return []
 
 
+def _normalize_company_linkedin_url(url: str) -> str:
+    """Normalize LinkedIn company/school URLs for stable comparisons."""
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+
+    try:
+        parsed = urllib.parse.urlparse(candidate)
+        path = (parsed.path or "").strip("/")
+        match = re.match(r"^(company|school)/([A-Za-z0-9_-]+)$", path, re.I)
+        if not match:
+            return ""
+        entity_type, slug = match.groups()
+        return f"https://www.linkedin.com/{entity_type.lower()}/{slug.lower()}/"
+    except Exception:
+        return ""
+
+
+def _extract_company_linkedin_from_xano_payload(db_company: Optional[dict]) -> str:
+    """Read the canonical LinkedIn URL from the Xano company payload if present."""
+    if not isinstance(db_company, dict):
+        return ""
+
+    company_info = db_company.get("Company", db_company)
+    if not isinstance(company_info, dict):
+        return ""
+
+    linkedin_block = company_info.get("linkedin_data") or {}
+    if not isinstance(linkedin_block, dict):
+        return ""
+
+    return _normalize_company_linkedin_url(linkedin_block.get("LinkedIn_URL", ""))
+
+
+def _is_press_section_url(url: str) -> bool:
+    """
+    Returns True only if the URL looks like a news/press *section* page
+    (e.g. /news, /newsroom, /press-releases) — NOT an individual article.
+
+    Rejects:
+    - URLs whose last path segment is too long (likely an article slug)
+    - URLs deeper than 4 path levels (likely an article under a dated folder)
+    - URLs whose path contains no known press/news keyword at all
+    """
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.rstrip("/").lower()
+        segments = [s for s in path.split("/") if s]
+
+        # Known section-level keywords
+        SECTION_KEYWORDS = {
+            "news", "press", "newsroom", "press-releases", "press-room",
+            "media", "media-center", "media-room", "announcements",
+            "updates", "in-the-news", "coverage", "articles",
+            "blog", "insights", "resources", "category",
+        }
+
+        # Reject if path has no press/news keyword anywhere
+        if not any(kw in path for kw in SECTION_KEYWORDS):
+            return False
+
+        # Reject if too many path levels (article under dated folder)
+        if len(segments) > 4:
+            return False
+
+        # Reject if last segment looks like an article slug (very long or contains year-month)
+        last = segments[-1] if segments else ""
+        if len(last) > 60:
+            return False
+        if re.search(r'\d{4}[-/]\d{2}', last):  # e.g. 2024-01 in slug
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
 def search_press_page(url_or_domain: str, company_name: str = "") -> str:
     """
-    Find a press/news page by searching for {domain} + news/press and picking the first
-    result on the same domain containing news/press/media.
+    Find a press/news *section* page for a company.
+    Returns empty string if only article-level pages are found.
     """
     try:
         parsed = urllib.parse.urlparse(url_or_domain)
@@ -199,35 +428,213 @@ def search_press_page(url_or_domain: str, company_name: str = "") -> str:
         base_domain = domain.lower()
 
         queries = [
+            f"{base_domain} newsroom",
+            f"{base_domain} press releases",
             f"{base_domain} news",
-            f"{base_domain} press",
-            f"{base_domain} article",
         ]
         if company_name:
-            queries.append(f"{company_name} news")
-            queries.append(f"{company_name} press")
-            queries.append(f"{company_name} article")
+            queries.append(f'"{company_name}" press releases site:{base_domain}')
+            queries.append(f'"{company_name}" newsroom site:{base_domain}')
 
-        for q in queries:
+        _headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+
+        def _fetch_press_query(q: str):
             encoded = urllib.parse.quote_plus(q)
             search_url = f"https://www.startpage.com/sp/search?query={encoded}"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            }
-            resp = requests.get(search_url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                continue
+            try:
+                resp = requests.get(search_url, headers=_headers, timeout=12)
+                if resp.status_code != 200:
+                    return None
+                links = re.findall(r'href="(https?://[^"]+)"', resp.text, re.I)
+                for link in links:
+                    if base_domain in link.lower() and _is_press_section_url(link):
+                        return link
+            except Exception:
+                pass
+            return None
 
-            links = re.findall(r'href="(https?://[^"]+)"', resp.text, re.I)
-            for link in links:
-                link_lower = link.lower()
-                if base_domain in link_lower and any(k in link_lower for k in ["news", "press", "media", "press-release", "article"]):
-                    return link
+        with ThreadPoolExecutor(max_workers=len(queries)) as _press_ex:
+            futures = {_press_ex.submit(_fetch_press_query, q): q for q in queries}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result:
+                    print(f"[PressPage] Found section page: {result}")
+                    return result
+
+        print(f"[PressPage] No valid press section page found for {base_domain}")
         return ""
     except Exception as e:
         print(f"[PressPage] search error: {e}")
         return ""
 
+
+# ============================================================
+# 🔹 Lightweight web corroboration helpers (Startpage)
+# ============================================================
+def _url_domain(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).netloc or "").lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _startpage_search_urls(query: str, max_urls: int = 8) -> List[str]:
+    """
+    Very lightweight HTML scraping of Startpage results.
+    Returns a de-duplicated list of candidate URLs.
+    """
+    try:
+        encoded = urllib.parse.quote_plus((query or "").strip())
+        if not encoded:
+            return []
+        search_url = f"https://www.startpage.com/sp/search?query={encoded}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        resp = requests.get(search_url, headers=headers, timeout=12)
+        if resp.status_code != 200 or not resp.text:
+            return []
+
+        # Startpage pages contain many links; filter out obvious non-result domains
+        raw_links = re.findall(r'href="(https?://[^"]+)"', resp.text, re.I)
+        out: List[str] = []
+        seen = set()
+        for link in raw_links:
+            if not link or not link.startswith("http"):
+                continue
+            d = _url_domain(link)
+            if not d:
+                continue
+            if any(bad in d for bad in ["startpage.com", "addthis.com", "doubleclick.net", "google.com", "bing.com"]):
+                continue
+            # Avoid common trackers / redirects
+            if "startpage.com" in link.lower():
+                continue
+            if link in seen:
+                continue
+            seen.add(link)
+            out.append(link)
+            if len(out) >= max_urls:
+                break
+        return out
+    except Exception as e:
+        print(f"[Startpage] search error: {e}")
+        return []
+
+
+def extract_publish_date_from_html(html: str) -> str:
+    """
+    Best-effort extraction of an article publish date (YYYY-MM-DD) from HTML metadata/JSON-LD.
+    """
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # JSON-LD datePublished is most common
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except Exception:
+                continue
+            candidates = []
+            if isinstance(data, dict):
+                candidates.append(data)
+            elif isinstance(data, list):
+                candidates.extend([x for x in data if isinstance(x, dict)])
+            for obj in candidates:
+                for key in ["datePublished", "dateCreated", "dateModified", "date"]:
+                    val = obj.get(key)
+                    if isinstance(val, str):
+                        dt = parse_date_flexible(val)
+                        if dt:
+                            return dt.strftime("%Y-%m-%d")
+
+        # Meta tags
+        meta = (
+            soup.find("meta", property="article:published_time")
+            or soup.find("meta", attrs={"name": "date"})
+            or soup.find("meta", attrs={"name": "pubdate"})
+            or soup.find("meta", attrs={"name": "publishdate"})
+            or soup.find("meta", property="og:updated_time")
+        )
+        if meta and meta.get("content"):
+            dt = parse_date_flexible(meta["content"])
+            if dt:
+                return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+    return ""
+
+
+def fetch_text_brief(url: str, max_chars: int = 3500) -> Dict[str, str]:
+    """
+    Fetch a URL and return a compact, prompt-friendly dict:
+    { url, domain, publish_date, title, text }
+    """
+    try:
+        html = fetch_html(url, force_scrapfly=True)
+        if not html:
+            return {"url": url, "domain": _url_domain(url), "publish_date": "", "title": "", "text": ""}
+        soup = BeautifulSoup(html, "html.parser")
+        title = ""
+        if soup.title and soup.title.get_text(strip=True):
+            title = soup.title.get_text(" ", strip=True)[:200]
+        publish_date = extract_publish_date_from_html(html)
+        text = soup.get_text(" ", strip=True)
+        text = (text or "")[:max_chars]
+        return {
+            "url": url,
+            "domain": _url_domain(url),
+            "publish_date": publish_date,
+            "title": title,
+            "text": text,
+        }
+    except Exception as e:
+        print(f"[fetch_text_brief] error for {url}: {e}")
+        return {"url": url, "domain": _url_domain(url), "publish_date": "", "title": "", "text": ""}
+
+
+def get_corroborating_sources(
+    *,
+    title: str,
+    company: str,
+    source_url: str,
+    max_sources: int = 3,
+) -> List[Dict[str, str]]:
+    """
+    Search for corroborating sources and return brief extracted texts.
+    """
+    base_domain = _url_domain(source_url)
+    q = " ".join([p for p in [company, title, "deal", "closed"] if p]).strip()
+    urls = _startpage_search_urls(q, max_urls=12)
+
+    # Filter & de-dup
+    out: List[Dict[str, str]] = []
+    seen_domains = set([base_domain]) if base_domain else set()
+    seen_urls = set([source_url]) if source_url else set()
+    for u in urls:
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        d = _url_domain(u)
+        if not d:
+            continue
+        # Avoid pulling the same domain repeatedly (paywalls/tracking); still allow one
+        if d in seen_domains:
+            continue
+        # Skip obvious low-signal domains
+        if any(x in d for x in ["facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com", "reddit.com", "tiktok.com"]):
+            continue
+        seen_domains.add(d)
+        brief = fetch_text_brief(u)
+        if brief.get("text"):
+            out.append(brief)
+        if len(out) >= max_sources:
+            break
+    return out
 
 # ============================================================
 # 🔹 Text helpers
@@ -255,123 +662,357 @@ def strip_marketing_phrases(text: str) -> str:
 
 
 # ============================================================
-# 🔹 Utilities for lightweight page parsing
+# 🔹 Utilities for lightweight page parsing (IMPROVED)
 # ============================================================
 DATE_PATTERNS = [
-    "%B %d, %Y",   # June 20, 2024
-    "%b %d, %Y",   # Jun 20, 2024
-    "%Y-%m-%d",    # 2024-06-20
-    "%d/%m/%Y",    # 20/06/2024
-    "%d.%m.%Y",    # 20.06.2024
+    "%Y-%m-%d",           # 2024-06-20
+    "%B %d, %Y",         # June 20, 2024
+    "%b %d, %Y",         # Jun 20, 2024
+    "%d %B %Y",          # 20 June 2024
+    "%d %b %Y",          # 20 Jun 2024
+    "%m/%d/%Y",          # 06/20/2024
+    "%d/%m/%Y",          # 20/06/2024
+    "%Y/%m/%d",          # 2024/06/20
+    "%d.%m.%Y",          # 20.06.2024
+    "%B %Y",             # June 2024
+    "%b %Y",             # Jun 2024
+    "%Y",                # 2024
+]
+
+# Date context keywords
+ANNOUNCEMENT_KEYWORDS = [
+    "announced", "announcement", "announcing", "announces",
+    "press release", "disclosed", "disclosure", "revealed",
+    "unveiled", "introduced", "launched", "published",
+    "dated", "dated on", "as of",
+    # Avoid bare "on" — it matches almost any sentence and picks founding/historical dates.
+]
+
+# Snippet context that usually refers to company history, not deal announcement
+DATE_HISTORICAL_NOISE = [
+    "founded in", "founded on", "established in", "established on",
+    "since 19", "since 20", "originally founded", "originally established",
+]
+DEAL_CONTEXT_HINTS = (
+    "acquisition", "acquire", "acquired", "merger", "investment",
+    "funding", "series ", "round", "deal", "transaction", "announced",
+    "press release", "closing", "completed acquisition", "takeover",
+)
+
+CLOSED_KEYWORDS = [
+    "closed", "completed", "finalized", "finalised",
+    "consummated", "signed", "executed", "completed on",
+    "closed on", "finalized on", "signed on"
 ]
 
 
+def parse_date_flexible(date_str: str) -> Optional[datetime]:
+    """Parse date string using multiple formats."""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    
+    date_str = date_str.strip()
+    
+    # Remove common prefixes/suffixes
+    date_str = re.sub(r'^(on|as of|dated|dated on)\s+', '', date_str, flags=re.IGNORECASE)
+    date_str = date_str.split('T')[0]  # Remove time if present
+    
+    for fmt in DATE_PATTERNS:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except:
+            continue
+    
+    return None
+
+
 def extract_first_date(text: str) -> str:
+    """
+    Legacy function for backward compatibility.
+    Returns first date found (announcement_date if available).
+    """
+    dates = extract_dates_with_context(text)
+    return dates.get("announcement_date", "")
+
+
+def extract_dates_with_context(text: str) -> Dict[str, str]:
+    """
+    Extract dates with context awareness - looks for announcement_date and closed_date
+    based on surrounding keywords.
+    
+    Returns: {"announcement_date": "YYYY-MM-DD", "closed_date": "YYYY-MM-DD"}
+    """
+    result = {"announcement_date": "", "closed_date": ""}
+    
     if not text:
-        return ""
-    # Try ISO-like first
-    iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-    if iso_match:
-        return iso_match.group(1)
+        return result
+    
+    # Normalize text for better matching
+    text_lower = text.lower()
+    
+    # Find all potential dates with their positions
+    date_candidates = []
+    
+    # Pattern 1: ISO dates (YYYY-MM-DD)
+    for match in re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', text):
+        date_str = match.group(1)
+        dt = parse_date_flexible(date_str)
+        if dt:
+            date_candidates.append({
+                "date": dt,
+                "pos": match.start(),
+                "text": date_str,
+                "context": text[max(0, match.start()-100):match.end()+100].lower()
+            })
+    
+    # Pattern 2: Month DD, YYYY
+    for match in re.finditer(r'\b([A-Z][a-z]+ \d{1,2}, \d{4})\b', text):
+        date_str = match.group(1)
+        dt = parse_date_flexible(date_str)
+        if dt:
+            date_candidates.append({
+                "date": dt,
+                "pos": match.start(),
+                "text": date_str,
+                "context": text[max(0, match.start()-100):match.end()+100].lower()
+            })
+    
+    # Pattern 3: DD/MM/YYYY or DD.MM.YYYY
+    for match in re.finditer(r'\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b', text):
+        date_str = match.group(1)
+        dt = parse_date_flexible(date_str)
+        if dt:
+            date_candidates.append({
+                "date": dt,
+                "pos": match.start(),
+                "text": date_str,
+                "context": text[max(0, match.start()-100):match.end()+100].lower()
+            })
+    
+    # Pattern 4: DD Month YYYY
+    for match in re.finditer(r'\b(\d{1,2} [A-Z][a-z]+ \d{4})\b', text):
+        date_str = match.group(1)
+        dt = parse_date_flexible(date_str)
+        if dt:
+            date_candidates.append({
+                "date": dt,
+                "pos": match.start(),
+                "text": date_str,
+                "context": text[max(0, match.start()-100):match.end()+100].lower()
+            })
+    
+    # Sort by position (earlier in text often = headline; historical filler can precede)
+    date_candidates.sort(key=lambda x: x["pos"])
 
-    # Try "Month DD, YYYY"
-    month_match = re.search(r"\b([A-Z][a-z]+ \d{1,2}, \d{4})\b", text)
-    if month_match:
-        raw = month_match.group(1)
-        for pattern in DATE_PATTERNS:
-            try:
-                dt = datetime.strptime(raw, pattern)
-                return dt.strftime("%Y-%m-%d")
-            except Exception:
-                continue
+    def _context_is_historical_noise(ctx: str) -> bool:
+        cl = (ctx or "").lower()
+        if not any(noise in cl for noise in DATE_HISTORICAL_NOISE):
+            return False
+        return not any(h in cl for h in DEAL_CONTEXT_HINTS)
 
-    # Try DD/MM/YYYY or DD.MM.YYYY
-    slash_match = re.search(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b", text)
-    if slash_match:
-        raw = slash_match.group(1)
-        for pattern in DATE_PATTERNS:
-            try:
-                dt = datetime.strptime(raw, pattern)
-                return dt.strftime("%Y-%m-%d")
-            except Exception:
-                continue
-
-    return ""
+    # Classify dates based on context
+    for candidate in date_candidates:
+        if _context_is_historical_noise(candidate["context"]):
+            continue
+        context = candidate["context"]
+        date_str = candidate["date"].strftime("%Y-%m-%d")
+        
+        # Check for announcement keywords
+        if not result["announcement_date"]:
+            for keyword in ANNOUNCEMENT_KEYWORDS:
+                if keyword in context:
+                    result["announcement_date"] = date_str
+                    break
+        
+        # Check for closed/completed keywords
+        if not result["closed_date"]:
+            for keyword in CLOSED_KEYWORDS:
+                if keyword in context:
+                    result["closed_date"] = date_str
+                    break
+    
+    # If we found dates but didn't classify them, prefer first non-historical-noise candidate
+    if not result["announcement_date"] and date_candidates:
+        usable = [c for c in date_candidates if not _context_is_historical_noise(c["context"])]
+        pool = usable if usable else date_candidates
+        result["announcement_date"] = pool[0]["date"].strftime("%Y-%m-%d")
+    
+    # If we found a second date and no closed_date, use it as closed_date
+    if not result["closed_date"] and len(date_candidates) > 1:
+        # Prefer second usable candidate when first was announcement
+        usable = [c for c in date_candidates if not _context_is_historical_noise(c["context"])]
+        pool = usable if usable else date_candidates
+        if len(pool) > 1:
+            result["closed_date"] = pool[1]["date"].strftime("%Y-%m-%d")
+    
+    return result
 
 
 def extract_investment_fields(text: str) -> Dict[str, Any]:
     """
-    Heuristics to extract investment amount (millions), currency, and funding stage from text.
+    Improved heuristics to extract investment amount (millions), currency, and funding stage from text.
     """
+    result = {}
+    
     if not text:
-        return {}
-
-    amount_m = None
-    currency = None
-    funding_stage = None
-
-    # Common funding stages
+        return result
+    
+    text_lower = text.lower()
+    
+    # Funding stages (improved patterns)
     stage_patterns = [
-        (r"\bseed\b", "Seed"),
+        (r"\bseed\s+round\b", "Seed"),
         (r"\bpre-?seed\b", "Pre-Seed"),
         (r"\bseries\s*a\b", "Series A"),
         (r"\bseries\s*b\b", "Series B"),
         (r"\bseries\s*c\b", "Series C"),
         (r"\bseries\s*d\b", "Series D"),
-        (r"\bgrowth\b", "Growth"),
+        (r"\bseries\s*e\b", "Series E"),
+        (r"\bgrowth\s+round\b", "Growth"),
         (r"\blate\s*stage\b", "Late Stage"),
+        (r"\bangel\s+round\b", "Angel"),
+        (r"\bventure\s+round\b", "Venture"),
     ]
-    lower = text.lower()
+    
     for pat, label in stage_patterns:
-        if re.search(pat, lower):
-            funding_stage = label
+        if re.search(pat, text_lower):
+            result["funding_stage"] = label
             break
-
-    # Currency and amount
-    # Matches examples: $200 million, €50m, GBP 25 million, 25 million USD, $25.5m
-    amount_regex = re.compile(
+    
+    # Amount and currency - improved regex patterns
+    amount_patterns = [
+        # $200 million, $200M, $200m
+        r"(?P<currency>\$|USD)\s*(?P<amt>\d+(?:[.,]\d+)?)\s*(?P<scale>million|m|mm|billion|bn|b)",
+        # €50 million, €50M
+        r"(?P<currency>€|EUR|EUR|euro)\s*(?P<amt>\d+(?:[.,]\d+)?)\s*(?P<scale>million|m|mm|billion|bn|b)",
+        # £25 million, GBP 25 million
+        r"(?P<currency>£|GBP|pound)\s*(?P<amt>\d+(?:[.,]\d+)?)\s*(?P<scale>million|m|mm|billion|bn|b)",
+        # 200 million USD, 200M USD
+        r"(?P<amt>\d+(?:[.,]\d+)?)\s*(?P<scale>million|m|mm|billion|bn|b)\s*(?P<currency>USD|EUR|GBP|CHF|CAD|AUD)",
+        # Original pattern for backward compatibility
         r"(?P<currency>USD|EUR|GBP|CHF|CAD|AUD|SEK|NOK|DKK|INR|JPY|CNY|HKD|\$|€|£)\s?(?P<amt>\d+(?:[.,]\d+)?)(?:\s?(?P<scale>billion|bn|million|m|mm))",
-        re.IGNORECASE,
-    )
-    for match in amount_regex.finditer(text):
-        cur = match.group("currency")
-        amt = match.group("amt").replace(",", "")
-        scale = match.group("scale") or ""
-        try:
-            amt_val = float(amt)
-            scale_lower = scale.lower()
-            if scale_lower in ("billion", "bn"):
-                amt_val *= 1000.0
-            amount_m = amt_val
-            currency = cur
+    ]
+    
+    for pattern in amount_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            try:
+                currency = match.group("currency").upper()
+                amt_str = match.group("amt").replace(",", "")  # Keep decimal point
+                scale = (match.group("scale") or "").lower()
+                
+                # Normalize currency symbols
+                currency_map = {"$": "USD", "€": "EUR", "£": "GBP", "EUR": "EUR", "EURO": "EUR"}
+                currency = currency_map.get(currency, currency)
+                
+                amt_val = float(amt_str)
+                
+                # Convert to millions
+                if scale in ("billion", "bn", "b"):
+                    amt_val *= 1000.0
+                
+                result["investment_amount_m"] = amt_val
+                result["investment_currency"] = currency
+                break
+            except Exception:
+                continue
+        
+        if "investment_amount_m" in result:
             break
-        except Exception:
-            continue
-
-    # Normalize currency symbols
-    symbol_map = {"$": "USD", "€": "EUR", "£": "GBP"}
-    if currency in symbol_map:
-        currency = symbol_map[currency]
-
-    result = {}
-    if amount_m is not None:
-        result["investment_amount_m"] = amount_m
-    if currency:
-        result["investment_currency"] = currency
-    if funding_stage:
-        result["funding_stage"] = funding_stage
+    
     return result
 
 
-def fetch_html(url: str) -> Optional[str]:
+def extract_structured_data(html: str, url: str) -> Dict[str, Any]:
     """
-    Fetch HTML via direct GET with proper headers.
+    Extract structured data from HTML (JSON-LD, meta tags) for dates and other metadata.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    result = {}
+    
+    # Try JSON-LD
+    json_ld = soup.find_all("script", type="application/ld+json")
+    for script in json_ld:
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                # Look for datePublished, dateCreated, etc.
+                for key in ["datePublished", "dateCreated", "dateModified", "date"]:
+                    if key in data:
+                        date_str = data[key]
+                        dt = parse_date_flexible(date_str)
+                        if dt and not result.get("announcement_date"):
+                            result["announcement_date"] = dt.strftime("%Y-%m-%d")
+        except:
+            pass
+    
+    # Try meta tags
+    meta_date = soup.find("meta", property="article:published_time") or \
+                soup.find("meta", attrs={"name": "date"}) or \
+                soup.find("meta", attrs={"name": "pubdate"}) or \
+                soup.find("meta", attrs={"name": "publishdate"})
+    
+    if meta_date:
+        date_str = meta_date.get("content", "")
+        dt = parse_date_flexible(date_str)
+        if dt:
+            result["announcement_date"] = dt.strftime("%Y-%m-%d")
+    
+    return result
+
+
+def fetch_html(url: str, force_scrapfly: bool = False) -> Optional[str]:
+    """
+    Fetch HTML via Scrapfly (if key available) or direct GET with proper headers.
+    
+    Args:
+        url: URL to fetch
+        force_scrapfly: If True, use Scrapfly even if not normally used
+    
+    Returns:
+        HTML content as string, or None if fetch failed
     """
     if not url:
         print(f"[fetch_html] No URL provided")
         return None
     
-    # Standard browser-like headers to avoid bot blocks
+    # Try Scrapfly first if key is available
+    if SCRAPFLY_KEY and force_scrapfly:
+        try:
+            print(f"[fetch_html] Using Scrapfly: {url[:100]}...")
+            api_url = "https://api.scrapfly.io/scrape"
+            
+            params = {
+                "key": SCRAPFLY_KEY,
+                "url": url,
+                "render": "html",  # Render JavaScript
+                "country": "US",
+            }
+            
+            body = {
+                "url": url,
+                "format": "raw",
+            }
+            
+            response = requests.post(
+                api_url,
+                params=params,
+                json=body,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get("result", {})
+                html = result.get("content", "")
+                if html:
+                    print(f"[fetch_html] Scrapfly: Got {len(html)} chars")
+                    return html
+            else:
+                print(f"[fetch_html] Scrapfly error: {response.status_code}, falling back to direct GET")
+        except Exception as e:
+            print(f"[fetch_html] Scrapfly error: {e}, falling back to direct GET")
+    
+    # Fallback: Direct GET with proper headers
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -381,9 +1022,8 @@ def fetch_html(url: str) -> Optional[str]:
         "Upgrade-Insecure-Requests": "1",
     }
 
-    # Direct GET with proper headers
     try:
-        print(f"[fetch_html] Fetching: {url[:100]}...")
+        print(f"[fetch_html] Fetching directly: {url[:100]}...")
         resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         print(f"[fetch_html] Response: {resp.status_code} ({len(resp.text)} chars)")
         
@@ -424,6 +1064,7 @@ Rules:
 - Amount: millions of base currency (e.g., $200 million => 200).
 - Currency: ISO code (USD, EUR, GBP, CHF, etc.). Map $->USD, €->EUR, £->GBP.
 - If unknown, use "" for strings and null for numbers. Keep keys present.
+- long_description: write a concise, neutral, professional paragraph (no bullet points) describing what happened using only verifiable facts from the provided text. Include absolute dates when available. If terms are undisclosed, state that neutrally.
 
 Announcement URL: {url}
 Page text (truncated):
@@ -530,14 +1171,38 @@ def ai_enrich_single_event(event: Dict[str, Any]) -> Dict[str, Any]:
     if not source_url:
         return {"error": "Missing source_url"}
 
-    html = fetch_html(source_url)
+    html = fetch_html(source_url, force_scrapfly=True)
     if not html:
         return {"error": "Fetch failed"}
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
+    
+    # Extract structured data and dates with context (before LLM)
+    structured = extract_structured_data(html, source_url)
+    dates = extract_dates_with_context(text)
+    
+    # Prepare initial result with improved date extraction
+    initial_result = {}
+    if structured.get("announcement_date"):
+        initial_result["announcement_date"] = structured["announcement_date"]
+    elif dates.get("announcement_date"):
+        initial_result["announcement_date"] = dates["announcement_date"]
+    if dates.get("closed_date"):
+        initial_result["closed_date"] = dates["closed_date"]
+
+    # Multi-source corroboration (best-effort). We pass short excerpts to the model.
+    corroborating = get_corroborating_sources(title=title, company=company, source_url=source_url, max_sources=3)
 
     prompt = f"""
-You are an evidence extractor for a corporate event. Use only the provided page text.
+You are a financial analyst who writes concise, professional, neutral descriptions of recently closed corporate finance events for clients.
+Your purpose is to help clients quickly understand what happened and why, using only verifiable facts.
+Clarity and completeness are the highest priorities.
+
+When sources conflict, briefly identify the discrepancy and use the most supportable figure (or mark as undisclosed if not supportable).
+Always include absolute dates where relevant. Do not use bullet points.
+
+Use ONLY the provided source materials below (do not invent facts). Prefer authoritative sources (company filings/press releases, major business media).
+
 Return STRICT one-line JSON (no code fences) with keys:
 {{
  "title": "",
@@ -568,19 +1233,27 @@ Rules:
 - parties: include target/investor/partner roles if evident.
 - evidence_links: up to 3 URLs found in page (absolute URLs).
 - Use empty strings for unknown strings; null for unknown numbers.
+- long_description: MUST be a single paragraph (no bullet points). 3–6 sentences max. Neutral tone. Include announcement and/or close date if known. Mention strategic rationale only if explicitly stated in sources (e.g., expansion, product, market).
 
 Context:
 - Event title hint: {title}
 - Company: {company}
 - Counterparties: {", ".join(cp_names)}
 - Source URL: {source_url}
+- Deal date hints: announcement_date={initial_result.get("announcement_date","")}, closed_date={initial_result.get("closed_date","")}
 
-Page text (truncated):
+Primary source material (source_url; publish_date={extract_publish_date_from_html(html)}):
 \"\"\"{text[:9000]}\"\"\"
+
+Corroborating sources (may be empty):
+{json.dumps(corroborating, ensure_ascii=False)[:14000]}
 """
 
     raw = openrouter_chat("openai/gpt-4o-mini", prompt, "ai-enrich-event")
     if not raw:
+        # Return initial result even if LLM fails
+        if initial_result:
+            return initial_result
         return {"error": "LLM returned empty"}
 
     try:
@@ -591,11 +1264,24 @@ Page text (truncated):
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict):
             parsed.setdefault("enrichment_version", 1)
+            
+            # Merge with improved date extraction (prefer our dates over LLM dates)
+            if initial_result.get("announcement_date"):
+                parsed["announcement_date"] = initial_result["announcement_date"]
+            if initial_result.get("closed_date"):
+                parsed["closed_date"] = initial_result["closed_date"]
+            
             return parsed
     except Exception as e:
         print(f"[AI enrich] JSON parse error: {e} / raw: {raw[:200]}")
+        # Return initial result even if LLM fails
+        if initial_result:
+            return initial_result
         return {"error": "LLM parse error", "raw": raw[:200]}
 
+    # Return initial result if LLM format is unexpected
+    if initial_result:
+        return initial_result
     return {"error": "Unexpected LLM format"}
 
 
@@ -691,9 +1377,16 @@ async def extract_event_meta(payload: Dict[str, Any]) -> JSONResponse:
                 if h2 and h2.get_text(strip=True):
                     title = h2.get_text(" ", strip=True)
 
-        # Collect text for date search
+        # Extract structured data first (JSON-LD, meta tags)
+        structured = extract_structured_data(html, url)
+        
+        # Collect text for date search with improved context-aware extraction
         body_text = soup.get_text(" ", strip=True)
-        date_iso = extract_first_date(body_text)
+        dates = extract_dates_with_context(body_text)
+        
+        # Use structured data date if available, otherwise use context-extracted date
+        date_iso = structured.get("announcement_date") or dates.get("announcement_date", "")
+        
         inv_fields = extract_investment_fields(body_text)
 
         # Long description: take first meaningful paragraphs
@@ -783,18 +1476,50 @@ async def smart_enrich_event(payload: Dict[str, Any]) -> JSONResponse:
     
     try:
         # =====================================================
-        # Step 1: Fetch and AI-parse the source URL
+        # Step 1: Fetch and parse the source URL (improved parsing)
         # =====================================================
         print(f"   📄 Step 1: Parsing source URL...")
-        html = fetch_html(url)
+        html = fetch_html(url, force_scrapfly=True)
         if html:
             soup = BeautifulSoup(html, "html.parser")
             body_text = soup.get_text(" ", strip=True)[:15000]  # Limit text
             
-            # AI extraction from source
+            # Extract structured data (JSON-LD, meta tags) for dates
+            structured = extract_structured_data(html, url)
+            if structured.get("announcement_date"):
+                result["announcement_date"] = structured["announcement_date"]
+                print(f"   ✅ Found date in structured data: {result['announcement_date']}")
+            
+            # Extract dates with context awareness
+            dates = extract_dates_with_context(body_text)
+            if dates.get("announcement_date") and not result.get("announcement_date"):
+                result["announcement_date"] = dates["announcement_date"]
+                print(f"   ✅ Found announcement date via context: {result['announcement_date']}")
+            if dates.get("closed_date"):
+                result["closed_date"] = dates["closed_date"]
+                print(f"   ✅ Found closed date via context: {result['closed_date']}")
+            
+            # Extract investment fields
+            inv_fields = extract_investment_fields(body_text)
+            if inv_fields:
+                result.update(inv_fields)
+                print(f"   ✅ Extracted investment fields: {inv_fields}")
+            
+            # AI extraction from source (for other fields)
             ai_data = ai_extract_event_from_text(body_text, url)
             if ai_data and not ai_data.get("error"):
-                result = {**ai_data}
+                # Merge AI data, but prefer our improved date extraction
+                for key in ["title", "deal_type", "deal_status", "long_description", 
+                           "investment_amount_m", "investment_currency", "funding_stage",
+                           "counterparties"]:
+                    if ai_data.get(key) and not result.get(key):
+                        result[key] = ai_data[key]
+                # Only use AI date if we didn't find one via improved parsing
+                if ai_data.get("announcement_date") and not result.get("announcement_date"):
+                    result["announcement_date"] = ai_data["announcement_date"]
+                if ai_data.get("closed_date") and not result.get("closed_date"):
+                    result["closed_date"] = ai_data["closed_date"]
+                
                 print(f"   ✅ AI extracted from source: title={bool(result.get('title'))}, date={bool(result.get('announcement_date'))}, amount={bool(result.get('investment_amount_m'))}")
         else:
             print(f"   ⚠️ Could not fetch source URL")
@@ -869,6 +1594,85 @@ async def smart_enrich_event(payload: Dict[str, Any]) -> JSONResponse:
 # ============================================================
 # 🔹 Routes
 # ============================================================
+
+@app.get("/investors_search", response_class=JSONResponse)
+async def investors_search(q: str = "", page: int = 1, per_page: int = 25):
+    """
+    Proxy for the Xano investors list endpoint.
+    Handles Xano auth transparently — credentials stay on the server.
+    """
+    xano_url = f"{XANO_BASE_URL}/api:y4OAXSVm/investors_with_d_a_list"
+    params = {"page": page, "per_page": per_page, "Search_Query": q.lower()}
+
+    def _call(token: str):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        return requests.get(xano_url, params=params, headers=headers, timeout=10)
+
+    token = _get_xano_token()
+    try:
+        resp = _call(token)
+        if resp.status_code == 401:
+            # Token may have expired — refresh once and retry
+            token = _get_xano_token(force_refresh=True)
+            resp = _call(token)
+        resp.raise_for_status()
+        return JSONResponse(resp.json())
+    except Exception as e:
+        print(f"[investors_search] error: {e}")
+        return JSONResponse({"items": [], "error": str(e)}, status_code=502)
+
+
+@app.post("/investors_create", response_class=JSONResponse)
+async def investors_create(request: Request):
+    """
+    Proxy for creating a new investor record in Xano.
+    Accepts JSON: { company_name, website_url, investor_type, city, country, linkedin_url, primary_business_focus_id }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    name    = (body.get("company_name") or "").strip()
+    website = (body.get("website_url") or "").strip()
+    if not name or not website:
+        return JSONResponse({"error": "company_name and website_url are required"}, status_code=422)
+
+    pbf_raw = body.get("primary_business_focus_id", 74)
+    try:
+        primary_business_focus_id = int(pbf_raw)
+    except (TypeError, ValueError):
+        primary_business_focus_id = 74
+    if primary_business_focus_id <= 0:
+        primary_business_focus_id = 74
+
+    xano_url = f"{XANO_BASE_URL}/api:y4OAXSVm/investors_new_company"
+    payload = {
+        "company_name": name,
+        "website_url":  website,
+        "investor_type": body.get("investor_type", ""),
+        "city":          body.get("city", ""),
+        "country":       body.get("country", ""),
+        "linkedin_url":  body.get("linkedin_url", ""),
+        "primary_business_focus_id": primary_business_focus_id,
+    }
+
+    def _call(token: str):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        return requests.post(xano_url, json=payload, headers=headers, timeout=10)
+
+    try:
+        token = _get_xano_token()
+        resp = _call(token)
+        if resp.status_code == 401:
+            token = _get_xano_token(force_refresh=True)
+            resp = _call(token)
+        resp.raise_for_status()
+        return JSONResponse(resp.json())
+    except Exception as e:
+        print(f"[investors_create] error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=502)
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
@@ -986,67 +1790,171 @@ async def search_company_headquarters_api(payload: Dict[str, Any]) -> JSONRespon
         return JSONResponse({"error": str(e), "city": "", "state": "", "country": ""}, status_code=500)
 
 
+@app.post("/api/search_company_linkedin", response_class=JSONResponse)
+async def search_company_linkedin_api(payload: Dict[str, Any]) -> JSONResponse:
+    """
+    Recover the current LinkedIn company URL using stable company identifiers.
+    Body: { "company": "Acme Corp", "website": "https://acme.com", "old_linkedin_url": "https://..." }
+    Returns: { "linkedin_url": "https://...", "source": "xano|serpapi|startpage|not_found", ... }
+    """
+    company = (payload or {}).get("company", "").strip()
+    website = (payload or {}).get("website", "").strip()
+    old_linkedin_url = (payload or {}).get("old_linkedin_url", "").strip()
+    normalized_old_linkedin = _normalize_company_linkedin_url(old_linkedin_url)
+
+    if not company and not website:
+        return JSONResponse(
+            {
+                "error": "Missing 'company' or 'website' field",
+                "linkedin_url": None,
+                "source": "not_found",
+                "matched_by": "",
+                "query_used": "",
+                "queries_used": [],
+                "changed": False,
+                "old_linkedin_url": old_linkedin_url or None,
+            },
+            status_code=400,
+        )
+
+    try:
+        if website:
+            existing_company = check_company_by_url(website)
+            if existing_company and existing_company.get("id"):
+                db_company = get_company_by_id(existing_company["id"])
+                xano_linkedin = _extract_company_linkedin_from_xano_payload(db_company)
+                if xano_linkedin:
+                    return JSONResponse(
+                        {
+                            "linkedin_url": xano_linkedin,
+                            "source": "xano",
+                            "matched_by": "website_domain",
+                            "query_used": website,
+                            "queries_used": [website],
+                            "changed": bool(normalized_old_linkedin and normalized_old_linkedin != xano_linkedin),
+                            "old_linkedin_url": old_linkedin_url or None,
+                            "company": company,
+                            "website": website,
+                        }
+                    )
+
+        from searxng_analyzer import search_company_linkedin_detailed
+
+        result = search_company_linkedin_detailed(company, website)
+        linkedin_url = _normalize_company_linkedin_url(result.get("linkedin_url", ""))
+        source = result.get("source", "not_found") if linkedin_url else "not_found"
+        query_used = result.get("query_used", "")
+        queries_used = result.get("queries_used", []) or []
+        matched_by = result.get("matched_by", "")
+
+        return JSONResponse(
+            {
+                "linkedin_url": linkedin_url or None,
+                "source": source,
+                "matched_by": matched_by if linkedin_url else "",
+                "query_used": query_used if linkedin_url else "",
+                "queries_used": queries_used,
+                "changed": bool(linkedin_url and normalized_old_linkedin and normalized_old_linkedin != linkedin_url),
+                "old_linkedin_url": old_linkedin_url or None,
+                "company": company,
+                "website": website,
+            }
+        )
+
+    except ImportError as e:
+        print(f"❌ search_company_linkedin_detailed not available: {e}")
+        return JSONResponse(
+            {
+                "error": "Function not available",
+                "linkedin_url": None,
+                "source": "not_found",
+                "matched_by": "",
+                "query_used": "",
+                "queries_used": [],
+                "changed": False,
+                "old_linkedin_url": old_linkedin_url or None,
+            },
+            status_code=500,
+        )
+    except Exception as e:
+        print(f"❌ Error searching company LinkedIn: {e}")
+        return JSONResponse(
+            {
+                "error": str(e),
+                "linkedin_url": None,
+                "source": "not_found",
+                "matched_by": "",
+                "query_used": "",
+                "queries_used": [],
+                "changed": False,
+                "old_linkedin_url": old_linkedin_url or None,
+            },
+            status_code=500,
+        )
+
+
 @app.post("/api/search_individual_linkedin", response_class=JSONResponse)
 async def search_individual_linkedin(payload: Dict[str, Any]) -> JSONResponse:
     """
-    Search for an individual's LinkedIn profile.
+    Search for an individual's LinkedIn profile AND extract location from SEO snippets.
     Body: { "name": "John Smith", "company": "Acme Corp", "position": "CFO" }
-    Returns: { "linkedin_url": "https://linkedin.com/in/johnsmith" } or { "linkedin_url": null }
+    Returns: { "linkedin_url": "https://linkedin.com/in/johnsmith", "location": {"city": "", "state": "", "country": ""} }
     """
     name = (payload or {}).get("name", "").strip()
     company = (payload or {}).get("company", "").strip()
     position = (payload or {}).get("position", "").strip()
     
     if not name:
-        return JSONResponse({"error": "Missing 'name' field", "linkedin_url": None}, status_code=400)
+        return JSONResponse({"error": "Missing 'name' field", "linkedin_url": None, "location": {}}, status_code=400)
     
     try:
-        # Build search query: "{name} {company} linkedin"
         search_query = " ".join([p for p in [name, position, company, "linkedin"] if p]).strip()
-        print(f"🔍 Searching individual LinkedIn: {search_query}")
+        print(f"🔍 Searching individual LinkedIn+Location: {search_query}")
         
-        # Use searxng_analyzer if available
-        from searxng_analyzer import search_person_linkedin
-        linkedin_url = search_person_linkedin(name, company, position)
+        # Use the combined search function that extracts location from SEO snippets
+        from searxng_analyzer import search_person_linkedin_with_location
+        result = search_person_linkedin_with_location(name, company, position)
+        
+        linkedin_url = result.get("linkedin_url", "")
+        location = result.get("location", {"city": "", "state": "", "country": ""})
         
         if linkedin_url:
-            print(f"✅ Found LinkedIn for {name}: {linkedin_url}")
-            return JSONResponse({"linkedin_url": linkedin_url, "query": search_query})
+            # Normalize location via AI if we got something
+            if location and (location.get("city") or location.get("state") or location.get("country")):
+                location = _normalize_location_with_ai(name, company, position, linkedin_url, location)
+            print(f"✅ Found LinkedIn for {name}: {linkedin_url}, location: {location}")
+            return JSONResponse({"linkedin_url": linkedin_url, "location": location, "query": search_query})
         else:
             print(f"⚠️ No LinkedIn found for: {name}")
-            return JSONResponse({"linkedin_url": None, "query": search_query})
+            return JSONResponse({"linkedin_url": None, "location": {}, "query": search_query})
             
-    except ImportError:
-        print("⚠️ searxng_analyzer.search_person_linkedin not available, trying fallback")
-        # Fallback: try using the general search function
+    except ImportError as ie:
+        print(f"⚠️ search_person_linkedin_with_location not available: {ie}, trying fallback")
+        # Fallback: try using the old function
         try:
-            from searxng_analyzer import searxng_search
-            search_query = " ".join([p for p in [name, position, company, "linkedin"] if p]).strip()
-            results = searxng_search(search_query, num_results=5)
+            from searxng_analyzer import search_person_linkedin
+            linkedin_url = search_person_linkedin(name, company, position)
             
-            # Find first LinkedIn profile URL
-            for result in results:
-                url = result.get("url", "")
-                if "linkedin.com/in/" in url:
-                    print(f"✅ Found LinkedIn (fallback): {url}")
-                    return JSONResponse({"linkedin_url": url, "query": search_query})
+            if linkedin_url:
+                print(f"✅ Found LinkedIn (fallback): {linkedin_url}")
+                return JSONResponse({"linkedin_url": linkedin_url, "location": {}, "query": search_query})
             
             print(f"⚠️ No LinkedIn found (fallback) for: {name}")
-            return JSONResponse({"linkedin_url": None, "query": search_query})
+            return JSONResponse({"linkedin_url": None, "location": {}, "query": search_query})
             
         except Exception as e:
             print(f"❌ Fallback search failed: {e}")
-            return JSONResponse({"error": str(e), "linkedin_url": None}, status_code=500)
+            return JSONResponse({"error": str(e), "linkedin_url": None, "location": {}}, status_code=500)
     
     except Exception as e:
         print(f"❌ Error searching individual LinkedIn: {e}")
-        return JSONResponse({"error": str(e), "linkedin_url": None}, status_code=500)
+        return JSONResponse({"error": str(e), "linkedin_url": None, "location": {}}, status_code=500)
 
 
 @app.post("/api/search_individual_location", response_class=JSONResponse)
 async def search_individual_location(payload: Dict[str, Any]) -> JSONResponse:
     """
-    Search for an individual's likely location (city/state/country) using our search engine.
+    Search for an individual's likely location (city/state/country) using AI analysis of search results.
     Body: { "name": "Mary Meeker", "company": "Kleiner Perkins", "position": "Partner", "linkedin_url": "https://..." }
     Returns: { "city": "...", "state": "...", "country": "..." }
     """
@@ -1059,15 +1967,33 @@ async def search_individual_location(payload: Dict[str, Any]) -> JSONResponse:
         return JSONResponse({"error": "Missing 'name' field", "city": "", "state": "", "country": ""}, status_code=400)
 
     try:
-        from searxng_analyzer import search_person_location
-        result = search_person_location(name, company, linkedin_url, position=position) or {"city": "", "state": "", "country": ""}
-        # Always normalize via AI so abbreviations (e.g., "CA") become full state names.
-        if result and (result.get("city") or result.get("state") or result.get("country")):
-            result = _normalize_location_with_ai(name, company, position, linkedin_url, result)
+        # NEW: Use AI to analyze raw SerpAPI results instead of regex patterns
+        from searxng_analyzer import get_raw_serpapi_results_for_person_location
+        
+        # Get raw search results
+        search_data = get_raw_serpapi_results_for_person_location(name, company, position)
+        organic_results = search_data.get("organic_results", [])
+        query_used = search_data.get("query", "")
+        
+        if organic_results:
+            # Use AI to analyze the search results and extract location
+            print(f"🔍 Searching location for {name} (query: {query_used})")
+            result = _extract_location_from_serpapi_with_ai(name, company, position, organic_results)
+        else:
+            # Fallback to old regex-based method if no SerpAPI results
+            print(f"⚠️ No SerpAPI results, falling back to regex method for {name}")
+            from searxng_analyzer import search_person_location
+            result = search_person_location(name, company, linkedin_url, position=position) or {"city": "", "state": "", "country": ""}
+            # Normalize via AI
+            if result and (result.get("city") or result.get("state") or result.get("country")):
+                result = _normalize_location_with_ai(name, company, position, linkedin_url, result)
+        
         print(f"📍 Individual location result for {name}: {result}")
         return JSONResponse(result)
     except Exception as e:
         print(f"❌ Error searching individual location: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse({"error": str(e), "city": "", "state": "", "country": ""}, status_code=500)
 
 
@@ -1101,8 +2027,11 @@ async def refresh_db(payload: Dict[str, Any]) -> JSONResponse:
 
     if existing_company and existing_company.get("id"):
         cid = existing_company["id"]
-        db_company = get_company_by_id(cid)
-        db_events = get_corporate_events_by_company_id(cid)
+        with ThreadPoolExecutor(max_workers=2) as _xano_ex:
+            _f_company = _xano_ex.submit(get_company_by_id, cid)
+            _f_events  = _xano_ex.submit(get_corporate_events_by_company_id, cid)
+            db_company = _f_company.result()
+            db_events  = _f_events.result()
 
     # 2) DB overview (extract from db_company)
     db_overview = None
@@ -1119,6 +2048,27 @@ async def refresh_db(payload: Dict[str, Any]) -> JSONResponse:
             linkedin = linkedin_block.get("LinkedIn_URL", "")
             website = company_info.get("url", "")
             desc = company_info.get("description", "")
+
+            def parse_maybe_json(value):
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except Exception:
+                        return value
+                return value
+
+            former_name = (
+                company_info.get("former_name")
+                or company_info.get("former_names")
+                or company_info.get("Former_Name")
+                or ""
+            )
+            investors = company_info.get("investors") or company_info.get("investor_names") or ""
+            investors_new_company = company_info.get("investors_new_company") or []
+            investment = parse_maybe_json(company_info.get("investment")) or {}
+            revenues = parse_maybe_json(company_info.get("revenues")) or {}
+            ev_data = parse_maybe_json(company_info.get("ev_data")) or {}
+            EBITDA = parse_maybe_json(company_info.get("EBITDA") or company_info.get("ebitda")) or {}
 
             # Year founded - check _years.Year first (proper structure), fallback to year_founded
             years_block = company_info.get("_years") or {}
@@ -1204,6 +2154,13 @@ async def refresh_db(payload: Dict[str, Any]) -> JSONResponse:
                 "linkedin": linkedin,
                 "description": desc,
                 "year_founded": year_founded,
+                "former_name": former_name,
+                "investors": investors,
+                "investors_new_company": investors_new_company,
+                "investment": investment,
+                "revenues": revenues,
+                "ev_data": ev_data,
+                "EBITDA": EBITDA,
                 "primary_business_focus": primary_business_focus,
                 "primary_business_focus_id": primary_business_focus_id,
                 "sectors": sectors,
@@ -1304,9 +2261,38 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
       "matched_events": [...]
     }
     """
-    query = (payload or {}).get("query", "").strip()
+    payload = payload or {}
+    query = payload.get("query", "").strip()
     if not query:
         return JSONResponse({"error": "Missing 'query' field"}, status_code=400)
+
+    raw_options = payload.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raw_options = {}
+    include_overview = bool(raw_options.get("include_overview", True))
+    include_events = bool(raw_options.get("include_events", True))
+    include_individuals = bool(raw_options.get("include_individuals", True))
+    include_counterparties = include_events and bool(raw_options.get("include_counterparties", True))
+
+    def strip_counterparties_from_events(events: List[dict]) -> List[dict]:
+        """Remove counterparty/advisor payloads when the user only wants event facts."""
+        cleaned = []
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                cleaned.append(ev)
+                continue
+            item = dict(ev)
+            for key in (
+                "counterparties",
+                "ai_counterparties",
+                "other_counterparties",
+                "target_company",
+                "advisors",
+                "investors",
+            ):
+                item.pop(key, None)
+            cleaned.append(item)
+        return cleaned
 
     # 1) Pre-check in Xano
     existing_company = check_company_by_url(query)
@@ -1316,7 +2302,8 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
     if existing_company and existing_company.get("id"):
         cid = existing_company["id"]
         db_company = get_company_by_id(cid)
-        db_events = get_corporate_events_by_company_id(cid)
+        if include_events:
+            db_events = get_corporate_events_by_company_id(cid)
 
     # 2) AI company overview (summary + description)
     # Extract company name from URL if needed
@@ -1351,14 +2338,36 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         """Generate company overview (summary + description)"""
         try:
             wiki_text = get_wikipedia_summary(query)
-            summary_md = generate_summary(query, text=wiki_text)
+
+            # Pre-fetch Yahoo Finance data so generate_summary can inject it into
+            # the LLM prompt context without making a second lookup.
+            # query may be a full URL; extract the bare company name so that
+            # lookup_ticker gets sensible SerpAPI queries (e.g. "equifax", not
+            # "https://www.equifax.com/").
+            _yf_name = query
+            if query.startswith(("http://", "https://")):
+                import urllib.parse as _urlparse
+                _domain = _urlparse.urlparse(query).netloc.replace("www.", "")
+                _yf_name = _domain.split(".")[0]  # "equifax" from "equifax.com"
+            yahoo_data = enrich_with_yahoo_finance(_yf_name, input_website or "")
+            if yahoo_data:
+                print(
+                    f"[Yahoo] EV=${yahoo_data.get('enterprise_value_m')}M, "
+                    f"Rev=${yahoo_data.get('revenue_m')}M, "
+                    f"EBITDA=${yahoo_data.get('ebitda_m')}M"
+                )
+            else:
+                print("[Yahoo] No data returned (private company or ticker not found)")
+
+            summary_md = generate_summary(query, text=wiki_text, yahoo_data=yahoo_data)
             description_raw = generate_description(query, text=wiki_text, company_details=summary_md)
             description = strip_marketing_phrases(description_raw)
             return {"summary_md": summary_md, "description": description, "wiki_text": wiki_text}
         except Exception as e:
             print(f"[AI] Overview task error: {e}")
+            traceback.print_exc()
             return {"summary_md": "", "description": "", "wiki_text": ""}
-    
+
     def task_events():
         """Generate corporate events"""
         try:
@@ -1366,7 +2375,7 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         except Exception as e:
             print(f"[AI] Events task error: {e}")
             return []
-    
+
     def task_management():
         """Get top management"""
         try:
@@ -1377,32 +2386,50 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         except Exception as e:
             print(f"[AI] Management task error: {e}")
             return []
-    
-    # Run all AI tasks in parallel
+
+    # Run all AI tasks in parallel (overview first so ownership task can use description)
     overview_result = {"summary_md": "", "description": "", "wiki_text": ""}
     ai_events = []
     top_management = []
-    
+    ownership_result = {"ownership": "", "confidence": "Low", "reasoning": ""}
+
     with ThreadPoolExecutor(max_workers=3) as executor:
-        future_overview = executor.submit(task_overview)
-        future_events = executor.submit(task_events)
-        future_mgmt = executor.submit(task_management)
-        
-        # Collect results as they complete
-        for future in as_completed([future_overview, future_events, future_mgmt]):
+        futures = {}
+        if include_overview:
+            futures[executor.submit(task_overview)] = "overview"
+        if include_events:
+            futures[executor.submit(task_events)] = "events"
+        if include_individuals:
+            futures[executor.submit(task_management)] = "management"
+
+        # Collect overview first so we can launch ownership detection on the description
+        future_ownership = None
+        for future in as_completed(list(futures.keys())):
+            task_name = futures.get(future)
             try:
-                if future == future_overview:
+                if task_name == "overview":
                     overview_result = future.result()
                     print(f"[AI] ✅ Overview completed")
-                elif future == future_events:
+                    # Launch ownership detection now that we have the description
+                    desc_for_ownership = overview_result.get("description", "")
+                    future_ownership = executor.submit(detect_ownership_from_description, desc_for_ownership)
+                elif task_name == "events":
                     ai_events = future.result()
                     print(f"[AI] ✅ Events completed ({len(ai_events)} found)")
-                elif future == future_mgmt:
+                elif task_name == "management":
                     top_management = future.result()
                     print(f"[AI] ✅ Management completed ({len(top_management)} found)")
             except Exception as e:
                 print(f"[AI] Parallel task error: {e}")
-    
+
+        # Collect ownership result (submitted after overview finished)
+        if future_ownership:
+            try:
+                ownership_result = future_ownership.result(timeout=30)
+                print(f"[AI] ✅ Ownership detected: {ownership_result.get('ownership')} (confidence: {ownership_result.get('confidence')})")
+            except Exception as e:
+                print(f"[AI] Ownership detection error: {e}")
+
     print(f"[AI] All parallel tasks completed")
     
     # Extract results from parallel execution
@@ -1410,6 +2437,8 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
     description = overview_result.get("description", "")
     
     try:
+        if not include_overview:
+            raise RuntimeError("overview skipped by profile options")
         
         print(f"[AI] Summary generated:\n{summary_md[:500]}...")
 
@@ -1423,6 +2452,33 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
         year_founded = ""
         ceo = ""
         ownership = ""
+        former_name = ""
+        investors = ""
+        investors_new_company: List[int] = []
+        investment = {
+            "last_investment_amount": "",
+            "last_investment_currency": "",
+            "last_investment_date": "",
+            "last_investment_source": "",
+        }
+        revenues = {
+            "revenues_m": "",
+            "rev_source": "",
+            "revenues_currency": "",
+            "years_id": "",
+        }
+        ev_data = {
+            "ev_value": "",
+            "ev_currency": "",
+            "ev_year": "",
+            "ev_source": "",
+        }
+        EBITDA = {
+            "EBITDA_m": "",
+            "EBITDA_source": "",
+            "EBITDA_currency": "",
+            "EBITDA_year": "",
+        }
         ai_sectors: List[Dict[str, Any]] = []
         primary_business_focus = ""
         primary_business_focus_id = 0
@@ -1594,35 +2650,60 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             "cooperative", "partnership"
         }
         
+        def strip_citations(val: str) -> str:
+            """Remove Perplexity/Sonar citation markers like [1], [2][3] from a value."""
+            if not isinstance(val, str):
+                return val
+            cleaned = re.sub(r'\[\d+\]', '', val)
+            return cleaned.strip()
+
         def is_valid_value(val: str) -> bool:
-            """Check if value is valid (not empty or placeholder)"""
+            """Check if value is valid (not empty or placeholder)."""
             if not val:
                 return False
-            low = val.lower().strip()
-            invalid = ["not found", "unknown", "n/a", "none", "<value>", ""]
+            low = strip_citations(val).lower().strip()
+            invalid = {"not found", "unknown", "n/a", "none", "<value>", "", "-"}
             return low not in invalid and not low.startswith("<")
-        
+
         def extract_url(text: str) -> str:
-            """Extract URL from text, handling markdown links"""
-            import re
+            """Extract URL from text, stripping citations and handling markdown links."""
+            text = strip_citations(text)
             # Handle markdown links like [text](url)
             md_match = re.search(r'\[.*?\]\((https?://[^\)]+)\)', text)
             if md_match:
                 return md_match.group(1)
-            # Handle plain URLs
-            url_match = re.search(r'(https?://[^\s\)]+)', text)
+            # Handle plain URLs (stop before any citation bracket)
+            url_match = re.search(r'(https?://[^\s\)\[]+)', text)
             if url_match:
-                return url_match.group(1)
+                return url_match.group(1).rstrip('.,;')
             return text.strip()
+
+        def extract_year(text: str) -> str:
+            if not text:
+                return ""
+            match = re.search(r'\b(19|20)\d{2}\b', text)
+            return match.group(0) if match else text.strip()
+
+        def parse_integer_list(text: str) -> List[int]:
+            if not text:
+                return []
+            return [int(x) for x in re.findall(r'\d+', text)]
         
         for line in (summary_md or "").splitlines():
+            # Strip Perplexity citation markers [1][2][3] so they never
+            # end up in parsed values or field-matching strings.
+            line = strip_citations(line)
             low = line.lower().replace("–", "-").replace("—", "-")
-            
+
             if "website:" in low:
                 val = line.split(":", 1)[-1].strip()
                 url = extract_url(val)
                 if is_valid_value(url) and ("http://" in url or "https://" in url):
                     website = url
+            elif "former name:" in low or "former names:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    former_name = val
             elif "linkedin:" in low:
                 val = line.split(":", 1)[-1].strip()
                 url = extract_url(val)
@@ -1632,7 +2713,10 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                 val = line.split(":", 1)[-1].strip()
                 url = extract_url(val)
                 if is_valid_value(url) and ("http://" in url or "https://" in url):
-                    press_page = url
+                    if _is_press_section_url(url):
+                        press_page = url
+                    else:
+                        print(f"[PressPage] Rejected AI-suggested URL (looks like article, not section): {url}")
             elif "headquarters:" in low:
                 hq = line.split(":", 1)[-1].strip()
                 if is_valid_value(hq):
@@ -1724,8 +2808,6 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             elif "year founded:" in low or "- founded:" in low:
                 val = line.split(":", 1)[-1].strip()
                 if is_valid_value(val):
-                    # Extract just the year if there's extra text
-                    import re
                     year_match = re.search(r'(\d{4})', val)
                     if year_match:
                         year_founded = year_match.group(1)
@@ -1733,10 +2815,80 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                 val = line.split(":", 1)[-1].strip()
                 if is_valid_value(val):
                     ceo = val
+            elif "investors:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    investors = val
             elif "company name:" in low:
                 val = line.split(":", 1)[-1].strip()
                 if is_valid_value(val):
                     company_name = val
+            elif "investors new company:" in low or "investor ids:" in low:
+                investors_new_company = parse_integer_list(line.split(":", 1)[-1].strip())
+            elif "last investment amount:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    investment["last_investment_amount"] = val
+            elif "last investment currency:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    investment["last_investment_currency"] = val.upper()
+            elif "last investment date:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    investment["last_investment_date"] = val
+            elif "last investment source:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    investment["last_investment_source"] = extract_url(val)
+            elif "revenues currency:" in low or "revenue currency:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    revenues["revenues_currency"] = val.upper()
+            elif "revenues year:" in low or "revenue year:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    revenues["years_id"] = extract_year(val)
+            elif "revenues source:" in low or "revenue source:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    revenues["rev_source"] = extract_url(val)
+            elif "revenues:" in low or "revenue:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    revenues["revenues_m"] = val
+            elif "enterprise value currency:" in low or "ev currency:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    ev_data["ev_currency"] = val.upper()
+            elif "enterprise value year:" in low or "ev year:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    ev_data["ev_year"] = extract_year(val)
+            elif "enterprise value source:" in low or "ev source:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    ev_data["ev_source"] = extract_url(val)
+            elif "enterprise value:" in low or "ev value:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    ev_data["ev_value"] = val
+            elif "ebitda currency:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    EBITDA["EBITDA_currency"] = val.upper()
+            elif "ebitda year:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    EBITDA["EBITDA_year"] = extract_year(val)
+            elif "ebitda source:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    EBITDA["EBITDA_source"] = extract_url(val)
+            elif "ebitda:" in low:
+                val = line.split(":", 1)[-1].strip()
+                if is_valid_value(val):
+                    EBITDA["EBITDA_m"] = val
 
         # Always try web search to correct press page: prefer domain-based result
         search_input = website or company_name
@@ -1793,6 +2945,14 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                 if state_province:
                     print(f"[AI] 📍 Auto-detected state for {city}: {state_province}")
 
+        # Ownership: use the dedicated LLM-based detector result (runs in parallel above)
+        # It overrides whatever was parsed from summary_md — more accurate and consistent.
+        detected_ownership = ownership_result.get("ownership", "")
+        detected_confidence = ownership_result.get("confidence", "Low")
+        if detected_ownership:
+            ownership = detected_ownership
+            print(f"[AI] 🏷️ Ownership set by detector: {ownership} (confidence: {detected_confidence})")
+
         ai_overview = {
             "name": company_name,
             "city": city,
@@ -1805,15 +2965,24 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             "description": description or "",
             "year_founded": year_founded,
             "ceo": ceo,
+            "former_name": former_name,
+            "investors": investors,
+            "investors_new_company": investors_new_company,
+            "investment": investment,
+            "revenues": revenues,
+            "ev_data": ev_data,
+            "EBITDA": EBITDA,
             "sectors": ai_sectors,
             "primary_business_focus": primary_business_focus,
             "primary_business_focus_id": primary_business_focus_id,
         }
         print(f"[AI] Parsed overview: {ai_overview}")
     except Exception as e:
-        print(f"[AI] overview generation error: {e}")
-        import traceback
-        traceback.print_exc()
+        if include_overview:
+            print(f"[AI] overview generation error: {e}")
+            traceback.print_exc()
+        else:
+            ai_overview = None
 
     # 3) AI events - already fetched in parallel above
 
@@ -1858,22 +3027,28 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
     matched_events: List[dict] = []
     missing_events: List[dict] = []
 
-    if ai_events and db_events:
+    if include_events and ai_events and db_events:
         for ev in ai_events:
             matched = any(events_match(ev, db_ev) for db_ev in db_events)
             if matched:
                 matched_events.append(ev)
             else:
                 missing_events.append(ev)
-    else:
+    elif include_events:
         missing_events = ai_events
+
+    if include_events and not include_counterparties:
+        ai_events = strip_counterparties_from_events(ai_events)
+        db_events = strip_counterparties_from_events(db_events)
+        matched_events = strip_counterparties_from_events(matched_events)
+        missing_events = strip_counterparties_from_events(missing_events)
 
     # 4.5) Top Management - already fetched in parallel above
 
     # 5) DB management roles (key people from Xano)
     # Note: Management roles are at ROOT level of db_company, not inside "Company"
     db_management = []
-    if db_company:
+    if include_individuals and db_company:
         try:
             # Check both root level (correct) and Company level (fallback)
             mgmt_current = (
@@ -1941,7 +3116,7 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
 
     # 6) DB overview (normalize to same structure as AI side)
     db_overview = None
-    if db_company:
+    if include_overview and db_company:
         try:
             company_info = db_company.get("Company", db_company)
             name = company_info.get("name") or query
@@ -1954,6 +3129,26 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             linkedin = linkedin_block.get("LinkedIn_URL", "")
             website = company_info.get("url", "")
             desc = company_info.get("description", "")
+
+            def parse_maybe_json(value):
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except Exception:
+                        return value
+                return value
+
+            former_name = (
+                company_info.get("former_name")
+                or company_info.get("former_names")
+                or company_info.get("Former_Name")
+                or ""
+            )
+            investors_new_company = company_info.get("investors_new_company") or []
+            investment = parse_maybe_json(company_info.get("investment")) or {}
+            revenues = parse_maybe_json(company_info.get("revenues")) or {}
+            ev_data = parse_maybe_json(company_info.get("ev_data")) or {}
+            EBITDA = parse_maybe_json(company_info.get("EBITDA") or company_info.get("ebitda")) or {}
             
             # Year founded - check _years.Year first (proper structure), fallback to year_founded
             years_block = company_info.get("_years") or {}
@@ -2039,6 +3234,12 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
                 "linkedin": linkedin,
                 "description": desc,
                 "year_founded": year_founded,
+                "former_name": former_name,
+                "investors_new_company": investors_new_company,
+                "investment": investment,
+                "revenues": revenues,
+                "ev_data": ev_data,
+                "EBITDA": EBITDA,
                 "primary_business_focus": primary_business_focus,
                 "primary_business_focus_id": primary_business_focus_id,
                 "sectors": sectors,
@@ -2059,6 +3260,12 @@ async def analyze(payload: Dict[str, Any]) -> JSONResponse:
             "matched_events": matched_events,
             "top_management": top_management,
             "db_management": db_management,
+            "options": {
+                "include_overview": include_overview,
+                "include_events": include_events,
+                "include_individuals": include_individuals,
+                "include_counterparties": include_counterparties,
+            },
         }
     )
 
