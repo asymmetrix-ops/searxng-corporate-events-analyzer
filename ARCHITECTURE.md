@@ -348,3 +348,75 @@ The system uses AI to analyze SerpAPI search results for accurate individual loc
 - `refreshXanoData()` is called after all DB save operations to immediately reflect changes in UI.
 - Counterparty individuals are linked to counterparty's `company_id`, not main company's `company_id`.
 
+---
+
+## Plain-English workflows (what happens, roughly how long)
+
+**How to read the percentages**
+
+These are **rough, rounded shares of typical wait time**—not precise benchmarks. Steps that say “in parallel” run at the same time, so **you mainly wait on the slowest lane**, not on every percentage added together. Think of them as “where the clock goes,” not accounting.
+
+---
+
+### 1) Analyze a company (**`POST /analyze`** — main “Run analyze” button)
+
+**Bird’s-eye timeline**
+
+Look up whether this company already lives in **Xano** and pull saved profile/events if yes (~**3%**) → run **three big internet + AI lanes in parallel** (together this is usually **~85–93%** of the total wait) → **compare** AI events vs DB events with simple keyword overlap (~**1–2%**) → **package** everything for the webpage (~**1–5%**).
+
+**What each lane is doing (the “engine” everyone feels waiting on)**
+
+**A — Company profile (overview)**
+
+Open **Wikipedia or backup web snippets**, pull **market-style numbers when the firm is listed** (~**small slice** inside this lane). Probe the company site for press/news hubs and add a burst of **search results about investors and financials**. Then one **AI pass** fills a structured “company card” markdown; another **AI pass** turns that into a clean six-line narrative. Optionally a short **ownership** check runs once that text exists. *Net: gather facts from many places → let AI unify them.*
+
+**B — Corporate events**
+
+Decide roughly if the entity looks more **startup** or **enterprise**, then fire **many searches at once** (funding vs M&A style queries). Dedupe hits, build one long research brief from titles and snippets. One **large AI pass** extracts a table of deals (investments, acquisitions, partnerships, etc.). *Net: saturate search → read the pile once with AI.*
+
+**C — Leaders / key people**
+
+Pull **leadership-oriented search snippets**, add wiki context when useful. One **AI pass** proposes names, titles, blurbs; then **per person**, quick **LinkedIn-style lookups** tighten identity. *Net: search + compose list + verify links.*
+
+**Important nuance**
+
+Automatic **batch HTML fetch + AI for every news link** (`enrich_ai_events_with_llm`) is implemented in code but **is not wired into this route by default**; doing deep per-article scraping is normally a **separate** “enrich one event” action below.
+
+---
+
+### 2) Refresh database only (**`/refresh_db`**)
+
+Re-fetch saved company data from **Xano** and rebuild the panels (~**mostly all of the wait** → think **70–95%** Xano/network, **minimal** AI). Useful when you saved changes and want the UI in sync **without** re-running searches.
+
+---
+
+### 3) Find a **person’s location** (**📍** — **`/api/search_individual_location`**)
+
+Run a **targeted web search for that person’s name + role + company** (~**35–45%**) → **first AI step** reads the result list and chooses a *personal* city/region—not the company HQ (~**35–45%**) → **second AI step** normalizes “Greater X Area” / abbreviations into a standard “City, State, Country” style (~**15–25%**) → send back fields for the form. *Net: search → interpret → tidy.*
+
+---
+
+### 4) Find a **LinkedIn profile** (**`/api/search_individual_linkedin`**)
+
+Targeted **search** (~**40–50%**) → **read** result snippets (and light parsing / small AI assists) to propose a profile URL and any location hint (~**50–60%**). *Net: shortest “identity assist” workflow.*
+
+---
+
+### 5) **Enrich one event** from its source (**`POST /enrich_event`** / smart enrich — buttons on cards)
+
+Pick the announcement URL (**~1%**) → download the page (direct **HTTP** or **Scrapfly** when configured) (**~25–35%**) → strip boilerplate, maybe pull extra corroborating links (**varies**) → **AI** extracts dates, amounts, parties, wording (**~35–55%**) → merge into the card you see (**rest**). *Net: grab article → squeeze structured facts.*
+
+---
+
+### 6) **Parse from source** (heuristic only — faster path)
+
+**Fetch** the URL (same rough idea as enrich) (**~35–45%**) → **rules and patterns** pull dates/money/stage (**~50–65%**)—this path is skewed toward **speed over depth** rather than heavy AI. *Net: lighter pass for editors who prefer quick fills.*
+
+---
+
+### 7) **Browser-side** cross-checks (instant from a UI perspective)
+
+**Fuzzy matching** people between leadership and counterparty sections, **sharing** bios/locations once matched—these happen in the browser and are negligible compared with server workflows above.
+
+---
+
