@@ -2084,7 +2084,7 @@
         xanoStatusContainer.style.display = "none";
       }
 
-      // Deal / status options (mirrors Streamlit version)
+      // Deal / status options — must match Xano enum exactly (17 values)
       const DEAL_TYPES = [
         "",
         "Acquisition",
@@ -2098,13 +2098,37 @@
         "Dual track",
         "Closing",
         "Grant",
-        "Accelerator",
         "Debt financing",
         "Bankruptcy",
         "Reorganisation",
         "Employee tender offer",
         "Rebrand",
         "Partnership",
+      ];
+
+      // EV source type — 3 values matching Xano enum
+      const EV_SOURCE_TYPES = [
+        "",
+        "Estimate",
+        "Proprietary Intelligence",
+        "Public",
+      ];
+
+      // EV band — 12 ranges matching Xano enum
+      const EV_BANDS = [
+        "",
+        "$0-5m",
+        "$6-10m",
+        "$11-25m",
+        "$26-50m",
+        "$51-100m",
+        "$101-250m",
+        "$251-500m",
+        "$501-1,000m",
+        "$1,001-2,500m",
+        "$2,501-5,000m",
+        "$5,001-10,000m",
+        "$10,001-20,000m",
       ];
 
       /** Deal types that use the Investment / Funding source field (matches UI dual-source logic) */
@@ -4214,6 +4238,8 @@
 
             // Map counterparties to expected shape (other_counterparties bucket)
             const mappedCps = (Array.isArray(cps) ? cps : []).map((cp) => ({
+              counterparty_id: cp.id || cp.counterparty_id || 0,
+              counterparty_type_id: cp.counterparty_type_id || 0,
               name: cp.company_name || "",
               counterparty_status: cp.type || "",
               url: cp.website || "",
@@ -4221,8 +4247,8 @@
               website: cp.website || "",
               counterparty_announcement_url: cp.announcement_url || "",
               linkedin_url: cp.linkedin_url || "",
-              individuals: (cp.individuals || []).map((ind) => ({
-                name: ind.name || "",
+              individuals: (cp.individuals || []).filter(Boolean).filter(ind => ind.name || ind.Individual_text).map((ind) => ({
+                name: ind.name || ind.Individual_text || "",
                 job_title: (ind.job_titles && ind.job_titles[0]) || "",
                 title: (ind.job_titles && ind.job_titles[0]) || "",
                 linkedin_url: ind.linkedin_url || "",
@@ -4248,6 +4274,19 @@
                 dealTerms.source_url ||
                 dealTerms.transaction_source_url ||
                 "",
+              deal_terms: dealTerms.deal_terms || "",
+              // ev_data passthrough for new CE fields
+              ev_data: {
+                enterprise_value_m: evData.enterprise_value_m || "",
+                ev_source: evData.ev_source || "",
+                EV_source_type: evData.EV_source_type || "",
+                ev_band: evData.ev_band || "",
+                currency_id: evData.currency_id || 0,
+              },
+              True_EV_and_Revs_or_EBITDA_disclosed:
+                ev.True_EV_and_Revs_or_EBITDA_disclosed === true ||
+                ev.True_EV_and_Revs_or_EBITDA_disclosed === "true" ||
+                ev.True_EV_and_Revs_or_EBITDA_disclosed === 1,
               other_counterparties: mappedCps,
               ready_to_publish: ev.ready_to_publish === true || ev.ready_to_publish === "true" || ev.ready_to_publish === 1,
             };
@@ -4308,14 +4347,16 @@
             const nameText = stripNotionSuffix(cp.counterparty_name || cp.company_name || cp.name || "Unknown");
 
             const mapped = {
+              counterparty_id: cp.id || cp.counterparty_id || 0,
+              counterparty_type_id: cp.counterparty_type_id || 0,
               name: nameText,
               counterparty_status: roleText,
-              url: "", // not provided by this endpoint (we have company_id instead)
-              company_url: "",
-              website: "",
+              url: cp.company_url || "",
+              company_url: cp.company_url || "",
+              website: cp.company_url || "",
               counterparty_announcement_url: cp.counterparty_announcement_url || "",
-              linkedin_url: "",
-              individuals: cp.counterparty_individuals || [],
+              linkedin_url: cp.linkedin_url || "",
+              individuals: (cp.counterparty_individuals || []).filter(v => v && (v.name || v.Individual_text)),
             };
 
             // Put Target into target_company for nicer rendering
@@ -4325,12 +4366,17 @@
                 url: "",
                 counterparty_announcement_url: cp.counterparty_announcement_url || "",
                 linkedin_url: "",
-                individuals: cp.counterparty_individuals || [],
+                individuals: (cp.counterparty_individuals || []).filter(v => v && (v.name || v.Individual_text)),
               };
             } else {
               otherCps.push(mapped);
             }
           });
+
+          const evDataObj =
+            eventObj.ev_data && typeof eventObj.ev_data === "object"
+              ? eventObj.ev_data
+              : (() => { try { return JSON.parse(eventObj.ev_data || "{}") || {}; } catch { return {}; } })();
 
           return {
             id: eventObj.id || id,
@@ -4350,6 +4396,19 @@
               dealTerms.source_url ||
               dealTerms.transaction_source_url ||
               "",
+            deal_terms: dealTerms.deal_terms || "",
+            // ev_data (new fields)
+            ev_data: {
+              enterprise_value_m: evDataObj.enterprise_value_m || "",
+              ev_source: evDataObj.ev_source || "",
+              EV_source_type: evDataObj.EV_source_type || "",
+              ev_band: evDataObj.ev_band || "",
+              currency_id: evDataObj.currency_id || 0,
+            },
+            True_EV_and_Revs_or_EBITDA_disclosed:
+              eventObj.True_EV_and_Revs_or_EBITDA_disclosed === true ||
+              eventObj.True_EV_and_Revs_or_EBITDA_disclosed === "true" ||
+              eventObj.True_EV_and_Revs_or_EBITDA_disclosed === 1,
             source_url: eventObj.source_url || "",
             // Counterparties
             target_company: targetCompany,
@@ -10465,7 +10524,251 @@
         form.appendChild(createField("Website URL", `new_cp_${eventIdx}_website`, "https://..."));
         form.appendChild(createField("LinkedIn URL", `new_cp_${eventIdx}_linkedin`, "https://linkedin.com/company/..."));
         form.appendChild(createField("Press Release URL", `new_cp_${eventIdx}_press`, "https://..."));
-        
+
+        // ── Individuals section ──────────────────────────────────────────────
+        const indSectionTitle = document.createElement("div");
+        indSectionTitle.textContent = "👤 Individuals / Executives (optional)";
+        indSectionTitle.style.fontSize = "11px";
+        indSectionTitle.style.fontWeight = "600";
+        indSectionTitle.style.color = "#a5b4fc";
+        indSectionTitle.style.marginTop = "14px";
+        indSectionTitle.style.marginBottom = "8px";
+        indSectionTitle.style.borderTop = "1px solid rgba(99,102,241,0.2)";
+        indSectionTitle.style.paddingTop = "10px";
+        form.appendChild(indSectionTitle);
+
+        // Pending individuals list (each item: { dbId, name, title, linkedin })
+        const pendingIndividuals = [];
+        const pendingListEl = document.createElement("div");
+        pendingListEl.style.marginBottom = "8px";
+
+        const renderPendingList = () => {
+          pendingListEl.innerHTML = "";
+          if (!pendingIndividuals.length) return;
+          pendingIndividuals.forEach((ind, i) => {
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;align-items:flex-start;gap:6px;margin-bottom:5px;padding:6px 10px;background:rgba(16,185,129,0.08);border-radius:6px;border:1px solid rgba(16,185,129,0.2);font-size:11px;";
+            const dbBadge = ind.dbId ? `<span style="color:#6ee7b7;font-size:10px;">[ID:${ind.dbId}]</span>` : `<span style="color:#fbbf24;font-size:10px;">[new]</span>`;
+            const statusBadge = (!ind.dbId && ind.status) ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);">${ind.status}</span>` : "";
+            const locationBadge = (!ind.dbId && ind.location_text) ? `<span style="font-size:9px;color:#9ca3af;">📍${ind.location_text}</span>` : "";
+            const bioPreview = (!ind.dbId && ind.bio) ? `<div style="font-size:9px;color:#6b7280;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px;" title="${ind.bio.replace(/"/g,'&quot;')}">📝 ${ind.bio}</div>` : "";
+            const infoDiv = document.createElement("div");
+            infoDiv.style.flex = "1";
+            infoDiv.innerHTML = `<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">${dbBadge} <strong style="color:#e5e7eb;">${ind.name}</strong>${ind.title ? `<span style="color:#9ca3af;"> — ${ind.title}</span>` : ""}${statusBadge}${locationBadge}${ind.linkedin ? ` <a href="${ind.linkedin}" target="_blank" class="source-link" style="font-size:10px;">LinkedIn</a>` : ""}</div>${bioPreview}`;
+            row.appendChild(infoDiv);
+            const removeBtn = document.createElement("button");
+            removeBtn.textContent = "✕";
+            removeBtn.title = "Remove";
+            removeBtn.style.cssText = "padding:1px 6px;font-size:10px;border-radius:4px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#fca5a5;cursor:pointer;flex-shrink:0;";
+            removeBtn.onclick = () => { pendingIndividuals.splice(i, 1); renderPendingList(); };
+            row.appendChild(removeBtn);
+            pendingListEl.appendChild(row);
+          });
+        };
+        form.appendChild(pendingListEl);
+
+        // Search row: name + LinkedIn + Search button
+        const indSearchRow = document.createElement("div");
+        indSearchRow.style.display = "flex";
+        indSearchRow.style.gap = "6px";
+        indSearchRow.style.marginBottom = "6px";
+        indSearchRow.style.flexWrap = "wrap";
+
+        const indNameInput = document.createElement("input");
+        indNameInput.type = "text";
+        indNameInput.placeholder = "Name (e.g. Jane Smith)";
+        indNameInput.style.cssText = "flex:2;min-width:120px;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        indSearchRow.appendChild(indNameInput);
+
+        const indTitleInput = document.createElement("input");
+        indTitleInput.type = "text";
+        indTitleInput.placeholder = "Title / Role (e.g. CEO)";
+        indTitleInput.style.cssText = "flex:2;min-width:100px;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        indSearchRow.appendChild(indTitleInput);
+
+        const indLinkedInInput = document.createElement("input");
+        indLinkedInInput.type = "url";
+        indLinkedInInput.placeholder = "LinkedIn URL (optional)";
+        indLinkedInInput.style.cssText = "flex:3;min-width:130px;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        indSearchRow.appendChild(indLinkedInInput);
+
+        // Search DB button
+        const indSearchBtn = document.createElement("button");
+        indSearchBtn.type = "button";
+        indSearchBtn.textContent = "🔍 Search DB";
+        indSearchBtn.style.cssText = "padding:5px 10px;font-size:10px;font-weight:600;border-radius:6px;border:1px solid rgba(59,130,246,0.4);background:rgba(59,130,246,0.15);color:#93c5fd;cursor:pointer;white-space:nowrap;";
+        indSearchRow.appendChild(indSearchBtn);
+
+        // Add button
+        const indAddBtn = document.createElement("button");
+        indAddBtn.type = "button";
+        indAddBtn.textContent = "➕ Add";
+        indAddBtn.title = "Add this individual to the list (will be created/linked after counterparty is saved)";
+        indAddBtn.style.cssText = "padding:5px 10px;font-size:10px;font-weight:600;border-radius:6px;border:1px solid rgba(16,185,129,0.4);background:rgba(16,185,129,0.15);color:#6ee7b7;cursor:pointer;white-space:nowrap;";
+        indSearchRow.appendChild(indAddBtn);
+
+        form.appendChild(indSearchRow);
+
+        // Search result badge
+        const indStatusEl = document.createElement("div");
+        indStatusEl.style.cssText = "font-size:10px;margin-bottom:6px;display:none;";
+        form.appendChild(indStatusEl);
+
+        // ── Full profile expander ─────────────────────────────────────────────
+        const fullProfileToggle = document.createElement("button");
+        fullProfileToggle.type = "button";
+        fullProfileToggle.textContent = "📋 Full Profile (optional)";
+        fullProfileToggle.title = "Fill in a complete individual profile — shown when creating a brand new person";
+        fullProfileToggle.style.cssText = "font-size:10px;color:#a5b4fc;background:none;border:none;cursor:pointer;padding:2px 0;margin-bottom:6px;text-decoration:underline;text-underline-offset:2px;";
+
+        const fullProfileSection = document.createElement("div");
+        fullProfileSection.style.display = "none";
+        fullProfileSection.style.marginBottom = "8px";
+        fullProfileSection.style.padding = "10px 12px";
+        fullProfileSection.style.background = "rgba(99,102,241,0.06)";
+        fullProfileSection.style.borderRadius = "8px";
+        fullProfileSection.style.border = "1px solid rgba(99,102,241,0.2)";
+
+        fullProfileToggle.onclick = () => {
+          const open = fullProfileSection.style.display !== "none";
+          fullProfileSection.style.display = open ? "none" : "block";
+          fullProfileToggle.textContent = open ? "📋 Full Profile (optional)" : "📋 Full Profile ▲";
+        };
+
+        // Status dropdown
+        const fpStatusRow = document.createElement("div");
+        fpStatusRow.style.cssText = "display:flex;gap:8px;margin-bottom:8px;align-items:center;";
+        const fpStatusLabel = document.createElement("label");
+        fpStatusLabel.style.cssText = "font-size:10px;color:#9ca3af;min-width:80px;";
+        fpStatusLabel.textContent = "Status";
+        const fpStatusSelect = document.createElement("select");
+        fpStatusSelect.style.cssText = "flex:1;padding:4px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        ["Current", "Past"].forEach(v => {
+          const o = document.createElement("option");
+          o.value = v; o.textContent = v;
+          fpStatusSelect.appendChild(o);
+        });
+        fpStatusRow.appendChild(fpStatusLabel);
+        fpStatusRow.appendChild(fpStatusSelect);
+        fullProfileSection.appendChild(fpStatusRow);
+
+        // Bio
+        const fpBioRow = document.createElement("div");
+        fpBioRow.style.cssText = "display:flex;gap:8px;margin-bottom:8px;align-items:flex-start;";
+        const fpBioLabel = document.createElement("label");
+        fpBioLabel.style.cssText = "font-size:10px;color:#9ca3af;min-width:80px;padding-top:4px;";
+        fpBioLabel.textContent = "Bio";
+        const fpBioInput = document.createElement("textarea");
+        fpBioInput.rows = 2;
+        fpBioInput.placeholder = "Short biography or description…";
+        fpBioInput.style.cssText = "flex:1;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;resize:vertical;";
+        fpBioRow.appendChild(fpBioLabel);
+        fpBioRow.appendChild(fpBioInput);
+        fullProfileSection.appendChild(fpBioRow);
+
+        // Location
+        const fpLocRow = document.createElement("div");
+        fpLocRow.style.cssText = "display:flex;gap:8px;margin-bottom:8px;align-items:center;";
+        const fpLocLabel = document.createElement("label");
+        fpLocLabel.style.cssText = "font-size:10px;color:#9ca3af;min-width:80px;";
+        fpLocLabel.textContent = "Location";
+        const fpLocInput = document.createElement("input");
+        fpLocInput.type = "text";
+        fpLocInput.placeholder = "e.g. London, UK";
+        fpLocInput.style.cssText = "flex:1;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        fpLocRow.appendChild(fpLocLabel);
+        fpLocRow.appendChild(fpLocInput);
+        fullProfileSection.appendChild(fpLocRow);
+
+        // Current Employer URL
+        const fpEmpRow = document.createElement("div");
+        fpEmpRow.style.cssText = "display:flex;gap:8px;margin-bottom:4px;align-items:center;";
+        const fpEmpLabel = document.createElement("label");
+        fpEmpLabel.style.cssText = "font-size:10px;color:#9ca3af;min-width:80px;";
+        fpEmpLabel.textContent = "Employer URL";
+        const fpEmpInput = document.createElement("input");
+        fpEmpInput.type = "url";
+        fpEmpInput.placeholder = "https://company.com (current employer)";
+        fpEmpInput.style.cssText = "flex:1;padding:5px 8px;border-radius:6px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:11px;";
+        fpEmpRow.appendChild(fpEmpLabel);
+        fpEmpRow.appendChild(fpEmpInput);
+        fullProfileSection.appendChild(fpEmpRow);
+
+        form.appendChild(fullProfileToggle);
+        form.appendChild(fullProfileSection);
+
+        // State for current individual search result
+        let foundIndividualId = 0;
+
+        indSearchBtn.onclick = async () => {
+          const nm = indNameInput.value.trim();
+          const li = indLinkedInInput.value.trim();
+          if (!nm && !li) { log("⚠️ Enter a name or LinkedIn URL to search", "warn"); return; }
+          indSearchBtn.disabled = true;
+          indSearchBtn.textContent = "⏳";
+          foundIndividualId = 0;
+          try {
+            const row = await window.lookupIndividualInDb(li, nm);
+            if (row && row.id) {
+              foundIndividualId = row.id;
+              const rName = row.name || row.Individual_text || nm;
+              indStatusEl.style.display = "block";
+              indStatusEl.innerHTML = `<span style="background:rgba(16,185,129,0.15);color:#6ee7b7;border:1px solid rgba(16,185,129,0.3);padding:2px 8px;border-radius:4px;">✅ Found in DB: <strong>${rName}</strong> (ID: ${row.id}) — will be linked, full profile fields ignored</span>`;
+              if (rName && !indNameInput.value.trim()) indNameInput.value = rName;
+            } else {
+              foundIndividualId = 0;
+              indStatusEl.style.display = "block";
+              indStatusEl.innerHTML = `<span style="background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);padding:2px 8px;border-radius:4px;">📝 Not in DB — will be created as new individual (use Full Profile for extra details)</span>`;
+            }
+          } catch (e) {
+            log(`❌ Individual search error: ${e.message}`, "err");
+          } finally {
+            indSearchBtn.disabled = false;
+            indSearchBtn.textContent = "🔍 Search DB";
+          }
+        };
+
+        // Clear result when user edits inputs
+        [indNameInput, indLinkedInInput].forEach(el => el.addEventListener("input", () => {
+          foundIndividualId = 0;
+          indStatusEl.style.display = "none";
+        }));
+
+        indAddBtn.onclick = () => {
+          const nm = indNameInput.value.trim();
+          if (!nm) { log("⚠️ Individual name is required", "warn"); return; }
+          const title = indTitleInput.value.trim();
+          const linkedin = indLinkedInInput.value.trim();
+          // Prevent duplicate by name
+          if (pendingIndividuals.some(p => p.name.toLowerCase() === nm.toLowerCase())) {
+            log(`⚠️ "${nm}" already in list`, "warn");
+            return;
+          }
+          // Collect full profile fields (only relevant for new individuals — dbId === 0)
+          const status = fpStatusSelect.value || "Current";
+          const bio = fpBioInput.value.trim();
+          const location_text = fpLocInput.value.trim();
+          const current_employer_url = fpEmpInput.value.trim();
+          pendingIndividuals.push({ dbId: foundIndividualId, name: nm, title, linkedin, status, bio, location_text, current_employer_url });
+          renderPendingList();
+          // Reset basic fields
+          indNameInput.value = "";
+          indTitleInput.value = "";
+          indLinkedInInput.value = "";
+          // Reset full profile fields
+          fpStatusSelect.value = "Current";
+          fpBioInput.value = "";
+          fpLocInput.value = "";
+          fpEmpInput.value = "";
+          // Collapse full profile section
+          fullProfileSection.style.display = "none";
+          fullProfileToggle.textContent = "📋 Full Profile (optional)";
+          foundIndividualId = 0;
+          indStatusEl.style.display = "none";
+          log(`✅ Added "${nm}" to individuals list`, "ok");
+        };
+
+        // ── Submit button ────────────────────────────────────────────────────
         const btnRow = document.createElement("div");
         btnRow.style.display = "flex";
         btnRow.style.gap = "8px";
@@ -10530,9 +10833,43 @@
           const result = await createCounterpartyInDb(eventId, name, typeId, submitBtn, press, website, companyIdToUse);
           
           if (result && (result.id || result.counterparty_id)) {
+            const newCpId = result.id || result.counterparty_id;
             submitBtn.innerHTML = "✅ Created!";
-            log(`✅ Counterparty created: ID ${result.id || result.counterparty_id}${companyIdToUse ? ` (linked to company ${companyIdToUse})` : ''}`, "ok");
-            
+            log(`✅ Counterparty created: ID ${newCpId}${companyIdToUse ? ` (linked to company ${companyIdToUse})` : ''}`, "ok");
+
+            // ── Link / create individuals ──────────────────────────────────
+            if (pendingIndividuals.length) {
+              submitBtn.innerHTML = "⏳ Linking individuals...";
+              const cpCompanyId = companyIdToUse || 0;
+              for (const ind of pendingIndividuals) {
+                try {
+                  let indDbId = ind.dbId;
+                  if (!indDbId) {
+                    // Create new individual — pass full profile fields if provided
+                    const dummyBtn = document.createElement("button");
+                    const created = await addIndividualToDb(ind.name, ind.title, ind.linkedin, dummyBtn, {
+                      job_title: ind.title,
+                      counterparty_id: newCpId,
+                      company_id: cpCompanyId,
+                      status: ind.status || "Current",
+                      bio: ind.bio || "",
+                      location_text: ind.location_text || "",
+                      current_employer_url: ind.current_employer_url || "",
+                    });
+                    indDbId = created?.id ? parseInt(created.id, 10) : 0;
+                    if (indDbId) log(`✅ Created individual "${ind.name}" (ID: ${indDbId})`, "ok");
+                  }
+                  if (indDbId && newCpId) {
+                    const dummyBtn2 = document.createElement("button");
+                    await window.assignIndividualToCounterparty(newCpId, indDbId, dummyBtn2, true);
+                    log(`🔗 Assigned "${ind.name}" to counterparty ${newCpId}`, "ok");
+                  }
+                } catch (e) {
+                  log(`⚠️ Failed to link individual "${ind.name}": ${e.message}`, "warn");
+                }
+              }
+            }
+
             // Refresh to show the new counterparty
             await refreshXanoData();
             
@@ -10941,6 +11278,9 @@
             ev.investment_currency ||
             ev.currency ||
             ev["Investment Currency"] ||
+            (typeof ev.investment_data === "object" && ev.investment_data
+              ? ev.investment_data.investment_currency_code || ""
+              : "") ||
             "";
           const invStage =
             ev.funding_stage ||
@@ -10967,7 +11307,30 @@
                 ""
               : "") ||
             "";
-          
+          const dealTermsText =
+            (typeof dealTermsRaw === "object" ? dealTermsRaw.deal_terms || "" : "") ||
+            ev.deal_terms || "";
+
+          const evDataRaw =
+            typeof ev.ev_data === "object" && ev.ev_data
+              ? ev.ev_data
+              : parseMaybeJsonValue(ev.ev_data) || {};
+          const evEnterpriseValueM =
+            (typeof evDataRaw === "object" ? evDataRaw.enterprise_value_m || "" : "");
+          const evSourceUrl =
+            (typeof evDataRaw === "object" ? evDataRaw.ev_source || "" : "");
+          const evSourceType =
+            (typeof evDataRaw === "object" ? evDataRaw.EV_source_type || "" : "");
+          const evBand =
+            (typeof evDataRaw === "object" ? evDataRaw.ev_band || "" : "");
+          const evCurrencyId =
+            (typeof evDataRaw === "object" ? evDataRaw.currency_id || "" : "");
+
+          const trueEvDisclosed =
+            ev.True_EV_and_Revs_or_EBITDA_disclosed === true ||
+            ev.True_EV_and_Revs_or_EBITDA_disclosed === "true" ||
+            ev.True_EV_and_Revs_or_EBITDA_disclosed === 1;
+
           // Ready to Publish status (from DB)
           const readyToPublish = ev.ready_to_publish || ev.readyToPublish || false;
 
@@ -11041,7 +11404,11 @@
               if (updateKey === "investment_data_source") {
                 updates = { investment_data: { investment_amount_source: value } };
               } else if (updateKey === "deal_terms_data_source") {
-                updates = { deal_terms_data: { source_url: value } };
+                updates = { deal_terms_data: { deal_terms_source: value } };
+              } else if (updateKey === "deal_terms_text") {
+                updates = { deal_terms_data: { deal_terms: value } };
+              } else if (updateKey === "ev_source_url") {
+                updates = { ev_data: { ev_source: value } };
               } else {
                 updates = { [updateKey]: value };
               }
@@ -11333,6 +11700,36 @@
           }
           dealSourceGroup.appendChild(dealSourceRow);
 
+          // Deal Terms text field (for M&A deal structure description)
+          const dealTermsGroup = document.createElement("div");
+          dealTermsGroup.className = "form-group";
+          const dealTermsLabel = document.createElement("label");
+          dealTermsLabel.className = "form-label";
+          dealTermsLabel.textContent = "📋 Deal Terms";
+          dealTermsGroup.appendChild(dealTermsLabel);
+          const dealTermsRow = document.createElement("div");
+          dealTermsRow.style.display = "flex";
+          dealTermsRow.style.alignItems = "center";
+          dealTermsRow.style.gap = "4px";
+          const dealTermsInput = document.createElement("input");
+          dealTermsInput.type = "text";
+          dealTermsInput.className = "form-input";
+          dealTermsInput.id = `ev_${idx}_deal_terms`;
+          dealTermsInput.placeholder = "e.g. all-cash acquisition, leveraged buyout…";
+          dealTermsInput.value = dealTermsText || "";
+          dealTermsInput.style.flex = "1";
+          dealTermsRow.appendChild(dealTermsInput);
+          if (!isMissing || dbEventId) {
+            dealTermsRow.appendChild(
+              createFieldSaveBtn(
+                "deal terms",
+                () => dealTermsInput.value.trim(),
+                "deal_terms_text"  // custom key handled in save handler below
+              )
+            );
+          }
+          dealTermsGroup.appendChild(dealTermsRow);
+
           // Show/hide based on deal type
           const syncSourceFields = (current_type) => {
             const isInv = EVENT_SOURCE_INVESTMENT_TYPES.includes(current_type);
@@ -11341,6 +11738,8 @@
               isInv || (!isInv && !isDeal) ? "block" : "none";
             dealSourceGroup.style.display =
               isDeal || (!isInv && !isDeal) ? "block" : "none";
+            dealTermsGroup.style.display =
+              isDeal ? "block" : "none";
           };
           syncSourceFields(type);
           typeSelect.addEventListener("change", () =>
@@ -11500,6 +11899,7 @@
           left.appendChild(typeRow);
           left.appendChild(invSourceGroup);
           left.appendChild(dealSourceGroup);
+          left.appendChild(dealTermsGroup);
           left.appendChild(smartEnrichRow);
 
           // Investment details (amount, currency, stage, source)
@@ -11650,6 +12050,170 @@
           }
 
           left.appendChild(invGroup);
+
+          // ─── Enterprise Value section ───────────────────────────────────
+          const evSection = document.createElement("div");
+          evSection.className = "form-row";
+          evSection.style.marginTop = "8px";
+          evSection.style.flexWrap = "wrap";
+          evSection.style.gap = "8px";
+
+          const evAmtGroup = document.createElement("div");
+          evAmtGroup.className = "form-group";
+          evAmtGroup.appendChild(Object.assign(document.createElement("label"), {
+            className: "form-label", textContent: "📊 EV (millions)"
+          }));
+          const evAmtInput = document.createElement("input");
+          evAmtInput.type = "text";
+          evAmtInput.className = "form-input";
+          evAmtInput.id = `ev_${idx}_enterprise_value_m`;
+          evAmtInput.placeholder = "e.g. 250";
+          evAmtInput.value = evEnterpriseValueM;
+          evAmtGroup.appendChild(evAmtInput);
+          evSection.appendChild(evAmtGroup);
+
+          const evBandGroup = document.createElement("div");
+          evBandGroup.className = "form-group";
+          evBandGroup.appendChild(Object.assign(document.createElement("label"), {
+            className: "form-label", textContent: "📏 EV Band"
+          }));
+          const evBandInput = document.createElement("select");
+          evBandInput.className = "form-select";
+          evBandInput.id = `ev_${idx}_ev_band`;
+          EV_BANDS.forEach(opt => {
+            const o = document.createElement("option");
+            o.value = opt;
+            o.textContent = opt || "Select band…";
+            if (opt && opt === evBand) o.selected = true;
+            evBandInput.appendChild(o);
+          });
+          evBandGroup.appendChild(evBandInput);
+          evSection.appendChild(evBandGroup);
+
+          const evSrcTypeGroup = document.createElement("div");
+          evSrcTypeGroup.className = "form-group";
+          evSrcTypeGroup.appendChild(Object.assign(document.createElement("label"), {
+            className: "form-label", textContent: "🏷️ EV Source Type"
+          }));
+          const evSrcTypeInput = document.createElement("select");
+          evSrcTypeInput.className = "form-select";
+          evSrcTypeInput.id = `ev_${idx}_ev_source_type`;
+          EV_SOURCE_TYPES.forEach(opt => {
+            const o = document.createElement("option");
+            o.value = opt;
+            o.textContent = opt || "Select source type…";
+            if (opt && opt === evSourceType) o.selected = true;
+            evSrcTypeInput.appendChild(o);
+          });
+          evSrcTypeGroup.appendChild(evSrcTypeInput);
+          evSection.appendChild(evSrcTypeGroup);
+
+          // Save EV fields button
+          if (!isMissing || dbEventId) {
+            const evSaveBtn = document.createElement("button");
+            evSaveBtn.textContent = "💾 Save EV";
+            evSaveBtn.className = "save-btn";
+            evSaveBtn.style.alignSelf = "flex-end";
+            evSaveBtn.onclick = async () => {
+              evSaveBtn.disabled = true;
+              evSaveBtn.textContent = "🔍";
+              const currentTitle = getCurrentEventTitle();
+              const eventId = getFreshDbEventId() || (await queryEventId(currentTitle));
+              if (!eventId) {
+                evSaveBtn.textContent = "❌";
+                log(`❌ Event not found in DB: ${currentTitle}`, "err");
+                setTimeout(() => { evSaveBtn.disabled = false; evSaveBtn.textContent = "💾 Save EV"; }, 2000);
+                return;
+              }
+              const evUpdates = { ev_data: {} };
+              const amtVal = evAmtInput.value.trim();
+              if (amtVal) evUpdates.ev_data.enterprise_value_m = amtVal;
+              const bandVal = evBandInput.value.trim();
+              if (bandVal) evUpdates.ev_data.ev_band = bandVal;
+              const srcTypeVal = evSrcTypeInput.value.trim();
+              if (srcTypeVal) evUpdates.ev_data.EV_source_type = srcTypeVal;
+              const evSrcVal = evSrcInput ? evSrcInput.value.trim() : "";
+              if (evSrcVal) evUpdates.ev_data.ev_source = evSrcVal;
+              if (Object.keys(evUpdates.ev_data).length === 0) {
+                evSaveBtn.textContent = "❌";
+                log("⚠️ No EV fields to update", "warn");
+                setTimeout(() => { evSaveBtn.disabled = false; evSaveBtn.textContent = "💾 Save EV"; }, 1500);
+                return;
+              }
+              await editCorporateEventInDb(eventId, evUpdates, evSaveBtn);
+              evSaveBtn.textContent = "💾 Save EV";
+              evSaveBtn.disabled = false;
+            };
+            evSection.appendChild(evSaveBtn);
+          }
+          left.appendChild(evSection);
+
+          // EV source URL row
+          const evSrcGroup = document.createElement("div");
+          evSrcGroup.className = "form-group";
+          evSrcGroup.appendChild(Object.assign(document.createElement("label"), {
+            className: "form-label", textContent: "🔗 EV Source"
+          }));
+          const evSrcRow = document.createElement("div");
+          evSrcRow.style.display = "flex";
+          evSrcRow.style.alignItems = "center";
+          evSrcRow.style.gap = "4px";
+          const evSrcInput = document.createElement("input");
+          evSrcInput.type = "url";
+          evSrcInput.className = "form-input";
+          evSrcInput.id = `ev_${idx}_ev_source`;
+          evSrcInput.placeholder = "Source URL for enterprise value…";
+          evSrcInput.value = evSourceUrl;
+          evSrcInput.style.flex = "1";
+          evSrcRow.appendChild(evSrcInput);
+          evSrcRow.appendChild(createOpenBtn(evSrcInput, "EV Source"));
+          if (!isMissing || dbEventId) {
+            evSrcRow.appendChild(
+              createFieldSaveBtn("EV source", () => evSrcInput.value.trim(), "ev_source_url")
+            );
+          }
+          evSrcGroup.appendChild(evSrcRow);
+          left.appendChild(evSrcGroup);
+
+          // True EV & Revs/EBITDA Disclosed checkbox
+          const trueEvGroup = document.createElement("div");
+          trueEvGroup.className = "form-group";
+          trueEvGroup.style.display = "flex";
+          trueEvGroup.style.alignItems = "center";
+          trueEvGroup.style.gap = "8px";
+          trueEvGroup.style.marginTop = "6px";
+          const trueEvCheck = document.createElement("input");
+          trueEvCheck.type = "checkbox";
+          trueEvCheck.id = `ev_${idx}_true_ev`;
+          trueEvCheck.checked = trueEvDisclosed;
+          trueEvCheck.style.width = "16px";
+          trueEvCheck.style.height = "16px";
+          trueEvCheck.style.cursor = "pointer";
+          const trueEvLabel = document.createElement("label");
+          trueEvLabel.htmlFor = `ev_${idx}_true_ev`;
+          trueEvLabel.className = "form-label";
+          trueEvLabel.style.marginBottom = "0";
+          trueEvLabel.style.cursor = "pointer";
+          trueEvLabel.textContent = "True EV & Revs/EBITDA Disclosed";
+          trueEvGroup.appendChild(trueEvCheck);
+          trueEvGroup.appendChild(trueEvLabel);
+          if (!isMissing || dbEventId) {
+            const trueEvSaveBtn = document.createElement("button");
+            trueEvSaveBtn.textContent = "💾";
+            trueEvSaveBtn.title = "Save True EV flag";
+            trueEvSaveBtn.className = "save-btn";
+            trueEvSaveBtn.style.padding = "2px 8px";
+            trueEvSaveBtn.onclick = async () => {
+              trueEvSaveBtn.disabled = true;
+              const currentTitle = getCurrentEventTitle();
+              const eventId = getFreshDbEventId() || (await queryEventId(currentTitle));
+              if (!eventId) { trueEvSaveBtn.disabled = false; return; }
+              await editCorporateEventInDb(eventId, { True_EV_and_Revs_or_EBITDA_disclosed: trueEvCheck.checked }, trueEvSaveBtn);
+              trueEvSaveBtn.disabled = false;
+            };
+            trueEvGroup.appendChild(trueEvSaveBtn);
+          }
+          left.appendChild(trueEvGroup);
 
           // Ready to Publish button (left side)
           if (!isMissing || dbEventId) {
@@ -11861,7 +12425,43 @@
               if (typeof longDescVal === "string" && longDescVal !== longDesc) {
                 updates.long_description = longDescVal;
               }
-              
+
+              // investment_data
+              const saInvSrc = document.getElementById(`ev_${idx}_inv_source`)?.value?.trim();
+              const saAmt = parseFloat(document.getElementById(`ev_${idx}_amount`)?.value);
+              const saCur = document.getElementById(`ev_${idx}_currency`)?.value;
+              const saStage = document.getElementById(`ev_${idx}_stage`)?.value?.trim();
+              const saInvData = {};
+              if (saInvSrc) saInvData.investment_amount_source = saInvSrc;
+              if (!isNaN(saAmt)) saInvData.investment_amount_m = saAmt;
+              if (saCur) saInvData.currency_id = parseInt(saCur, 10) || 0;
+              if (saStage) saInvData.Funding_stage = saStage;
+              if (Object.keys(saInvData).length) updates.investment_data = saInvData;
+
+              // deal_terms_data
+              const saDealSrc = document.getElementById(`ev_${idx}_deal_source`)?.value?.trim();
+              const saDealTerms = document.getElementById(`ev_${idx}_deal_terms`)?.value?.trim();
+              const saDtData = {};
+              if (saDealSrc) saDtData.deal_terms_source = saDealSrc;
+              if (saDealTerms) saDtData.deal_terms = saDealTerms;
+              if (Object.keys(saDtData).length) updates.deal_terms_data = saDtData;
+
+              // ev_data
+              const saEvAmt = document.getElementById(`ev_${idx}_enterprise_value_m`)?.value?.trim();
+              const saEvBand = document.getElementById(`ev_${idx}_ev_band`)?.value?.trim();
+              const saEvSrcType = document.getElementById(`ev_${idx}_ev_source_type`)?.value?.trim();
+              const saEvSrc = document.getElementById(`ev_${idx}_ev_source`)?.value?.trim();
+              const saEvData = {};
+              if (saEvAmt) saEvData.enterprise_value_m = saEvAmt;
+              if (saEvBand) saEvData.ev_band = saEvBand;
+              if (saEvSrcType) saEvData.EV_source_type = saEvSrcType;
+              if (saEvSrc) saEvData.ev_source = saEvSrc;
+              if (Object.keys(saEvData).length) updates.ev_data = saEvData;
+
+              // True EV flag
+              const saTrueEv = document.getElementById(`ev_${idx}_true_ev`);
+              if (saTrueEv) updates.True_EV_and_Revs_or_EBITDA_disclosed = saTrueEv.checked;
+
               if (Object.keys(updates).length === 0) {
                 log("No changes to save", "warn");
                 saveAllBtn.disabled = false;
@@ -11990,7 +12590,7 @@
               const link = cp.company_linkedin_url || "";
               const press = cp.press_release_url || cp.counterparty_announcement_url || cp.announcement_url || "";
               let website = cp.company_website || cp.company_url || cp.website || cp.url || "";
-              const indiv = cp.individuals || [];
+              const indiv = (cp.individuals || []).filter(v => v && (v.name || v.individual_name));
               let existsInDb = false;
               let existingCompanyId = null;
               let lookupInProgress = false;
@@ -13395,6 +13995,7 @@
                 indiv.slice(0, 10).forEach((person, personIdx) => {
                   let personName = person.name || "Unknown";
                   const personTitle = person.title || person.job_title || "";
+                  const personPosition = personTitle || "";
                   let personLinkedIn = person.linkedin_url || person.linkedin || "";
                   let personBio = person.bio || person.description || "";
                   let personLocation = person.location || "";
@@ -13668,8 +14269,8 @@
                   
                   // LinkedIn search button (also extracts location from SEO)
                   const liSearchBtn = document.createElement("button");
-                  liSearchBtn.innerHTML = "🔍";
-                  liSearchBtn.title = "Search LinkedIn profile (also fills location from SEO)";
+                  liSearchBtn.innerHTML = "🔎";
+                  liSearchBtn.title = "Find LinkedIn profile (on demand — not run during Analyze)";
                   liSearchBtn.style.padding = "4px 8px";
                   liSearchBtn.style.fontSize = "12px";
                   liSearchBtn.style.borderRadius = "6px";
@@ -14401,24 +15002,28 @@
         
         if (target && target.name) {
           cpData.push({
+            counterparty_id: target.counterparty_id || 0,
+            counterparty_type_id: target.counterparty_type_id || 0,
             company_name: target.name,
             role: "Target",
-            company_website: target.url || "",
+            company_website: target.url || target.company_url || target.website || "",
             announcement_url: target.counterparty_announcement_url || "",
             company_linkedin_url: target.linkedin_url || "",
-            individuals: target.individuals || target._individuals || []
+            individuals: (target.individuals || target._individuals || []).filter(v => v && (v.name || v.Individual_text))
           });
         }
         
         ["other_counterparties", "investors", "sellers", "buyers"].forEach(key => {
           (ev[key] || []).forEach(cp => {
             cpData.push({
+              counterparty_id: cp.counterparty_id || 0,
+              counterparty_type_id: cp.counterparty_type_id || 0,
               company_name: cp.name || "Unknown",
               role: cp.counterparty_status || cp.role || key.replace("_", " "),
               company_website: cp.url || cp.company_url || cp.website || "",
               announcement_url: cp.counterparty_announcement_url || "",
               company_linkedin_url: cp.linkedin_url || "",
-              individuals: cp.individuals || cp._individuals || []
+              individuals: (cp.individuals || cp._individuals || []).filter(v => v && (v.name || v.Individual_text))
             });
           });
         });
@@ -14486,7 +15091,41 @@
           
           if (annDate) metaRow.appendChild(createBadge(`📢 ${annDate}`, "#fbbf24"));
           if (closedDate) metaRow.appendChild(createBadge(`✅ ${closedDate}`, "#6ee7b7"));
-          if (dealType) metaRow.appendChild(createBadge(dealType, "#a5b4fc"));
+
+          // Deal type — inline editable dropdown (saves immediately on change)
+          if (dbEventId) {
+            const dtWrap = document.createElement("div");
+            dtWrap.style.display = "flex";
+            dtWrap.style.alignItems = "center";
+            dtWrap.style.gap = "4px";
+            const dtSelect = document.createElement("select");
+            dtSelect.style.cssText = "background:rgba(165,180,252,0.12);border:1px solid rgba(165,180,252,0.4);color:#a5b4fc;border-radius:6px;padding:2px 6px;font-size:12px;font-weight:600;cursor:pointer;";
+            DEAL_TYPES.forEach(opt => {
+              const o = document.createElement("option");
+              o.value = opt;
+              o.textContent = opt || "—";
+              if (opt === dealType) o.selected = true;
+              dtSelect.appendChild(o);
+            });
+            const dtSaveBtn = document.createElement("button");
+            dtSaveBtn.textContent = "💾";
+            dtSaveBtn.title = "Save deal type";
+            dtSaveBtn.style.cssText = "background:none;border:none;cursor:pointer;font-size:13px;padding:0 2px;opacity:0.6;";
+            dtSaveBtn.onclick = async () => {
+              dtSaveBtn.disabled = true;
+              dtSaveBtn.textContent = "⏳";
+              const ok = await editCorporateEventInDb(dbEventId, { deal_type: dtSelect.value }, dtSaveBtn, true, true);
+              dtSaveBtn.textContent = ok ? "✅" : "❌";
+              dtSaveBtn.disabled = false;
+              setTimeout(() => { dtSaveBtn.textContent = "💾"; dtSaveBtn.style.opacity = "0.6"; }, 1800);
+            };
+            dtWrap.appendChild(dtSelect);
+            dtWrap.appendChild(dtSaveBtn);
+            metaRow.appendChild(dtWrap);
+          } else if (dealType) {
+            metaRow.appendChild(createBadge(dealType, "#a5b4fc"));
+          }
+
           if (dealStatus) metaRow.appendChild(createBadge(dealStatus));
           container.appendChild(metaRow);
           
@@ -14692,7 +15331,7 @@
             container.appendChild(descBlock);
           }
           
-          // Counterparties section (read-only)
+          // Counterparties section — editable when counterparty_id is available
           const cps = ev.counterparties || [];
           if (cps.length) {
             const cpSection = document.createElement("div");
@@ -14706,11 +15345,12 @@
             cpHeader.textContent = `🏢 Counterparties (${cps.length})`;
             cpSection.appendChild(cpHeader);
             
-            cps.forEach(cp => {
+            cps.forEach((cp, cpIdx) => {
+              const cpDbId = cp.counterparty_id || 0;
               const cpCard = document.createElement("div");
               cpCard.className = "counterparty-card";
-              cpCard.style.opacity = "0.9";
-              
+
+              // ── Header row ──────────────────────────────────────────────
               const header = document.createElement("div");
               header.className = "counterparty-header";
               
@@ -14722,15 +15362,36 @@
               roleSpan.className = "counterparty-role";
               roleSpan.textContent = cp.role || "Counterparty";
               
-              header.appendChild(nameSpan);
-              header.appendChild(roleSpan);
+              const headerLeft = document.createElement("div");
+              headerLeft.style.display = "flex";
+              headerLeft.style.alignItems = "center";
+              headerLeft.style.gap = "8px";
+              headerLeft.appendChild(nameSpan);
+              headerLeft.appendChild(roleSpan);
+              header.appendChild(headerLeft);
+
+              // Edit toggle button (only when we have a DB id)
+              if (cpDbId) {
+                const editToggleBtn = document.createElement("button");
+                editToggleBtn.textContent = "✏️ Edit";
+                editToggleBtn.style.cssText = "padding:3px 9px;font-size:10px;border-radius:6px;border:1px solid rgba(99,102,241,0.4);background:rgba(99,102,241,0.1);color:#c7d2fe;cursor:pointer;";
+                editToggleBtn.onclick = () => {
+                  const isOpen = editForm.style.display !== "none";
+                  editForm.style.display = isOpen ? "none" : "block";
+                  editToggleBtn.textContent = isOpen ? "✏️ Edit" : "✕ Close";
+                  editToggleBtn.style.background = isOpen ? "rgba(99,102,241,0.1)" : "rgba(99,102,241,0.2)";
+                };
+                header.appendChild(editToggleBtn);
+              }
+
               cpCard.appendChild(header);
-              
-              // Links row (open buttons only)
+
+              // ── Quick links row ──────────────────────────────────────────
               const linksRow = document.createElement("div");
               linksRow.style.display = "flex";
               linksRow.style.gap = "6px";
               linksRow.style.marginTop = "8px";
+              linksRow.style.flexWrap = "wrap";
               
               if (cp.company_website) {
                 const webBtn = document.createElement("a");
@@ -14756,13 +15417,10 @@
                 annBtn.textContent = "📄 Announcement";
                 linksRow.appendChild(annBtn);
               }
-              
-              if (linksRow.childNodes.length) {
-                cpCard.appendChild(linksRow);
-              }
-              
-              // Individuals (read-only)
-              const indivs = cp.individuals || [];
+              if (linksRow.childNodes.length) cpCard.appendChild(linksRow);
+
+              // ── Individuals (read-only) ──────────────────────────────────
+              const indivs = (cp.individuals || []).filter(v => v && (v.name || v.Individual_text));
               if (indivs.length) {
                 const indSection = document.createElement("div");
                 indSection.style.marginTop = "10px";
@@ -14772,28 +15430,20 @@
                 
                 indivs.forEach(ind => {
                   const indRow = document.createElement("div");
-                  indRow.style.display = "flex";
-                  indRow.style.alignItems = "center";
-                  indRow.style.gap = "6px";
-                  indRow.style.marginBottom = "4px";
-                  
+                  indRow.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px;";
                   const indName = ind.name || ind.Individual_text || "Unknown";
                   const indTitle = ind.title || ind.job_title || "";
                   const indLinkedIn = ind.linkedin_url || "";
-                  
                   const nameEl = document.createElement("span");
-                  nameEl.style.color = "#e5e7eb";
-                  nameEl.style.fontWeight = "500";
+                  nameEl.style.cssText = "color:#e5e7eb;font-weight:500;";
                   nameEl.textContent = `• ${indName}`;
                   indRow.appendChild(nameEl);
-                  
                   if (indTitle) {
                     const titleEl = document.createElement("span");
                     titleEl.style.color = "#9ca3af";
                     titleEl.textContent = `— ${indTitle}`;
                     indRow.appendChild(titleEl);
                   }
-                  
                   if (indLinkedIn) {
                     const liLink = document.createElement("a");
                     liLink.href = indLinkedIn;
@@ -14803,13 +15453,153 @@
                     liLink.style.fontSize = "10px";
                     indRow.appendChild(liLink);
                   }
-                  
                   indSection.appendChild(indRow);
                 });
-                
                 cpCard.appendChild(indSection);
               }
-              
+
+              // ── Expandable edit form (hidden by default) ─────────────────
+              const editForm = document.createElement("div");
+              editForm.style.display = "none";
+              editForm.style.marginTop = "12px";
+              editForm.style.paddingTop = "12px";
+              editForm.style.borderTop = "1px solid rgba(99,102,241,0.2)";
+
+              if (cpDbId) {
+                // Company Name
+                const nameGrp = document.createElement("div");
+                nameGrp.className = "form-group";
+                nameGrp.appendChild(Object.assign(document.createElement("label"), { className: "form-label", textContent: "Company Name" }));
+                const nameInp = document.createElement("input");
+                nameInp.type = "text";
+                nameInp.className = "form-input";
+                nameInp.value = cp.company_name || "";
+                nameInp.placeholder = "Company name";
+                nameGrp.appendChild(nameInp);
+                editForm.appendChild(nameGrp);
+
+                // Counterparty Type
+                const typeGrp = document.createElement("div");
+                typeGrp.className = "form-group";
+                typeGrp.appendChild(Object.assign(document.createElement("label"), { className: "form-label", textContent: "Counterparty Type" }));
+                const typeSelect = document.createElement("select");
+                typeSelect.className = "form-select";
+                const initialType = cp.counterparty_type_id ? String(cp.counterparty_type_id) : (cp.role || "");
+                attachCounterpartyTypeDropdown(typeSelect, initialType);
+                typeGrp.appendChild(typeSelect);
+                editForm.appendChild(typeGrp);
+
+                // Website
+                const webGrp = document.createElement("div");
+                webGrp.className = "form-group";
+                webGrp.appendChild(Object.assign(document.createElement("label"), { className: "form-label", textContent: "Company Website" }));
+                const webInpRow = document.createElement("div");
+                webInpRow.style.cssText = "display:flex;align-items:center;gap:4px;";
+                const webInp = document.createElement("input");
+                webInp.type = "url";
+                webInp.className = "form-input";
+                webInp.style.flex = "1";
+                webInp.value = cp.company_website || "";
+                webInp.placeholder = "https://company.com";
+                const webOpenBtn = document.createElement("button");
+                webOpenBtn.textContent = "↗";
+                webOpenBtn.title = "Open";
+                webOpenBtn.style.cssText = "padding:6px 10px;font-size:12px;border-radius:6px;border:1px solid rgba(99,102,241,0.3);background:rgba(99,102,241,0.1);color:#c7d2fe;cursor:pointer;";
+                webOpenBtn.onclick = () => { if (webInp.value) window.open(webInp.value, "_blank"); };
+                webInpRow.appendChild(webInp);
+                webInpRow.appendChild(webOpenBtn);
+                webGrp.appendChild(webInpRow);
+                editForm.appendChild(webGrp);
+
+                // Press Release / Announcement URL
+                const pressGrp = document.createElement("div");
+                pressGrp.className = "form-group";
+                pressGrp.appendChild(Object.assign(document.createElement("label"), { className: "form-label", textContent: "Press Release / Announcement URL" }));
+                const pressInpRow = document.createElement("div");
+                pressInpRow.style.cssText = "display:flex;align-items:center;gap:4px;";
+                const pressInp = document.createElement("input");
+                pressInp.type = "url";
+                pressInp.className = "form-input";
+                pressInp.style.flex = "1";
+                pressInp.value = cp.announcement_url || "";
+                pressInp.placeholder = "https://company.com/press/...";
+                const pressOpenBtn = document.createElement("button");
+                pressOpenBtn.textContent = "↗";
+                pressOpenBtn.title = "Open";
+                pressOpenBtn.style.cssText = "padding:6px 10px;font-size:12px;border-radius:6px;border:1px solid rgba(99,102,241,0.3);background:rgba(99,102,241,0.1);color:#c7d2fe;cursor:pointer;";
+                pressOpenBtn.onclick = () => { if (pressInp.value) window.open(pressInp.value, "_blank"); };
+                pressInpRow.appendChild(pressInp);
+                pressInpRow.appendChild(pressOpenBtn);
+                pressGrp.appendChild(pressInpRow);
+                editForm.appendChild(pressGrp);
+
+                // LinkedIn URL
+                const liGrp = document.createElement("div");
+                liGrp.className = "form-group";
+                liGrp.appendChild(Object.assign(document.createElement("label"), { className: "form-label", textContent: "LinkedIn URL" }));
+                const liInpRow = document.createElement("div");
+                liInpRow.style.cssText = "display:flex;align-items:center;gap:4px;";
+                const liInp = document.createElement("input");
+                liInp.type = "url";
+                liInp.className = "form-input";
+                liInp.style.flex = "1";
+                liInp.value = cp.company_linkedin_url || "";
+                liInp.placeholder = "https://linkedin.com/company/...";
+                const liOpenBtn = document.createElement("button");
+                liOpenBtn.textContent = "↗";
+                liOpenBtn.title = "Open";
+                liOpenBtn.style.cssText = "padding:6px 10px;font-size:12px;border-radius:6px;border:1px solid rgba(99,102,241,0.3);background:rgba(99,102,241,0.1);color:#c7d2fe;cursor:pointer;";
+                liOpenBtn.onclick = () => { if (liInp.value) window.open(liInp.value, "_blank"); };
+                liInpRow.appendChild(liInp);
+                liInpRow.appendChild(liOpenBtn);
+                liGrp.appendChild(liInpRow);
+                editForm.appendChild(liGrp);
+
+                // Save button
+                const saveRow = document.createElement("div");
+                saveRow.style.cssText = "margin-top:12px;display:flex;justify-content:flex-end;gap:8px;";
+                const saveBtn = document.createElement("button");
+                saveBtn.className = "save-btn";
+                saveBtn.textContent = "💾 Save Changes";
+                saveBtn.onclick = async () => {
+                  saveBtn.disabled = true;
+                  saveBtn.textContent = "⏳ Saving...";
+                  const updates = {};
+                  const newName = nameInp.value.trim();
+                  const newTypeId = parseInt(typeSelect.value || "0") || 0;
+                  const newWebsite = webInp.value.trim();
+                  const newPress = pressInp.value.trim();
+                  const newLinkedIn = liInp.value.trim();
+                  if (newName && newName !== (cp.company_name || "")) updates.company_name = newName;
+                  if (newTypeId) { updates.type_id = newTypeId; updates.counterparty_type_id = newTypeId; }
+                  if (newWebsite !== (cp.company_website || "")) updates.company_url = newWebsite;
+                  if (newPress !== (cp.announcement_url || "")) updates.press_release_url = newPress;
+                  if (newLinkedIn !== (cp.company_linkedin_url || "")) updates.linkedin_url = newLinkedIn;
+                  if (!Object.keys(updates).length) {
+                    saveBtn.textContent = "No changes";
+                    saveBtn.disabled = false;
+                    setTimeout(() => { saveBtn.textContent = "💾 Save Changes"; }, 1500);
+                    return;
+                  }
+                  const ok = await editCounterpartyInDb(cpDbId, updates, saveBtn, dbEventId);
+                  if (ok) {
+                    // Update quick-link anchors in the card
+                    if (updates.company_name) nameSpan.textContent = cleanCompanyName(updates.company_name) || updates.company_name;
+                    if (updates.company_url) { cp.company_website = updates.company_url; }
+                    if (updates.press_release_url) { cp.announcement_url = updates.press_release_url; }
+                    if (updates.linkedin_url) { cp.company_linkedin_url = updates.linkedin_url; }
+                  }
+                };
+                saveRow.appendChild(saveBtn);
+                editForm.appendChild(saveRow);
+              } else {
+                const note = document.createElement("div");
+                note.style.cssText = "font-size:11px;color:#9ca3af;font-style:italic;padding:8px 0;";
+                note.textContent = "ℹ️ Counterparty ID not available — edit in Xano directly.";
+                editForm.appendChild(note);
+              }
+
+              cpCard.appendChild(editForm);
               cpSection.appendChild(cpCard);
             });
             
@@ -15040,7 +15830,7 @@
               url: cp.url || cp.company_url || cp.website || "",
                   announcement_url: cp.counterparty_announcement_url || "",
                 linkedin: cp.linkedin_url || "",
-                individuals: cp.individuals || cp._individuals || []
+                individuals: (cp.individuals || cp._individuals || []).filter(v => v && (v.name || v.Individual_text))
               });
             });
           });
@@ -15908,56 +16698,48 @@
           deal_type: dealType,
           deal_status: dealStatus,
           source_url: sourceUrl || "",
-          currency_id: 0,
-          funding_stage: "",
-          Amount: 0,
-          funding_source: "",
-          investment_amount_m: 0,
-          company_id: companyId,  // Link event to the company
+          company_id: companyId,
         };
-
-        // Investment fields (optional)
-        const amtVal = amountInput ? parseFloat(amountInput.value) : NaN;
-        if (!isNaN(amtVal)) {
-          payload.investment_amount_m = amtVal;
-          payload.Amount = amtVal;
-        }
-        if (currencySelect && currencySelect.value) {
-          payload.currency_id = parseInt(currencySelect.value, 10) || 0;
-        }
-        if (stageInput && stageInput.value.trim()) payload.funding_stage = stageInput.value.trim();
 
         const currentType = typeSelect ? typeSelect.value : dealType;
         const isInvType = EVENT_SOURCE_INVESTMENT_TYPES.includes(currentType);
         const isDealTermsType = EVENT_SOURCE_DEAL_TERMS_TYPES.includes(currentType);
-        if (isInvType) {
-          if (invSrc) {
-            payload.investment_data = {
-              ...(payload.investment_data || {}),
-              investment_amount_source: invSrc,
-            };
-          }
-        } else if (isDealTermsType) {
-          if (dealSrc) {
-            payload.deal_terms_data = {
-              ...(payload.deal_terms_data || {}),
-              source_url: dealSrc,
-            };
-          }
-        } else {
-          if (invSrc) {
-            payload.investment_data = {
-              ...(payload.investment_data || {}),
-              investment_amount_source: invSrc,
-            };
-          }
-          if (dealSrc) {
-            payload.deal_terms_data = {
-              ...(payload.deal_terms_data || {}),
-              source_url: dealSrc,
-            };
-          }
+
+        // ── investment_data sub-object ──────────────────────────────────────
+        const invData = {};
+        if (isInvType || (!isInvType && !isDealTermsType)) {
+          if (invSrc) invData.investment_amount_source = invSrc;
         }
+        const amtRaw = amountInput ? parseFloat(amountInput.value) : NaN;
+        if (!isNaN(amtRaw)) invData.investment_amount_m = amtRaw;
+        if (currencySelect && currencySelect.value) invData.currency_id = parseInt(currencySelect.value, 10) || 0;
+        if (stageInput && stageInput.value.trim()) invData.Funding_stage = stageInput.value.trim();
+        if (Object.keys(invData).length) payload.investment_data = invData;
+
+        // ── deal_terms_data sub-object ──────────────────────────────────────
+        const dtData = {};
+        if (isDealTermsType || (!isInvType && !isDealTermsType)) {
+          if (dealSrc) dtData.deal_terms_source = dealSrc;
+        }
+        const dealTermsVal = document.getElementById(`ev_${idx}_deal_terms`)?.value?.trim();
+        if (dealTermsVal) dtData.deal_terms = dealTermsVal;
+        if (Object.keys(dtData).length) payload.deal_terms_data = dtData;
+
+        // ── ev_data sub-object ─────────────────────────────────────────────
+        const evDt = {};
+        const evAmtVal = document.getElementById(`ev_${idx}_enterprise_value_m`)?.value?.trim();
+        if (evAmtVal) evDt.enterprise_value_m = evAmtVal;
+        const evBandVal = document.getElementById(`ev_${idx}_ev_band`)?.value?.trim();
+        if (evBandVal) evDt.ev_band = evBandVal;
+        const evSrcTypeVal = document.getElementById(`ev_${idx}_ev_source_type`)?.value?.trim();
+        if (evSrcTypeVal) evDt.EV_source_type = evSrcTypeVal;
+        const evSrcUrlVal = document.getElementById(`ev_${idx}_ev_source`)?.value?.trim();
+        if (evSrcUrlVal) evDt.ev_source = evSrcUrlVal;
+        if (Object.keys(evDt).length) payload.ev_data = evDt;
+
+        // ── True EV flag ───────────────────────────────────────────────────
+        const trueEvEl = document.getElementById(`ev_${idx}_true_ev`);
+        if (trueEvEl) payload.True_EV_and_Revs_or_EBITDA_disclosed = trueEvEl.checked;
 
         const endpoint = `${XANO_BASE}/api:8Bv5PK4I/create_corporate_event`;
         

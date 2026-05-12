@@ -1058,11 +1058,12 @@ def ai_extract_event_from_text(text: str, url: str) -> Dict[str, Any]:
     prompt = f"""
 You are an information extractor. Extract ONE corporate event from the given announcement page text.
 Return ONLY minified JSON (no code fences, no trailing text) exactly like:
-{{"title":"","announcement_date":"","closed_date":"","deal_type":"","deal_status":"","long_description":"","investment_amount_m":null,"investment_currency":"","funding_stage":"","investment_amount_source":"","source_url":"","counterparties":[{{"name":"","role":"","website":"","linkedin":""}}]}}
+{{"title":"","announcement_date":"","closed_date":"","deal_type":"","deal_status":"","long_description":"","investment_amount_m":null,"investment_currency":"","funding_stage":"","investment_amount_source":"","deal_terms":"","source_url":"","counterparties":[{{"name":"","role":"","website":"","linkedin":""}}]}}
 Rules:
-- Dates: use YYYY-MM-DD when you can; otherwise "".
+- Dates: use YYYY-MM-DD when you can; otherwise "". ONLY use dates tied to this specific transaction — never founding year, prior milestones, or unrelated history.
 - Amount: millions of base currency (e.g., $200 million => 200).
 - Currency: ISO code (USD, EUR, GBP, CHF, etc.). Map $->USD, €->EUR, £->GBP.
+- deal_terms: brief M&A deal structure only (e.g. "all-cash acquisition", "all-stock merger"). Use "" for funding events.
 - If unknown, use "" for strings and null for numbers. Keep keys present.
 - long_description: write a concise, neutral, professional paragraph (no bullet points) describing what happened using only verifiable facts from the provided text. Include absolute dates when available. If terms are undisclosed, state that neutrally.
 
@@ -1129,6 +1130,7 @@ def enrich_ai_events_with_llm(events: List[dict], max_enrich: int = 5) -> List[d
                             "investment_currency",
                             "funding_stage",
                             "investment_amount_source",
+                            "deal_terms",
                             "source_url",
                         ]:
                             v = ai.get(k)

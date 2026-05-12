@@ -17,6 +17,31 @@ from bs4 import BeautifulSoup
 import base64
 from typing import Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+from searxng_ce_helpers import (
+    corporate_events_shard_size,
+    format_ce_journal_from_hits,
+    merge_dedupe_ce_rows,
+    normalize_llm_ce_events_to_rows,
+    openrouter_extract_ce_events_json,
+    title_is_strict_csuite,
+)
+
+_CE_LLM_SEM_STATE: Dict[str, Any] = {"sem": None, "n": None}
+
+
+def _ce_llm_concurrency_semaphore() -> threading.Semaphore:
+    """Caps concurrent OpenRouter CE shard calls. Recreates semaphore when CORPORATE_EVENTS_LLM_CONCURRENCY changes."""
+    try:
+        n = int(os.getenv("CORPORATE_EVENTS_LLM_CONCURRENCY", "4"))
+    except ValueError:
+        n = 4
+    n = max(1, min(n, 12))
+    if _CE_LLM_SEM_STATE["sem"] is None or _CE_LLM_SEM_STATE["n"] != n:
+        _CE_LLM_SEM_STATE["sem"] = threading.Semaphore(n)
+        _CE_LLM_SEM_STATE["n"] = n
+    return _CE_LLM_SEM_STATE["sem"]
 
 try:
     import yfinance as yf
@@ -376,6 +401,78 @@ def serpapi_parallel_search(queries: list, api_key: str, num_results: int = 10) 
         return []
 
 
+async def _run_parallel_searches_grouped(queries: list, api_key: str, num_results: int = 10, batch_size: int = 10):
+    """
+    Same scheduling as _run_parallel_searches, but returns **per-query** hit lists (no cross-query URL dedupe).
+    Order matches `queries`.
+    """
+    grouped = []
+    connector = aiohttp.TCPConnector(limit=batch_size, limit_per_host=batch_size)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for i in range(0, len(queries), batch_size):
+            batch = queries[i : i + batch_size]
+            tasks = [_serpapi_search_async(session, q, api_key, num_results) for q in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for q, results in zip(batch, batch_results):
+                hits = []
+                if isinstance(results, Exception):
+                    print(f"⚠️ Async SerpAPI batch error for '{q[:48]}...': {results}")
+                elif results:
+                    for r in results:
+                        url = r.get("link", "")
+                        if not url:
+                            continue
+                        hits.append(
+                            {
+                                "title": r.get("title", ""),
+                                "snippet": r.get("snippet", ""),
+                                "link": url,
+                                "published_date": (r.get("date") or "").strip(),
+                            }
+                        )
+                grouped.append((q, hits))
+            if i + batch_size < len(queries):
+                await asyncio.sleep(0.3)
+    return grouped
+
+
+def serpapi_parallel_search_grouped(queries: list, api_key: str, num_results: int = 10) -> list:
+    """
+    Per-query SerpAPI results: list of (query_string, [ {title, snippet, link, published_date}, ... ]).
+    """
+    if not queries or not api_key:
+        return []
+    try:
+        try:
+            asyncio.get_running_loop()
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    _run_parallel_searches_grouped(queries, api_key, num_results),
+                )
+                return future.result(timeout=180)
+        except RuntimeError:
+            return asyncio.run(_run_parallel_searches_grouped(queries, api_key, num_results))
+    except Exception as e:
+        print(f"⚠️ Parallel grouped search error: {e}")
+        return []
+
+
+# Serp snippets often contain "NYSE FUTURES" / similar — not a valid equity symbol for yfinance.
+_INVALID_EQUITY_TICKERS = frozenset(
+    {"FUTURES", "OPTIONS", "ETF", "INDEX", "FUND", "TRUST"}
+)
+
+
+def _sanitized_equity_ticker(ticker: str) -> str:
+    t = (ticker or "").strip().upper()
+    if not t or t in _INVALID_EQUITY_TICKERS:
+        return ""
+    return t
+
+
 def lookup_ticker(company_name: str, website_url: str = "") -> str:
     """
     Find a stock ticker symbol for a company name using SerpAPI.
@@ -410,7 +507,9 @@ def lookup_ticker(company_name: str, website_url: str = "") -> str:
             snippet,
         )
         if match:
-            ticker = match.group(1).strip()
+            ticker = _sanitized_equity_ticker(match.group(1).strip())
+            if not ticker:
+                continue
             print(f"   📈 Found ticker for {company_name}: {ticker}")
             return ticker
 
@@ -418,7 +517,9 @@ def lookup_ticker(company_name: str, website_url: str = "") -> str:
         if "finance.yahoo.com/quote/" in link:
             m = re.search(r'/quote/([A-Z.\-]{1,8})(?:/|$)', link)
             if m:
-                ticker = m.group(1)
+                ticker = _sanitized_equity_ticker(m.group(1))
+                if not ticker:
+                    continue
                 print(f"   📈 Found ticker from Yahoo URL: {ticker}")
                 return ticker
 
@@ -436,6 +537,10 @@ def get_yahoo_finance_data(ticker: str) -> dict:
         return {}
 
     ticker = ticker.strip().upper()
+    if not _sanitized_equity_ticker(ticker):
+        print(f"   ⚠️ Skipping Yahoo Finance for invalid/non-equity ticker token: {ticker}")
+        return {}
+
     print(f"   📊 Fetching Yahoo Finance data for ticker: {ticker}")
 
     result = {}
@@ -2327,7 +2432,7 @@ def get_top_management(company_name, text=""):
     # Search for company leadership info (PARALLEL)
     context_queries = [
         f'"{company_name}" leadership team CEO CFO executives',
-        f'"{company_name}" management team board directors',
+        f'"{company_name}" CFO COO CTO CMO CISO chief officer',
         f'{company_name} CEO "chief executive" OR CFO OR CTO',
     ]
     
@@ -2345,23 +2450,18 @@ def get_top_management(company_name, text=""):
     # 2️⃣ AI Extraction - Get Names First
     # =====================================================
     prompt = f"""
-You are a corporate research analyst. Research and extract the COMPLETE current executive leadership team for "{company_name}".
+You are a corporate research analyst. Extract ONLY **strict C-suite** executives currently at "{company_name}".
 
-IMPORTANT: You MUST include ALL of these roles if they exist:
-- CEO (Chief Executive Officer) - REQUIRED
-- CFO (Chief Financial Officer)
-- COO (Chief Operating Officer)  
-- CTO (Chief Technology Officer)
-- CMO (Chief Marketing Officer)
-- CLO/General Counsel (Chief Legal Officer)
-- CHRO/CPO (Chief Human Resources/People Officer)
-- President / Managing Director
-- Chairman of the Board
-- Other C-suite or Senior VP roles
+ALLOWED ROLES (and titles that **start with "Chief"** mapping to these): CEO, CFO, COO, CTO, CRO, CISO, CPO (Chief Product Officer), CMO, CLO (Chief Legal Officer).
+❌ EXCLUDE everyone else: board members only, regional heads, EVPs, VPs, Partners, MDs (unless also Chief…), presidents without Chief title, general counsel without "Chief Legal Officer", etc.
+
+RULES:
+- **position** is REQUIRED for every person. Use the exact published title (e.g. "Chief Financial Officer", "CEO").
+- If you cannot confidently assign an allowed C-suite title from reliable sources, **omit that person entirely** (do not guess).
 
 For EACH executive, provide:
 - name: Full legal name
-- position: Official title
+- position: Official C-suite title (REQUIRED — see allowed list above)
   - status: "Current" or "Past"
 - location: City, State/Country (if known, else "")
 - current_employee_url: A DEDICATED page URL on the company's website for THIS SPECIFIC INDIVIDUAL. 
@@ -2436,11 +2536,12 @@ JSON:"""
     # =====================================================
     if not management_results:
         fallback_prompt = f"""
-List the **current top management** (CEO, CFO, CTO, etc.) of {company_name}.
+List ONLY **strict C-suite** executives currently at {company_name}: CEO, CFO, COO, CTO, CRO, CISO, CPO, CMO, CLO — or other titles that **start with "Chief"** for those functions.
+Exclude board-only, regional heads, VPs, partners, etc. **position is REQUIRED**; if unsure of an allowed C-suite title, omit the person.
 
 For each person provide:
 - name: Full name
-- position: Official title
+- position: Official C-suite title (required)
 - status: "Current"
 - location: Where they are based
 - current_employee_url: ONLY a dedicated individual page URL (e.g., /team/john-smith, /people/jane-doe). Use "" if no dedicated page exists. Do NOT use generic pages like /about, /team, /leadership, or homepage.
@@ -2460,6 +2561,17 @@ Return JSON array only:
         except Exception as e:
             print(f"⚠️ Claude fallback parse failed: {e}")
 
+    raw_mgmt_ct = len(management_results)
+    management_results = [
+        m
+        for m in management_results
+        if isinstance(m, dict)
+        and (m.get("position") or m.get("title") or "").strip()
+        and title_is_strict_csuite((m.get("position") or m.get("title") or "").strip())
+    ]
+    if raw_mgmt_ct != len(management_results):
+        print(f"   → C-suite filter: kept {len(management_results)} / {raw_mgmt_ct} executives (strict Chief / acronym list)")
+
     # =====================================================
     # 4️⃣ Search LinkedIn for EACH Executive in parallel
     # =====================================================
@@ -2467,8 +2579,8 @@ Return JSON array only:
 
     def _find_exec_linkedin(m):
         name = m.get("name", "")
-        position = m.get("position", "")
-        if not name:
+        position = (m.get("position") or m.get("title") or "").strip()
+        if not name or not position or not title_is_strict_csuite(position):
             return
         linkedin_url = search_linkedin_profile(name, company_name, position)
         if linkedin_url:
@@ -2590,14 +2702,14 @@ Return JSON array only:
     seen = set()
     for m in management_results:
         name = m.get("name", "").strip()
-        position = m.get("position", "").strip()
+        position = (m.get("position") or m.get("title") or "").strip()
         status = m.get("status", "Current").capitalize()
         linkedin_url = m.get("linkedin_url", "").strip()
         location = m.get("location", "").strip()
         bio = m.get("bio", "").strip()
         current_employee_url = m.get("current_employee_url", "").strip()
-        
-        if not name or not position:
+
+        if not name or not position or not title_is_strict_csuite(position):
             continue
         
         # Validate that current_employee_url is a dedicated individual page
@@ -2637,81 +2749,166 @@ Return JSON array only:
 
 def enrich_counterparties_with_individuals(events: list, main_company: str) -> list:
     """
-    Second-pass enrichment: Uses Perplexity to find individuals and announcement URLs for each deal.
-    
-    Args:
-        events: List of corporate events with counterparties
-        main_company: The main company being researched
-        
-    Returns:
-        Enriched events with individuals and press release URLs added to counterparties
+    Second-pass enrichment: batched Perplexity calls + deduped SerpAPI for company website / company LinkedIn.
+
+    Individual profile LinkedIn is skipped during /analyze by default (use UI 🔎 Find on event cards).
+    Set ENRICH_INDIVIDUAL_LINKEDIN_IN_ANALYZE=1 to restore bulk Serp calls here.
+
+    Env:
+      COUNTERPARTY_ENRICH_BATCH_SIZE — deals per Perplexity call (default 5)
+      COUNTERPARTY_ENRICH_PARALLEL_BATCHES — concurrent batch requests (default 3)
     """
-    import os, json, requests
-    
+    import os
+    import json
+    import requests
+
     OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_KEY")
     if not OPENROUTER_KEY:
         print("   ⚠️ No OpenRouter key for individual enrichment")
         return events
-    
-    # Enrich ALL events in parallel (max 5 concurrent to respect rate limits)
-    total_events = len(events)
 
-    def _enrich_single_event(idx_event_tuple):
-        idx, event = idx_event_tuple
-        event_short = event.get("Event (short)", "")
-        announcement_date = event.get("Announcement Date", "")
-        closed_date = event.get("Closed Date", "")
-        counterparties = event.get("counterparties", [])
+    _ = main_company
 
-        if not counterparties:
+    try:
+        batch_sz = int(os.getenv("COUNTERPARTY_ENRICH_BATCH_SIZE", "5"))
+    except ValueError:
+        batch_sz = 5
+    batch_sz = max(1, min(batch_sz, 8))
+
+    try:
+        batch_parallel = int(os.getenv("COUNTERPARTY_ENRICH_PARALLEL_BATCHES", "3"))
+    except ValueError:
+        batch_parallel = 3
+    batch_parallel = max(1, min(batch_parallel, 6))
+
+    do_bulk_ind_li = os.getenv("ENRICH_INDIVIDUAL_LINKEDIN_IN_ANALYZE", "").strip().lower() in ("1", "true", "yes")
+    if not do_bulk_ind_li:
+        print(
+            "   → Counterparty individual LinkedIn: deferred (use 🔎 Find in UI per person). "
+            "Set ENRICH_INDIVIDUAL_LINKEDIN_IN_ANALYZE=1 for bulk Serp during /analyze.",
+            flush=True,
+        )
+
+    def _merge_enrichment_list_into_counterparties(counterparties: list, enrichment_data) -> None:
+        if not enrichment_data or not isinstance(enrichment_data, list):
             return
+        print(f"         → Merging {len(enrichment_data)} counterparty blocks from model", flush=True)
+        for enrich_cp in enrichment_data:
+            enrich_company = (enrich_cp.get("company") or "").lower()
+            enrich_url = enrich_cp.get("press_release_url", "")
+            enrich_linkedin = enrich_cp.get("company_linkedin_url", "")
+            enrich_individuals = enrich_cp.get("individuals", [])
+            print(f"         → {enrich_company}: {len(enrich_individuals)} individuals (model)", flush=True)
 
-        cp_names = [cp.get("company_name", "") for cp in counterparties if cp.get("company_name")]
-        if len(cp_names) < 1:
-            print(f"         → Skipping: no counterparty names found")
-            return
+            for cp in counterparties:
+                cp_name = cp.get("company_name", "").lower()
+                if enrich_company in cp_name or cp_name in enrich_company or any(
+                    word in cp_name for word in enrich_company.split() if len(word) > 3
+                ):
+                    if enrich_url and not cp.get("press_release_url"):
+                        cp["press_release_url"] = enrich_url
 
-        date_context = ""
-        if announcement_date:
-            date_context += f"Announced: {announcement_date}"
-        if closed_date:
-            date_context += f", Closed: {closed_date}" if date_context else f"Closed: {closed_date}"
-        if not date_context:
-            date_context = "Date unknown"
+                    if enrich_linkedin and not cp.get("company_linkedin_url"):
+                        cp["company_linkedin_url"] = enrich_linkedin
 
-        print(f"      [{idx+1}/{total_events}] Enriching: {event_short[:50]}...")
+                    if "individuals" not in cp:
+                        cp["individuals"] = []
 
-        query = f"""For the corporate deal: "{event_short}"
-Date: {date_context}
-Companies involved: {', '.join(cp_names)}
+                    existing_names = [i.get("name", "").lower() for i in cp["individuals"]]
+                    for ind in enrich_individuals:
+                        ind_name = ind.get("name", "")
+                        ind_title = (ind.get("title") or "").strip()
+                        if not ind_name or not ind_title or not title_is_strict_csuite(ind_title):
+                            continue
+                        if ind_name and ind_name.lower() not in existing_names:
+                            cp["individuals"].append(
+                                {
+                                    "name": ind_name,
+                                    "title": ind_title,
+                                    "linkedin_url": ind.get("linkedin_url", ""),
+                                }
+                            )
+                            existing_names.append(ind_name.lower())
+                    break
 
-Find for EACH company involved:
+    rules_block = """Find for EACH legal entity / counterparty named under that deal:
 
-1. **KEY EXECUTIVES** involved in this deal:
-   - CEO, President, or Managing Director
-   - CFO or deal leads
-   - Executives quoted in press releases
-   - PE firm Partners (if applicable)
+1. **C-SUITE INDIVIDUALS** for that company:
+   - PREFERRED: C-suite executives (CEO, CFO, COO, CTO, CRO, CISO, CPO, CMO, CLO, or titles starting with Chief) who are explicitly quoted or named in the deal announcement for that party.
+   - ALSO ACCEPTABLE: The known CEO or top executive of the target/acquirer company at the approximate time of the deal, even if not explicitly quoted.
+   - For INVESTOR counterparties (VC firms, PE funds): include the General Partner, Managing Partner, or Partner who led this investment if known.
+   **Hard cap: at most 2 individuals per company.**
+   **title is REQUIRED** per person; use their actual title (e.g. "General Partner", "CEO", "Chief Financial Officer").
 
-2. **ANNOUNCEMENT URL** - each company's own press release or announcement about this deal
+2. **ANNOUNCEMENT URL** — that company's own press release for this deal, if known.
 
-Return JSON with this EXACT format:
-{{
-  "counterparties": [
-    {{
-      "company": "Company Name",
-      "press_release_url": "https://company.com/news/deal-announcement",
-      "company_linkedin_url": "https://www.linkedin.com/company/company-name/",
-      "individuals": [
-        {{"name": "Full Name", "title": "Title at Company", "linkedin_url": ""}},
-        {{"name": "Full Name", "title": "Title at Company", "linkedin_url": ""}}
+Return ONLY valid JSON, no markdown. Shape:
+{
+  "deals": [
+    {
+      "batch_event_index": 0,
+      "counterparties": [
+        {
+          "company": "Company Name",
+          "press_release_url": "",
+          "company_linkedin_url": "",
+          "individuals": [{"name": "", "title": "", "linkedin_url": ""}]
+        }
       ]
-    }}
+    }
   ]
-}}
+}
 
-Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
+batch_event_index MUST match the deal section index (0 .. N-1). Include every deal section below."""
 
+    def _parse_json_with_deals(raw: str):
+        start_obj = raw.find("{")
+        end_obj = raw.rfind("}") + 1
+        if start_obj == -1 or end_obj <= start_obj:
+            return None
+        try:
+            return json.loads(raw[start_obj:end_obj])
+        except Exception:
+            return None
+
+    def _enrich_batch(chunk: list) -> None:
+        """chunk: [(global_event_idx, event), ...] — each event must have ≥1 named counterparty."""
+        deal_sections = []
+        chunk_events_ordered: list = []
+        bi = 0
+        for _gi, ev in chunk:
+            event_short = ev.get("Event (short)", "")
+            announcement_date = ev.get("Announcement Date", "")
+            closed_date = ev.get("Closed Date", "")
+            counterparties = ev.get("counterparties", [])
+            cp_names = [cp.get("company_name", "") for cp in counterparties if cp.get("company_name")]
+            if not cp_names:
+                continue
+            date_context = ""
+            if announcement_date:
+                date_context += f"Announced: {announcement_date}"
+            if closed_date:
+                date_context += f", Closed: {closed_date}" if date_context else f"Closed: {closed_date}"
+            if not date_context:
+                date_context = "Date unknown"
+            deal_sections.append(
+                f"### Deal batch_event_index={bi}\n"
+                f'Short description: "{event_short}"\n'
+                f"Dates: {date_context}\n"
+                f"Companies involved: {', '.join(cp_names)}\n"
+            )
+            chunk_events_ordered.append(ev)
+            bi += 1
+        if not deal_sections:
+            return
+
+        query = (
+            f"You will enrich {len(deal_sections)} distinct corporate deals in ONE response.\n"
+            f"{rules_block}\n\n---\n" + "\n".join(deal_sections)
+        )
+
+        mtok = min(16000, 800 + 2200 * len(deal_sections))
+        print(f"      📦 Perplexity batch: {len(deal_sections)} deals in 1 call (max_tokens={mtok})…", flush=True)
         try:
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -2720,85 +2917,85 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
                     "model": "perplexity/sonar-pro",
                     "messages": [{"role": "user", "content": query}],
                     "temperature": 0.1,
-                    "max_tokens": 2000
+                    "max_tokens": mtok,
                 },
-                timeout=45
+                timeout=90,
             )
+            if response.status_code != 200:
+                print(f"      ⚠️ Batch enrichment HTTP {response.status_code}", flush=True)
+                return
+            raw = response.json()["choices"][0]["message"]["content"].strip()
+            data = _parse_json_with_deals(raw)
+            if not data:
+                print("      ⚠️ Batch enrichment JSON parse failed", flush=True)
+                return
+            deals = data.get("deals")
+            if not isinstance(deals, list):
+                print("      ⚠️ Batch enrichment missing deals[]", flush=True)
+                return
+            by_bi: Dict[int, list] = {}
+            for d in deals:
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    bidx = int(d.get("batch_event_index", -1))
+                except (TypeError, ValueError):
+                    continue
+                if bidx < 0:
+                    continue
+                by_bi[bidx] = d.get("counterparties") or []
 
-            if response.status_code == 200:
-                raw = response.json()["choices"][0]["message"]["content"].strip()
+            n_ev = len(chunk_events_ordered)
 
-                start_obj = raw.find('{')
-                end_obj = raw.rfind('}') + 1
-                start_arr = raw.find('[')
-                end_arr = raw.rfind(']') + 1
+            # Model sometimes uses 1-based batch_event_index (1..N with no 0)
+            if by_bi and 0 not in by_bi:
+                ks = sorted(by_bi.keys())
+                if ks == list(range(1, n_ev + 1)):
+                    by_bi = {k - 1: v for k, v in by_bi.items()}
 
-                enrichment_data = None
+            def _cps_from_deal_elem(elem):
+                if isinstance(elem, list):
+                    return elem
+                if isinstance(elem, dict):
+                    return elem.get("counterparties") or []
+                return []
 
-                if start_obj != -1 and end_obj > start_obj:
-                    try:
-                        enrichment_data = json.loads(raw[start_obj:end_obj])
-                        if "counterparties" in enrichment_data:
-                            enrichment_data = enrichment_data["counterparties"]
-                    except Exception:
-                        pass
+            # Positional fallback when batch_event_index is missing or wrong for some rows.
+            for bidx in range(n_ev):
+                if bidx not in by_bi and bidx < len(deals):
+                    cps = _cps_from_deal_elem(deals[bidx])
+                    if cps:
+                        by_bi[bidx] = cps
+                        print(f"      ℹ️ Batch: used positional fallback for index={bidx}", flush=True)
 
-                if not enrichment_data and start_arr != -1 and end_arr > start_arr:
-                    try:
-                        enrichment_data = json.loads(raw[start_arr:end_arr])
-                    except Exception:
-                        pass
-
-                if enrichment_data and isinstance(enrichment_data, list):
-                    print(f"         → Found {len(enrichment_data)} companies in enrichment response")
-                    for enrich_cp in enrichment_data:
-                        enrich_company = enrich_cp.get("company", "").lower()
-                        enrich_url = enrich_cp.get("press_release_url", "")
-                        enrich_linkedin = enrich_cp.get("company_linkedin_url", "")
-                        enrich_individuals = enrich_cp.get("individuals", [])
-                        print(f"         → {enrich_company}: {len(enrich_individuals)} individuals found")
-
-                        for cp in counterparties:
-                            cp_name = cp.get("company_name", "").lower()
-                            if enrich_company in cp_name or cp_name in enrich_company or \
-                               any(word in cp_name for word in enrich_company.split() if len(word) > 3):
-
-                                if enrich_url and not cp.get("press_release_url"):
-                                    cp["press_release_url"] = enrich_url
-
-                                if enrich_linkedin and not cp.get("company_linkedin_url"):
-                                    cp["company_linkedin_url"] = enrich_linkedin
-
-                                if "individuals" not in cp:
-                                    cp["individuals"] = []
-
-                                existing_names = [i.get("name", "").lower() for i in cp["individuals"]]
-                                for ind in enrich_individuals:
-                                    ind_name = ind.get("name", "")
-                                    if ind_name and ind_name.lower() not in existing_names:
-                                        cp["individuals"].append({
-                                            "name": ind_name,
-                                            "title": ind.get("title", ""),
-                                            "linkedin_url": ind.get("linkedin_url", "")
-                                        })
-                                        existing_names.append(ind_name.lower())
-                                break
-
+            for bidx, ev in enumerate(chunk_events_ordered):
+                cp_list = by_bi.get(bidx)
+                if not cp_list:
+                    print(f"      ⚠️ Batch: no counterparties for batch_event_index={bidx}", flush=True)
+                    continue
+                _merge_enrichment_list_into_counterparties(ev.get("counterparties") or [], cp_list)
         except Exception as e:
-            print(f"      ⚠️ Enrichment failed for '{event_short[:30]}...': {e}")
+            print(f"      ⚠️ Batch enrichment error: {e}", flush=True)
 
-    # Run all event enrichments in parallel (max 5 concurrent Perplexity calls)
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        list(executor.map(_enrich_single_event, enumerate(events)))
-    
-    # =====================================================
-    # Post-process: Find Website URLs and verify LinkedIn URLs
-    # AI often hallucinates URLs, so we verify/find with SerpAPI
-    # Run all counterparties in parallel (each cp is fully independent)
-    # =====================================================
-    print(f"\n🔍 Finding counterparty website & LinkedIn URLs via search (parallel)...")
+    indexed = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if ev.get("counterparties")
+        and any((cp.get("company_name") or "").strip() for cp in (ev.get("counterparties") or []))
+    ]
+    batches = [indexed[j : j + batch_sz] for j in range(0, len(indexed), batch_sz)]
+    print(
+        f"\n   🤝 Counterparty enrichment: {len(indexed)} events with named counterparties → "
+        f"{len(batches)} batched Perplexity call(s) (batch_size≤{batch_sz}, parallel≤{batch_parallel})",
+        flush=True,
+    )
 
-    # Collect every (event, cp) pair so we can process them all concurrently
+    if batches:
+        with ThreadPoolExecutor(max_workers=batch_parallel) as executor:
+            list(executor.map(_enrich_batch, batches))
+
+    print("\n🔍 Resolving counterparty websites & company LinkedIn (deduped by company name)…", flush=True)
+
     all_cp_pairs = [
         (event, cp)
         for event in events
@@ -2806,15 +3003,34 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
         if cp.get("company_name")
     ]
 
-    def _enrich_single_cp(event_cp_tuple):
-        _event, cp = event_cp_tuple
+    def _cp_key(cp: dict) -> str:
+        return (cp.get("company_name") or "").strip().lower()
+
+    leaders: Dict[str, dict] = {}
+    followers: Dict[str, list] = {}
+    for _event, cp in all_cp_pairs:
+        k = _cp_key(cp)
+        if not k:
+            continue
+        if k not in leaders:
+            leaders[k] = cp
+            followers[k] = []
+        elif cp is not leaders[k]:
+            followers[k].append(cp)
+
+    def _propagate_url_fields(lead: dict, follower: dict) -> None:
+        for fld in ("company_website", "company_url", "website", "company_linkedin_url"):
+            v = lead.get(fld)
+            if v and not follower.get(fld):
+                follower[fld] = v
+
+    def _resolve_company_site_and_li(cp: dict) -> None:
         cp_name = cp.get("company_name", "")
         cp_website = cp.get("company_website", "") or cp.get("company_url", "") or cp.get("website", "")
         existing_linkedin = cp.get("company_linkedin_url", "")
 
-        # 1) Find Website URL if missing
         if not cp_website:
-            print(f"   → Searching website for: {cp_name}...")
+            print(f"   → Searching website for: {cp_name}…", flush=True)
             found_website = search_company_website(cp_name)
             if found_website:
                 cp["company_website"] = found_website
@@ -2822,56 +3038,107 @@ Return ONLY valid JSON, no other text. Include ALL companies from the deal."""
                 cp["website"] = found_website
                 cp_website = found_website
             else:
-                print(f"   ⚠️ No website found for {cp_name}")
+                print(f"   ⚠️ No website found for {cp_name}", flush=True)
 
-        # 2) Find/Verify LinkedIn URL
         needs_linkedin_search = False
         if not existing_linkedin:
             needs_linkedin_search = True
         elif existing_linkedin:
-            slug = existing_linkedin.split('/company/')[-1].rstrip('/').lower() if '/company/' in existing_linkedin else ""
-            name_slug = cp_name.lower().replace(' ', '-').replace(',', '').replace('.', '').replace("'", '')
-            if slug and (slug == name_slug or slug.replace('-', '') == name_slug.replace('-', '')):
+            slug = (
+                existing_linkedin.split("/company/")[-1].rstrip("/").lower()
+                if "/company/" in existing_linkedin
+                else ""
+            )
+            name_slug = cp_name.lower().replace(" ", "-").replace(",", "").replace(".", "").replace("'", "")
+            if slug and (slug == name_slug or slug.replace("-", "") == name_slug.replace("-", "")):
                 needs_linkedin_search = True
 
         if needs_linkedin_search:
-            print(f"   → Searching LinkedIn for: {cp_name}...")
+            print(f"   → Searching company LinkedIn for: {cp_name}…", flush=True)
             real_linkedin = search_company_linkedin(cp_name, cp_website)
             if real_linkedin:
                 if existing_linkedin and existing_linkedin != real_linkedin:
-                    print(f"   ✅ Corrected LinkedIn: {existing_linkedin} → {real_linkedin}")
+                    print(f"   ✅ Corrected LinkedIn: {existing_linkedin} → {real_linkedin}", flush=True)
                 else:
-                    print(f"   ✅ Found LinkedIn: {real_linkedin}")
+                    print(f"   ✅ Found LinkedIn: {real_linkedin}", flush=True)
                 cp["company_linkedin_url"] = real_linkedin
             elif not existing_linkedin:
-                print(f"   ⚠️ No LinkedIn found for {cp_name}")
+                print(f"   ⚠️ No LinkedIn found for {cp_name}", flush=True)
 
-        # 3) Find LinkedIn URLs for individuals — parallelized per individual
-        individuals = cp.get("individuals", [])
-        if individuals:
-            print(f"   👤 Searching LinkedIn for {len(individuals)} individuals at {cp_name} (parallel)...")
+    print(f"   → {len(all_cp_pairs)} counterparty rows, {len(leaders)} unique company names", flush=True)
+
+    leader_items = list(leaders.items())
+
+    def _run_leader(item):
+        _k, cp = item
+        _resolve_company_site_and_li(cp)
+
+    with ThreadPoolExecutor(max_workers=8) as cp_ex:
+        list(cp_ex.map(_run_leader, leader_items))
+
+    for k, lead in leaders.items():
+        for fo in followers[k]:
+            _propagate_url_fields(lead, fo)
+
+    if do_bulk_ind_li:
+
+        def _enrich_individuals_for_cp(event_cp_tuple):
+            _event, cp = event_cp_tuple
+            cp_name = cp.get("company_name", "")
+            individuals = [
+                ind
+                for ind in (cp.get("individuals") or [])
+                if isinstance(ind, dict)
+                and (ind.get("name") or "").strip()
+                and (ind.get("title") or "").strip()
+                and title_is_strict_csuite((ind.get("title") or "").strip())
+            ]
+            cp["individuals"] = individuals
+            if not individuals:
+                return
+
+            print(
+                f"   👤 Searching LinkedIn for {len(individuals)} individuals at {cp_name} (parallel)…",
+                flush=True,
+            )
 
             def _find_ind_linkedin(ind):
                 ind_name = ind.get("name", "")
-                ind_title = ind.get("title", "")
+                ind_title = (ind.get("title") or "").strip()
                 existing_ind_linkedin = ind.get("linkedin_url", "")
                 if not ind_name:
+                    return
+                if not ind_title or not title_is_strict_csuite(ind_title):
                     return
                 if existing_ind_linkedin and "linkedin.com/in/" in existing_ind_linkedin:
                     return
                 person_linkedin = search_linkedin_profile(ind_name, cp_name, ind_title)
                 if person_linkedin:
                     ind["linkedin_url"] = person_linkedin
-                    print(f"      ✅ Found LinkedIn for {ind_name}: {person_linkedin}")
+                    print(f"      ✅ Found LinkedIn for {ind_name}: {person_linkedin}", flush=True)
                 else:
-                    print(f"      ⚠️ No LinkedIn found for {ind_name}")
+                    print(f"      ⚠️ No LinkedIn found for {ind_name}", flush=True)
 
             with ThreadPoolExecutor(max_workers=min(len(individuals), 5)) as ind_ex:
                 list(ind_ex.map(_find_ind_linkedin, individuals))
 
-    # Process all counterparties concurrently (cap at 8 workers to avoid hammering SerpAPI)
-    with ThreadPoolExecutor(max_workers=8) as cp_ex:
-        list(cp_ex.map(_enrich_single_cp, all_cp_pairs))
+        with ThreadPoolExecutor(max_workers=8) as ind_ex:
+            list(ind_ex.map(_enrich_individuals_for_cp, all_cp_pairs))
+    else:
+
+        def _strip_and_filter_individuals_only(event_cp_tuple):
+            _event, cp = event_cp_tuple
+            individuals = [
+                ind
+                for ind in (cp.get("individuals") or [])
+                if isinstance(ind, dict)
+                and (ind.get("name") or "").strip()
+                and (ind.get("title") or "").strip()
+                and title_is_strict_csuite((ind.get("title") or "").strip())
+            ]
+            cp["individuals"] = individuals
+
+        list(map(_strip_and_filter_individuals_only, all_cp_pairs))
 
     return events
 
@@ -2954,6 +3221,33 @@ def detect_company_type(company_name: str, serpapi_key: str) -> dict:
                 elif year >= 2010:
                     startup_score += 1
                 break
+
+        # Yahoo Finance: mega-cap EV forces enterprise regardless of snippet tie / thin startup signals
+        if yf is not None:
+            try:
+                ticker = lookup_ticker(company_name)
+                if ticker:
+                    ydata = get_yahoo_finance_data(ticker)
+                    ev_m = ydata.get("enterprise_value_m") or 0
+                    if ev_m >= 1000:
+                        print(
+                            f"   📈 Yahoo override: large cap EV=${ev_m}M → forcing enterprise",
+                            flush=True,
+                        )
+                        result["company_type"] = "enterprise"
+                        result["estimated_size"] = "large"
+                        result["is_startup"] = False
+                        result["is_small_company"] = False
+                        result["confidence"] = 1.0
+                        print(
+                            f"   📊 Company type: {result['company_type']} (startup_score={startup_score}, enterprise_score={enterprise_score})",
+                            flush=True,
+                        )
+                        if result["founded_year"]:
+                            print(f"   📅 Founded: {result['founded_year']}")
+                        return result
+            except Exception:
+                pass
         
         # Determine company type
         total_signals = startup_score + enterprise_score
@@ -2971,13 +3265,11 @@ def detect_company_type(company_name: str, serpapi_key: str) -> dict:
             result["company_type"] = "enterprise"
             result["estimated_size"] = "large"
         else:
-            # If unclear, check if we found ANY M&A history
-            if "acquired" in all_snippets_lower or "acquisition" in all_snippets_lower:
-                result["company_type"] = "enterprise"
-            else:
-                # Default to startup-friendly search for unknown companies
-                result["is_small_company"] = True
-                result["company_type"] = "small_company"
+            # Equal scores: prefer enterprise — low snippet overlap ties wrongly favored startups before.
+            result["company_type"] = "enterprise"
+            result["estimated_size"] = "large"
+            result["is_startup"] = False
+            result["is_small_company"] = False
         
         print(f"   📊 Company type: {result['company_type']} (startup_score={startup_score}, enterprise_score={enterprise_score})")
         if result["founded_year"]:
@@ -2989,12 +3281,34 @@ def detect_company_type(company_name: str, serpapi_key: str) -> dict:
     return result
 
 
+def resolve_company_search_label(name: str) -> str:
+    """
+    When users paste a website (e.g. https://www.equifax.com/), Serp may still return hits but the CE
+    LLM prompt must name the real company — otherwise extraction returns empty arrays quickly.
+    """
+    s = (name or "").strip()
+    if not s.startswith(("http://", "https://")):
+        return s
+    try:
+        from urllib.parse import urlparse
+
+        netloc = urlparse(s).netloc.replace("www.", "").split(":")[0]
+        if not netloc:
+            return s
+        parts = netloc.split(".")
+        label = parts[0] if parts else netloc
+        label = label.replace("-", " ").strip()
+        return label.title() if label else s
+    except Exception:
+        return s
+
+
 def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     """
     Fetches and extracts corporate M&A events for a company using web search and LLM.
     Automatically detects if company is a startup and adjusts search strategy accordingly.
     
-    OPTIMIZED: Uses parallel SerpAPI queries for ~5x faster search.
+    OPTIMIZED: Parallel SerpAPI queries; optional parallel LLM shards (CORPORATE_EVENTS_SHARD_SIZE, 0 = single call).
     
     Args:
         company_name: Name of the company to search for
@@ -3010,6 +3324,14 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
     if not OPENROUTER_KEY or not SERPAPI_KEY:
         print("Missing API keys")
         return []
+
+    _ce_raw_input = (company_name or "").strip()
+    company_name = resolve_company_search_label(_ce_raw_input)
+    if company_name != _ce_raw_input:
+        print(
+            f"   → Corporate events: resolved label {company_name!r} from pasted URL/query {_ce_raw_input[:48]!r}…",
+            flush=True,
+        )
 
     print(f"⚡ Fetching corporate events for: {company_name} (max_events={max_events})")
     
@@ -3083,40 +3405,43 @@ def generate_corporate_events(company_name: str, max_events: int = 20) -> list:
             f'"{company_name}" M&A deal OR transaction',
         ]
 
+    shard_sz = corporate_events_shard_size()
+    use_legacy_ce_llm = shard_sz <= 0 or len(queries) <= 1
+
     # ========================================
     # 🚀 PARALLEL SEARCH EXECUTION
     # ========================================
     start_time = time.time()
     print(f"   → Running {len(queries)} search queries in PARALLEL...")
-    
-    search_results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=15)
-    
-    elapsed = time.time() - start_time
-    print(f"   ✅ Parallel search completed in {elapsed:.1f}s ({len(search_results)} unique results)")
-    
-    print(f"   → Collected {len(search_results)} unique search results")
 
-    if not search_results:
-        print("❌ No search results found")
-        return []
+    grouped_for_shards = None
+    if use_legacy_ce_llm:
+        search_results = serpapi_parallel_search(queries, SERPAPI_KEY, num_results=15)
+        elapsed = time.time() - start_time
+        print(f"   ✅ Parallel search completed in {elapsed:.1f}s ({len(search_results)} unique results)")
+        print(f"   → Collected {len(search_results)} unique search results")
+        if not search_results:
+            print("❌ No search results found")
+            return []
+        results_to_analyze = len(search_results)
+        context = format_ce_journal_from_hits(search_results)
+    else:
+        grouped_for_shards = serpapi_parallel_search_grouped(queries, SERPAPI_KEY, num_results=15)
+        elapsed = time.time() - start_time
+        total_hits = sum(len(h[1]) for h in grouped_for_shards)
+        print(f"   ✅ Parallel grouped search completed in {elapsed:.1f}s ({total_hits} hits across {len(queries)} queries)")
+        if total_hits == 0:
+            print("❌ No search results found")
+            return []
+        results_to_analyze = total_hits
+        context = ""
 
-    # Format context - use all results for comprehensive coverage
-    context = ""
-    results_to_analyze = len(search_results)
-    for i, result in enumerate(search_results, 1):
-        pd = (result.get("published_date") or "").strip()
-        pd_line = f"Search result date: {pd}\n" if pd else ""
-        context += (
-            f"[{i}] {result['title']}\n{result['snippet']}\n"
-            f"{pd_line}"
-            f"Source: {result['link']}\n\n"
-        )
+    mode_msg = "legacy single LLM" if use_legacy_ce_llm else f"sharded ({shard_sz} queries/shard)"
+    print(f"   → Preparing {results_to_analyze} snippets for AI extraction ({mode_msg})...", flush=True)
 
-    print(f"   → Sending {results_to_analyze} results to AI for extraction...")
-    
     # Determine if this is a startup for prompt customization
     is_startup_search = company_info.get("is_startup") or company_info.get("is_small_company") or company_info.get("company_type") in ["startup", "small_company"]
-    
+
     if is_startup_search:
         extraction_checklist = f'''EXTRACTION CHECKLIST FOR STARTUPS - scan for ALL of these:
 □ FUNDING ROUNDS (HIGHEST PRIORITY for startups):
@@ -3179,11 +3504,13 @@ COMMON MISSED DEALS - pay special attention to:
 - Climate tech, fintech, healthtech sector deals
 - Early-stage investments and accelerator programs'''
 
-    prompt = f'''Extract ALL corporate events for "{company_name}" from the {results_to_analyze} search results below.
+    def build_ce_prompt(results_to_analyze: int, max_events_return: int, journal_context: str, shard_note: str = "") -> str:
+        note_prefix = (shard_note.strip() + "\n\n") if shard_note.strip() else ""
+        return f'''Extract ALL corporate events for "{company_name}" from the {results_to_analyze} search results below.
 
-YOUR GOAL: Find and return up to {max_events} UNIQUE corporate events including M&A, funding, grants, accelerators, and partnerships.
+YOUR GOAL: Find and return up to {max_events_return} UNIQUE corporate events including M&A, funding, grants, accelerators, and partnerships.
 
-{extraction_checklist}
+{note_prefix}{extraction_checklist}
 
 EXTRACTION RULES:
 1. Each unique target company = separate event (even if small deal)
@@ -3193,7 +3520,7 @@ EXTRACTION RULES:
 5. If date is unclear, use the article date or "Jan 1, [year]" 
 6. Extract ALL deals - do not filter by size or importance
 
-OUTPUT: Return exactly {max_events} events if that many exist in the search results.
+OUTPUT: Return exactly {max_events_return} events if that many exist in the search results.
 
 For EACH verified event, extract these EXACT fields:
 
@@ -3209,14 +3536,14 @@ For EACH verified event, extract these EXACT fields:
    
    DATE ACCURACY RULES (CRITICAL):
    - ONLY use dates tied to THIS transaction (announcement, signing, closing) — not company founding, prior milestones, or unrelated history in the snippet.
-   - NEVER use "founded in YYYY", "established in", or "since YYYY" as announcement_date or closed_date unless the snippet is explicitly about THIS deal and uses that date for the deal.
-   - Look for phrases like "announced on [date]", "press release dated", "completed on [date]", "closed [date]".
-   - If each result shows "Search result date: …" and you set source_url to that result's URL, prefer that line for announcement_date when the body does not give a clearer explicit announcement date (it is the article/listing date, not a random older year in the text).
-   - If article mentions year but not exact date, check the article date/URL for clues
-   - If ONLY year is known: use "Jan 1, YYYY" and add "(approximate)" to event description
+   - NEVER use "founded in YYYY", "established in", "since YYYY", "incorporated", or "started" as announcement_date or closed_date unless the snippet is explicitly about THIS deal and uses that date for the deal.
+   - Look for phrases like "announced on [date]", "press release dated", "completed on [date]", "closed [date]", "signed on [date]".
+   - "Search result date: …" is the article's publish/index date. Use it as announcement_date ONLY when ALL of the following apply: (a) the source URL is a direct company press release domain or a major financial news outlet (not a database, directory, aggregator, or Wikipedia), AND (b) the body text contains no more specific deal-announcement phrase. NEVER use the search result date when it is obviously from a listing site, news aggregator, or is significantly older than the deal context.
+   - A year mentioned as context (e.g. "the 2018 acquisition") is NOT the announcement date of the current article — do not confuse background history with the event date.
+   - If article mentions year but not exact date, use "Jan 1, YYYY" and add "(approximate)" to the event description.
    - Do not guess — leave dates empty rather than picking an unrelated older date from the snippet.
-   - Cross-reference dates across multiple sources when possible
-   - Prefer announcement_date if only one date is available
+   - Cross-reference dates across multiple sources when possible.
+   - Prefer announcement_date if only one date is available.
 
 4. **event_short**: Precise description following these patterns:
    - Acquisition: "{company_name} acquired [Target] to [brief purpose]"
@@ -3291,6 +3618,14 @@ For EACH verified event, extract these EXACT fields:
    - Extract the FULL URL exactly as shown in the search results
    - If no URL available, use empty string ""
 
+9b. **investment_amount_m**: (OPTIONAL — funding/investment events only) Deal amount in millions of the base currency as a number (e.g., 25.5 for $25.5M). Use null if not a funding event or if amount is undisclosed.
+
+9c. **investment_currency**: (OPTIONAL — funding/investment events only) ISO currency code (e.g., "USD", "EUR", "GBP"). Use "" if not a funding event or unknown.
+
+9d. **funding_stage**: (OPTIONAL — funding/investment events only) Funding round label, e.g. "Seed", "Series A", "Series B", "Series C", "Growth", "Venture Debt". Use "" if not applicable.
+
+9e. **deal_terms**: (OPTIONAL — M&A/acquisition events only) Brief deal structure description, e.g. "all-cash acquisition", "all-stock merger", "mixed cash and stock", "leveraged buyout". Use "" if not an M&A event or if terms are undisclosed.
+
 10. **counterparties**: Array of ALL companies involved in this deal with their ROLES.
    
    COUNTERPARTY TYPES (use exact type_id):
@@ -3309,12 +3644,13 @@ For EACH verified event, extract these EXACT fields:
    - role_description: Brief description of their role in this specific deal (REQUIRED)
    - company_linkedin_url: LinkedIn company page URL if known, otherwise ""
    - press_release_url: Company's own press release URL for this deal if found, otherwise ""
-   - individuals: Array of key people mentioned in press releases/articles for this deal
+   - individuals: Array of **strict C-suite** people quoted or named for this deal ONLY:
+     Allowed: titles starting with **Chief** or CEO, CFO, COO, CTO, CRO, CISO, CPO, CMO, CLO as clear roles.
+     **title is REQUIRED** — if you cannot assign a confident allowed C-suite title, omit the person (do not search filler names).
      For each individual include:
      - name: Full name (e.g., "Peter Berweger")
-     - title: Role at the company (e.g., "CEO", "CFO", "Managing Director")
+     - title: Allowed C-suite title only (e.g., "Chief Financial Officer", "CEO") — REQUIRED
      - linkedin_url: "" (leave empty for now)
-     Look for: CEOs, CFOs, deal leads, executives quoted in press releases about this transaction
 
 11. **advisors**: Array of professional advisory firms that advised on this transaction.
    
@@ -3368,7 +3704,7 @@ SMALL/REGIONAL DEALS - IMPORTANT:
 ✓ Even if limited information is available, include the deal with what data you have
 
 Search results to analyze:
-{context}
+{journal_context}
 
 Return ONLY valid JSON array (no markdown, no explanation):
 [
@@ -3381,6 +3717,10 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "deal_status": "In Exclusivity",
     "value_usd": "$44,000,000,000 (enterprise value)",
     "source_url": "https://press.spglobal.com/2020-11-30-S-P-Global-and-IHS-Markit-to-Merge",
+    "investment_amount_m": null,
+    "investment_currency": "",
+    "funding_stage": "",
+    "deal_terms": "all-stock merger",
     "counterparties": [
       {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Douglas Peterson", "title": "President & CEO", "linkedin_url": ""}}]}},
       {{"company_name": "IHS Markit", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Lance Uggla", "title": "Chairman & CEO", "linkedin_url": ""}}]}}
@@ -3413,8 +3753,12 @@ Return ONLY valid JSON array (no markdown, no explanation):
     "deal_status": "Completed",
     "value_usd": "Undisclosed",
     "source_url": "https://www.spglobal.com/visible-alpha-acquisition",
+    "investment_amount_m": null,
+    "investment_currency": "",
+    "funding_stage": "",
+    "deal_terms": "all-cash acquisition",
     "counterparties": [
-      {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Martina Cheung", "title": "President, S&P Global Market Intelligence", "linkedin_url": ""}}]}},
+      {{"company_name": "S&P Global", "type_id": 18, "type": "Acquirer", "role_description": "Acquiring company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Martina Cheung", "title": "Chief Operating Officer", "linkedin_url": ""}}]}},
       {{"company_name": "Visible Alpha", "type_id": 17, "type": "Target", "role_description": "Target company", "company_linkedin_url": "", "press_release_url": "", "individuals": [{{"name": "Scott Ryles", "title": "CEO", "linkedin_url": ""}}]}}
     ],
     "advisors": [
@@ -3426,143 +3770,107 @@ Return ONLY valid JSON array (no markdown, no explanation):
 JSON:'''
 
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "anthropic/claude-sonnet-4.6",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,  # Slightly increased for more creative extraction
-                "max_tokens": 32000  # Doubled to allow more events with enhanced counterparty data
-            },
-            timeout=180
-        )
-        response.raise_for_status()
-        raw = response.json()["choices"][0]["message"]["content"].strip()
+        if use_legacy_ce_llm:
+            prompt = build_ce_prompt(results_to_analyze, max_events, context, shard_note="")
+            print("   🤖 CE single-call LLM: OpenRouter (may take 1–4 min for large journals)...", flush=True)
+            events = openrouter_extract_ce_events_json(
+                prompt, OPENROUTER_KEY, max_tokens=32000, timeout=180, max_retries=2
+            )
+            result = normalize_llm_ce_events_to_rows(events, company_name, max_events)
+        else:
+            shards = []
+            for grp_i in range(0, len(grouped_for_shards), shard_sz):
+                chunk = grouped_for_shards[grp_i : grp_i + shard_sz]
+                hits = []
+                seen_urls = set()
+                for _q, reslist in chunk:
+                    for r in reslist:
+                        url = (r.get("link") or "").strip()
+                        if url:
+                            if url in seen_urls:
+                                continue
+                            seen_urls.add(url)
+                        hits.append(r)
+                shards.append(hits)
 
-        # Extract JSON
-        start = raw.find('[')
-        end = raw.rfind(']') + 1
-        if start == -1 or end == 0:
-            print("No JSON found in response")
-            return []
+            total_shards = len(shards)
+            num_shards_approx = (len(queries) + shard_sz - 1) // max(1, shard_sz)
+            per_shard_cap = max(max_events, min(120, max_events * max(5, num_shards_approx)))
 
-        events = json.loads(raw[start:end])
+            try:
+                _ce_conc = int(os.getenv("CORPORATE_EVENTS_LLM_CONCURRENCY", "4"))
+            except ValueError:
+                _ce_conc = 4
+            _ce_conc = max(1, min(_ce_conc, 12))
+            print(
+                f"   🤖 CE parallel LLM: {total_shards} shard(s), up to {_ce_conc} concurrent OpenRouter calls "
+                f"(read timeout 180s/call; expect ~1–3 min wall-clock per wave)",
+                flush=True,
+            )
 
-        # Transform to match your table structure with counterparties
-        result = []
-        for i, e in enumerate(events[:max_events], 1):
-            # Process counterparties with enhanced fields
-            counterparties = []
-            raw_counterparties = e.get("counterparties", [])
-            for cp in raw_counterparties:
-                # Process individuals for this counterparty
-                individuals = []
-                raw_individuals = cp.get("individuals", [])
-                for ind in raw_individuals:
-                    individuals.append({
-                        "name": str(ind.get("name", "")).strip(),
-                        "title": str(ind.get("title", "")).strip(),
-                        "linkedin_url": str(ind.get("linkedin_url", "")).strip()
-                    })
-                
-                counterparties.append({
-                    "company_name": str(cp.get("company_name", "")).strip(),
-                    "type_id": int(cp.get("type_id", 0)),
-                    "type": str(cp.get("type", "Unknown")).strip(),
-                    "role_description": str(cp.get("role_description", "")).strip(),
-                    "company_linkedin_url": str(cp.get("company_linkedin_url", "")).strip(),
-                    "press_release_url": str(cp.get("press_release_url", "")).strip(),
-                    "individuals": individuals
-                })
-            
-            # Use announcement_date as primary, fall back to date field for backwards compatibility
-            announcement_date = str(e.get("announcement_date", e.get("date", ""))).strip()
-            closed_date = str(e.get("closed_date", "")).strip()
-            
-            # For display, prefer announcement_date, then closed_date
-            display_date = announcement_date if announcement_date else closed_date
-            if not display_date:
-                display_date = "Unknown"
-            
-            # Extract deal type and status (new fields)
-            deal_type = str(e.get("deal_type", e.get("event_type", "Unknown"))).strip()
-            deal_status = str(e.get("deal_status", "")).strip()
-            # Auto-set status to Completed if closed_date exists and no status provided
-            if not deal_status and closed_date:
-                deal_status = "Completed"
-            elif not deal_status:
-                deal_status = "Unknown"
-            
-            # Extract advisors (EXCLUDING legal advisors)
-            advisors = []
-            # Known legal advisor indicators
-            legal_keywords = ['legal', 'law', 'counsel', 'attorney', 'solicitor', 'llp', 'lawyers']
-            known_law_firms = [
-                'skadden', 'sullivan & cromwell', 'sullivan cromwell', 'wachtell', 'kirkland',
-                'simpson thacher', 'latham', 'davis polk', 'freshfields', 'clifford chance',
-                'allen & overy', 'linklaters', 'white & case', 'cleary gottlieb', 'cravath',
-                'debevoise', 'paul weiss', 'weil gotshal', 'milbank', 'gibson dunn',
-                'sidley', 'jones day', 'baker mckenzie', 'hogan lovells', 'norton rose',
-                'dla piper', 'herbert smith', 'ashurst', 'slaughter and may', 'cooley'
-            ]
-            
-            for adv in e.get("advisors", []):
-                if adv and isinstance(adv, dict):
-                    adv_name = str(adv.get("advisor_name", "")).strip()
-                    adv_type = str(adv.get("advisor_type", "")).strip()
-                    adv_name_lower = adv_name.lower()
-                    adv_type_lower = adv_type.lower()
-                    
-                    # Skip if explicitly marked as legal advisor
-                    if 'legal' in adv_type_lower:
-                        print(f"   ⚠️ Excluding legal advisor: {adv_name}")
-                        continue
-                    
-                    # Skip if name matches known law firms
-                    is_law_firm = any(law_firm in adv_name_lower for law_firm in known_law_firms)
-                    if is_law_firm:
-                        print(f"   ⚠️ Excluding law firm: {adv_name}")
-                        continue
-                    
-                    # Skip if name contains legal keywords
-                    has_legal_keyword = any(kw in adv_name_lower for kw in legal_keywords)
-                    if has_legal_keyword and 'financial' not in adv_type_lower:
-                        print(f"   ⚠️ Excluding potential legal advisor: {adv_name}")
-                        continue
-                    
-                    advisors.append({
-                        "advisor_name": adv_name,
-                        "advisor_type": adv_type,
-                        "advised_party": str(adv.get("advised_party", "")).strip(),
-                        "announcement_url": str(adv.get("announcement_url", "")).strip()
-                    })
-            
-            result.append({
-                "Announcement Date": announcement_date,
-                "Closed Date": closed_date,
-                "Date": display_date,  # Keep for backwards compatibility
-                "Event (short)": str(e.get("event_short", e.get("event", "Unknown event"))).strip(),
-                "Description": str(e.get("description", "")).strip(),
-                "Deal Type": deal_type,
-                "Deal Status": deal_status,
-                "Event type": deal_type,  # Keep for backwards compatibility
-                "Event value (USD)": str(e.get("value_usd", e.get("value", "Undisclosed"))).strip(),
-                "Source URL": str(e.get("source_url", "")).strip(),
-                "counterparties": counterparties,
-                "advisors": advisors
-            })
+            llm_t0 = time.time()
+            all_rows = []
+
+            def run_shard(shard_idx: int, shard_hits: list):
+                if not shard_hits:
+                    return []
+                t_shard = time.time()
+                journal = format_ce_journal_from_hits(shard_hits)
+                note = (
+                    "SHARD CONTEXT: You are processing shard %s of %s (a subset of parallel web searches). "
+                    "Extract every distinct corporate event supported by these snippets only. "
+                    "The same real-world deal may appear in another shard; overlapping outputs are OK and will be merged downstream."
+                ) % (shard_idx, total_shards)
+                pr = build_ce_prompt(len(shard_hits), per_shard_cap, journal, shard_note=note)
+                tok_floor = 6000 if is_startup_search else 12000
+                mtok = min(16000, max(tok_floor, 220 * len(shard_hits)))
+                print(
+                    f"   … CE shard {shard_idx}/{total_shards}: request started ({len(shard_hits)} snippets, max_tokens={mtok})",
+                    flush=True,
+                )
+                with _ce_llm_concurrency_semaphore():
+                    raw_ev = openrouter_extract_ce_events_json(
+                        pr, OPENROUTER_KEY, max_tokens=mtok, timeout=180, max_retries=2
+                    )
+                rows = normalize_llm_ce_events_to_rows(raw_ev, company_name, per_shard_cap)
+                print(
+                    f"   ✅ CE shard {shard_idx}/{total_shards}: finished in {time.time() - t_shard:.1f}s ({len(rows)} rows)",
+                    flush=True,
+                )
+                return rows
+
+            max_workers = min(12, max(1, total_shards))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(run_shard, si + 1, sh): si for si, sh in enumerate(shards)}
+                for fut in as_completed(futures):
+                    try:
+                        all_rows.extend(fut.result())
+                    except Exception as _shard_exc:
+                        print(f"   ⚠️ Corporate-events shard failed: {_shard_exc}")
+
+            print(
+                f"   ✅ Parallel LLM extraction finished in {time.time() - llm_t0:.1f}s "
+                f"({total_shards} shards, {len(all_rows)} candidate rows pre-merge)",
+                flush=True,
+            )
+            if not all_rows:
+                print(
+                    "   ⚠️ CE shards produced no rows — often caused by URL pasted as company "
+                    "(now auto-resolved) or OpenRouter returning []. Check warnings above.",
+                    flush=True,
+                )
+            result = merge_dedupe_ce_rows(all_rows, max_events)
 
         print(f"SUCCESS: {len(result)} corporate events loaded for {company_name}")
-        
+
         # SECOND PASS: Enrich counterparties with individuals using Perplexity
-        print(f"   → Enriching counterparties with individuals...")
+        print(f"   → Enriching counterparties with individuals...", flush=True)
         result = enrich_counterparties_with_individuals(result, company_name)
-        
+
         # Validate and fix date logic issues
         print(f"\n📅 Validating event dates...")
         result = validate_and_fix_event_dates(result)
-        
+
         # Log counterparty summary
         total_counterparties = sum(len(e.get("counterparties", [])) for e in result)
         total_individuals = sum(len(cp.get("individuals", [])) for e in result for cp in e.get("counterparties", []))
@@ -3570,12 +3878,12 @@ JSON:'''
         print(f"   → {total_counterparties} counterparties extracted across {len(result)} events")
         print(f"   → {total_individuals} individuals identified")
         print(f"   → {total_advisors} advisors identified")
-        
+
         # Log date and status extraction
         events_with_announcement = sum(1 for e in result if e.get("Announcement Date"))
         events_with_closed = sum(1 for e in result if e.get("Closed Date"))
         print(f"   → Dates: {events_with_announcement} with announcement date, {events_with_closed} with closed date")
-        
+
         # Log deal types and statuses
         deal_types = {}
         deal_statuses = {}
@@ -3586,7 +3894,7 @@ JSON:'''
             deal_statuses[ds] = deal_statuses.get(ds, 0) + 1
         print(f"   → Deal types: {deal_types}")
         print(f"   → Deal statuses: {deal_statuses}")
-        
+
         return result
 
     except Exception as e:
@@ -3594,6 +3902,7 @@ JSON:'''
         import traceback
         traceback.print_exc()
         return []
+
 
 def get_ceo_from_serpapi_ai(company_name: str) -> str:
     """
