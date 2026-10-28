@@ -1,0 +1,12 @@
+app = "profile-completeness"
+primary_region = "lhr"
+
+[build]
+
+[env]
+  XANO_BASE_URL = "https://xdil-abvj-o7rq.e2.xano.io"
+  SEARCH_ENGINE_URL = "https://REPLACE-WITH-SEARCH-ENGINE-HOST"
+  PROMPT_VERSION = "search-engine@v1"
+  MAX_WORKERS = "3"
+  MAX_COMPANIES_PER_RUN = "100"
+  REJECT_COOLDOWN_DAYS = "14"
