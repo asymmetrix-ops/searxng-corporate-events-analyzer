@@ -1,0 +1,21 @@
+app = "hades-agent"
+primary_region = "lhr"
+
+[build]
+
+# Worker only (no HTTP service). One small machine that stays up and runs the job every day at RUN_AT.
+[env]
+  LOOP = "1"
+  RUN_AT = "03:00"
+  SCHEDULE_TZ = "Europe/Berlin"
+  XANO_BASE_URL = "https://xdil-abvj-o7rq.e2.xano.io"
+  SEARCH_ENGINE_URL = "https://searxng-corporate-events-analyzer.fly.dev"
+  MAX_ITEMS_PER_RUN = "25"
+  MAX_RUNTIME_MIN = "240"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[[restart]]
+  policy = "always"

@@ -23,6 +23,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -48,6 +49,10 @@ SOCIAL_HOSTS = ("linkedin.com", "facebook.com", "twitter.com", "x.com", "youtube
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 # The repo is public, so GitHub Actions logs are public: no item titles, URLs, company names or error bodies there.
 PUBLIC_LOGS = os.getenv("GITHUB_ACTIONS") == "true"
+# LOOP=1 (the Fly machine): stay running, sleep until RUN_AT in SCHEDULE_TZ, run once, repeat every day.
+LOOP = os.getenv("LOOP", "0") == "1"
+RUN_AT = os.getenv("RUN_AT", "03:00")
+SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/Berlin")
 ITEM_IDS = {int(x) for x in os.getenv("ITEM_IDS", "").split(",") if x.strip().isdigit()}
 
 STATUS_TODO = ("Data entry required", "Surfaced via Corporate Event Checker")
@@ -499,5 +504,39 @@ def main():
     return 1 if stats["error"] and not (stats["ready"] or stats["blocked"]) else 0
 
 
+def next_run_after(now_utc):
+    """The next RUN_AT (local time in SCHEDULE_TZ) strictly after now_utc. Daylight saving is handled by zoneinfo."""
+    tz = ZoneInfo(SCHEDULE_TZ)
+    hour, minute = (int(x) for x in RUN_AT.split(":"))
+    local = now_utc.astimezone(tz)
+    day = local.date()
+    cand = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
+    if cand <= local:
+        nxt = day + timedelta(days=1)
+        cand = datetime(nxt.year, nxt.month, nxt.day, hour, minute, tzinfo=tz)
+    return cand
+
+
+def run_forever():
+    """Fly machine mode. Does not run at start-up: waits for the next RUN_AT, so a deploy never triggers a run."""
+    log.info("scheduler on: every day at %s %s (up to %d items per run)", RUN_AT, SCHEDULE_TZ, MAX_ITEMS_PER_RUN)
+    while True:
+        nxt = next_run_after(datetime.now(timezone.utc))
+        log.info("next run at %s", nxt.isoformat())
+        while True:
+            remaining = (nxt - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 60))
+        try:
+            main()
+        except Exception as exc:  # one bad night must not stop the schedule
+            log.error("run failed (%s)", type(exc).__name__ if PUBLIC_LOGS else exc)
+        time.sleep(5)  # make sure the next computed time is tomorrow's
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if LOOP:
+        run_forever()
+    else:
+        sys.exit(main())

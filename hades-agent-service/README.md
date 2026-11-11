@@ -30,8 +30,15 @@ Dry run (calls the Search Engine, saves nothing):
 One item:
     ITEM_IDS=5479 DRY_RUN=1 SERVICE_EMAIL=... SERVICE_PASSWORD=... python main.py
 
-Schedule: GitHub Actions, `.github/workflows/hades-agent.yml` (repo root), every day at 03:00 Europe/Berlin
-(two UTC cron entries plus a local-hour check keep it at 03:00 in winter and summer). Fly's `--schedule daily`
-cannot pin a time of day, which is why it is not used here. Repo secrets to set once:
-    HADES_SERVICE_EMAIL, HADES_SERVICE_PASSWORD
-Manual run: Actions -> "HADES agent" -> Run workflow (options: dry run, one item id, max items).
+Schedule and hosting: its own Fly app `hades-agent` (worker, no HTTP): one small machine that stays up, sleeps until
+03:00 Europe/Berlin (`RUN_AT`, `SCHEDULE_TZ`, daylight saving handled), runs once and waits for the next night.
+A deploy never triggers a run; it only waits for the next 03:00. Fly's `--schedule daily` cannot pin a time of day,
+which is why the machine runs the clock itself.
+
+Deploy / change:
+    fly apps create hades-agent
+    fly secrets set SERVICE_EMAIL=... SERVICE_PASSWORD=... -a hades-agent
+    fly deploy -a hades-agent --ha=false
+Logs: `fly logs -a hades-agent` (look for "next run at ...").
+Run now by hand (same code, real run of 5): MAX_ITEMS_PER_RUN=5 SERVICE_EMAIL=... SERVICE_PASSWORD=... SEARCH_ENGINE_URL=... python main.py
+Local one-shot runs do not use the scheduler (LOOP is only set on Fly).
