@@ -46,6 +46,8 @@ MAX_DRAFT_BYTES = int(os.getenv("MAX_DRAFT_BYTES", str(1_500_000)))
 RESEARCH_EXISTING = os.getenv("RESEARCH_EXISTING", "0") == "1"  # 1 = still run the AI research on companies already in the DB
 SOCIAL_HOSTS = ("linkedin.com", "facebook.com", "twitter.com", "x.com", "youtube.com", "instagram.com", "share.google", "crunchbase.com")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+# The repo is public, so GitHub Actions logs are public: no item titles, URLs, company names or error bodies there.
+PUBLIC_LOGS = os.getenv("GITHUB_ACTIONS") == "true"
 ITEM_IDS = {int(x) for x in os.getenv("ITEM_IDS", "").split(",") if x.strip().isdigit()}
 
 STATUS_TODO = ("Data entry required", "Surfaced via Corporate Event Checker")
@@ -175,7 +177,7 @@ def party_check(name, cache):
                 if possible:
                     out["possible"] = [{"id": c.get("id"), "name": c.get("name")} for c in possible]
     except Exception as exc:  # a failed lookup must not fail the item, and must not read as "new"
-        log.warning("party lookup failed for %r: %s", name, exc)
+        log.warning("party lookup failed (%s)", type(exc).__name__ if PUBLIC_LOGS else f"{name!r}: {exc}")
     cache[key] = out
     return out
 
@@ -424,7 +426,7 @@ def run_item(item):
         draft, link = result if isinstance(result, tuple) else (result, {})
         ok = True
     except Exception as exc:
-        log.error("item %s failed: %s", item["id"], exc)
+        log.error("item %s failed (%s)", item["id"], type(exc).__name__ if PUBLIC_LOGS else exc)
         draft, link, ok = {"status": "error", "error": str(exc)[:500]}, {}, False
     draft.update({"version": 1, "kind": kind, "ran_at": now_iso(), "duration_s": round(time.time() - started, 1),
                   "requested": bool(item.get("agent_requested"))})
@@ -466,7 +468,7 @@ def main():
             try:
                 claim(item)
             except Exception as exc:  # without the marker a repeat could not be ruled out, so skip it
-                log.error("could not claim item %s, skipping: %s", item["id"], exc)
+                log.error("could not claim item %s, skipping (%s)", item["id"], type(exc).__name__ if PUBLIC_LOGS else exc)
                 stats["error"] += 1
                 streak += 1
                 continue
@@ -474,13 +476,13 @@ def main():
         streak = 0 if ok else streak + 1
         stats[draft["status"]] += 1
         log.info("item %s (%s) -> %s in %ss", item["id"], draft["kind"], draft["status"], draft["duration_s"])
-        if DRY_RUN:
+        if DRY_RUN and not PUBLIC_LOGS:
             print(json.dumps({"item": item["id"], "draft": {k: v for k, v in draft.items() if k != "analysis"}, "link": link}, default=str)[:2000])
         else:
             try:
                 save(item, draft, link)
             except Exception as exc:
-                log.error("could not save item %s: %s", item["id"], exc)
+                log.error("could not save item %s (%s)", item["id"], type(exc).__name__ if PUBLIC_LOGS else exc)
     log.info("done in %.0fs: %s", time.time() - started, json.dumps(stats))
     return 1 if stats["error"] and not (stats["ready"] or stats["blocked"]) else 0
 
