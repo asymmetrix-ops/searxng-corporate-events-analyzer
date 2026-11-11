@@ -265,10 +265,22 @@ def find_existing_company(item):
     return None, None, possible
 
 
+_NOT_A_NAME = ("map", "providers", "list", "companies", "ecosystem", "stack", "landscape", "dataset", "index", "directory", "report")
+
+
+def looks_like_company_name(text):
+    """Without a Related URL the title is searched as a company name; market maps and lists are not."""
+    head = (text or "").split(" | ")[0].strip()
+    words = head.lower().replace("-", " ").split()
+    return bool(head) and len(words) <= 4 and not any(w.strip(",.:") in _NOT_A_NAME for w in words)
+
+
 def process_company(item):
-    query = (item.get("related_url") or "").strip() or (item.get("description") or "").strip()
-    if not query:
-        return {"status": "blocked", "blocker": "no_related_url", "message": "No Related URL or name to search from."}
+    url = (item.get("related_url") or "").strip()
+    query = url or (item.get("description") or "").strip()
+    if not query or (not url and not looks_like_company_name(query)):
+        return {"status": "blocked", "blocker": "no_related_url",
+                "message": "No Related URL, and the title is not a single company name (market map or list)."}
     # Double gate FIRST (website, then name): /analyze looks the company up but then researches it anyway.
     # An existing company is linked and flagged, and no search/AI credits are spent on it.
     found, matched_by, possible = find_existing_company(item)
