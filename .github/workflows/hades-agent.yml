@@ -1,0 +1,71 @@
+name: HADES agent
+
+# Nightly run at 03:00 Europe/Berlin. GitHub cron is UTC only, so both 01:00 and 02:00 UTC are scheduled and the
+# first step lets only the run that falls on 03:00 local time continue (03:00 CET = 02:00 UTC in winter,
+# 03:00 CEST = 01:00 UTC in summer). Each HADES item is processed once, so a repeated or manual run is safe.
+on:
+  schedule:
+    - cron: "0 1 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (calls the search engine, saves nothing)"
+        type: boolean
+        default: true
+      item_ids:
+        description: "Only these HADES item ids (comma separated), empty = normal selection"
+        type: string
+        default: ""
+      max_items:
+        description: "Max items this run (cost limit, hard cap 100)"
+        type: string
+        default: "25"
+
+concurrency:
+  group: hades-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Only continue at 03:00 Europe/Berlin (scheduled runs)
+        id: gate
+        run: |
+          hour=$(TZ=Europe/Berlin date +%H)
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$hour" != "03" ]; then
+            echo "Berlin hour is $hour, not 03: skipping this trigger"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: hades-agent-service/requirements.txt
+
+      - name: Install
+        if: steps.gate.outputs.go == 'true'
+        run: pip install -r hades-agent-service/requirements.txt
+
+      - name: Run the HADES agent
+        if: steps.gate.outputs.go == 'true'
+        working-directory: hades-agent-service
+        env:
+          SERVICE_EMAIL: ${{ secrets.HADES_SERVICE_EMAIL }}
+          SERVICE_PASSWORD: ${{ secrets.HADES_SERVICE_PASSWORD }}
+          SEARCH_ENGINE_URL: https://searxng-corporate-events-analyzer.fly.dev
+          XANO_BASE_URL: https://xdil-abvj-o7rq.e2.xano.io
+          MAX_ITEMS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_items || '25' }}
+          MAX_RUNTIME_MIN: "240"
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          ITEM_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.item_ids || '' }}
+        run: python main.py
