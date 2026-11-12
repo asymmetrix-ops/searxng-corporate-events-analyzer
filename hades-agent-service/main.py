@@ -56,7 +56,7 @@ SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/Berlin")
 ITEM_IDS = {int(x) for x in os.getenv("ITEM_IDS", "").split(",") if x.strip().isdigit()}
 
 STATUS_TODO = ("Data entry required", "Surfaced via Corporate Event Checker")
-STATUS_READY = "Completed by agent – ready for review"
+STATUS_READY = "Ready for Human Review"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("hades_agent")
